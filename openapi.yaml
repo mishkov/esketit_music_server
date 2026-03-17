@@ -1,0 +1,644 @@
+openapi: 3.0.3
+info:
+  title: Esketit Music Server API
+  version: 1.2.0
+  description: |
+    REST API for listing/serving song files, managing tracks and authors,
+    and authenticating users with access and refresh tokens.
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+
+tags:
+  - name: Auth
+    description: Authentication endpoints
+  - name: Songs
+    description: Read-only endpoints for song files
+  - name: Tracks
+    description: CRUD endpoints for tracks
+  - name: Authors
+    description: CRUD endpoints for authors
+
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new user
+      description: The first registered user becomes `admin`; later users become `listener`.
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: Registered and authenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Email already exists
+          content:
+            text/plain:
+              schema:
+                $ref: '#/components/schemas/PlainError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in with email and password
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Rotate refresh token and issue a new access token
+      operationId: refresh
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: Rotated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke a refresh token
+      operationId: logout
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '204':
+          description: Logged out
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Get the currently authenticated user
+      operationId: me
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicUser'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /songs:
+    get:
+      tags: [Songs]
+      summary: List songs
+      operationId: listSongs
+      responses:
+        '200':
+          description: Song list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SongInfo'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /songs/{name}:
+    get:
+      tags: [Songs]
+      summary: Get song file
+      operationId: getSong
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Song file stream
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /authors:
+    get:
+      tags: [Authors]
+      summary: List authors
+      operationId: listAuthors
+      responses:
+        '200':
+          description: Author list sorted by ID asc
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Author'
+
+    post:
+      tags: [Authors]
+      summary: Create author
+      operationId: createAuthor
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertAuthorRequest'
+      responses:
+        '201':
+          description: Created author
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Author'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /authors/{id}:
+    get:
+      tags: [Authors]
+      summary: Get author by ID
+      operationId: getAuthorById
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      responses:
+        '200':
+          description: Author
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Author'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [Authors]
+      summary: Update author by ID
+      operationId: updateAuthor
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertAuthorRequest'
+      responses:
+        '200':
+          description: Updated author
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Author'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    delete:
+      tags: [Authors]
+      summary: Delete author by ID
+      operationId: deleteAuthor
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      responses:
+        '204':
+          description: Deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Author is used by one or more tracks
+          content:
+            text/plain:
+              schema:
+                $ref: '#/components/schemas/PlainError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /tracks:
+    get:
+      tags: [Tracks]
+      summary: List tracks
+      operationId: listTracks
+      responses:
+        '200':
+          description: Track list sorted by ID asc
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Track'
+
+    post:
+      tags: [Tracks]
+      summary: Create track
+      operationId: createTrack
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertTrackRequest'
+      responses:
+        '201':
+          description: Created track
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Track'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /tracks/{id}:
+    get:
+      tags: [Tracks]
+      summary: Get track by ID
+      operationId: getTrackById
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      responses:
+        '200':
+          description: Track
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Track'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [Tracks]
+      summary: Update track by ID
+      operationId: updateTrack
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertTrackRequest'
+      responses:
+        '200':
+          description: Updated track
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Track'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    delete:
+      tags: [Tracks]
+      summary: Delete track by ID
+      operationId: deleteTrack
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      responses:
+        '204':
+          description: Deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    SongInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        sizeBytes:
+          type: integer
+          format: int64
+        lastModified:
+          type: string
+          format: date-time
+        url:
+          type: string
+      required: [name, sizeBytes, lastModified, url]
+
+    Author:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        currentName:
+          type: string
+        photos:
+          type: array
+          items:
+            type: string
+      required: [id, currentName, photos]
+
+    UpsertAuthorRequest:
+      type: object
+      properties:
+        currentName:
+          type: string
+          minLength: 1
+        photos:
+          type: array
+          items:
+            type: string
+      required: [currentName, photos]
+
+    Track:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        authorIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        albumImagePath:
+          type: string
+        audioFilePath:
+          type: string
+      required: [id, name, authorIds, albumImagePath, audioFilePath]
+
+    UpsertTrackRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        authorIds:
+          type: array
+          minItems: 1
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        albumImagePath:
+          type: string
+          minLength: 1
+        audioFilePath:
+          type: string
+          minLength: 1
+      required: [name, authorIds, albumImagePath, audioFilePath]
+
+    RegisterRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+      required: [email, password]
+
+    LoginRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+      required: [email, password]
+
+    RefreshRequest:
+      type: object
+      properties:
+        refreshToken:
+          type: string
+      required: [refreshToken]
+
+    PublicUser:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          enum: [admin, listener]
+        createdAt:
+          type: string
+          format: date-time
+      required: [id, email, role, createdAt]
+
+    AuthResponse:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/PublicUser'
+        accessToken:
+          type: string
+        accessTokenExpiresAt:
+          type: string
+          format: date-time
+        refreshToken:
+          type: string
+        refreshTokenExpiresAt:
+          type: string
+          format: date-time
+      required:
+        [user, accessToken, accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt]
+
+    PlainError:
+      type: string
+      example: invalid track id
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        text/plain:
+          schema:
+            $ref: '#/components/schemas/PlainError'
+    Unauthorized:
+      description: Authentication failed or missing
+      content:
+        text/plain:
+          schema:
+            $ref: '#/components/schemas/PlainError'
+    Forbidden:
+      description: Authenticated user does not have permission for this action
+      content:
+        text/plain:
+          schema:
+            $ref: '#/components/schemas/PlainError'
+    NotFound:
+      description: Not found
+      content:
+        text/plain:
+          schema:
+            $ref: '#/components/schemas/PlainError'
+    InternalServerError:
+      description: Internal server error
+      content:
+        text/plain:
+          schema:
+            $ref: '#/components/schemas/PlainError'
