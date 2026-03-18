@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -30,6 +31,7 @@ const (
 	passwordHashIterations = 310000
 	passwordHashKeyLength  = 32
 	minPasswordLength      = 8
+	maxSongUploadSize      = 512 << 20
 	roleAdmin              = "admin"
 	roleListener           = "listener"
 )
@@ -205,6 +207,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /songs", listSongsHandler(songsDir))
+	mux.Handle("POST /songs", requireRole(auth, store, roleAdmin, uploadSongHandler(songsDir)))
 	mux.HandleFunc("GET /songs/", getSongHandler(songsDir))
 	mux.HandleFunc("GET /tracks", listTracksHandler(store))
 	mux.Handle("POST /tracks", requireRole(auth, store, roleAdmin, createTrackHandler(store)))
@@ -882,12 +885,7 @@ func listSongsHandler(songsDir string) http.HandlerFunc {
 				continue
 			}
 
-			songs = append(songs, songInfo{
-				Name:         name,
-				SizeBytes:    info.Size(),
-				LastModified: info.ModTime(),
-				URL:          "/songs/" + url.PathEscape(name),
-			})
+			songs = append(songs, buildSongInfo(name, info))
 		}
 
 		sort.Slice(songs, func(i, j int) bool {
@@ -895,6 +893,67 @@ func listSongsHandler(songsDir string) http.HandlerFunc {
 		})
 
 		writeJSON(w, http.StatusOK, songs)
+	}
+}
+
+func uploadSongHandler(songsDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxSongUploadSize)
+		if err := r.ParseMultipartForm(maxSongUploadSize); err != nil {
+			http.Error(w, "invalid multipart form", http.StatusBadRequest)
+			return
+		}
+
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			http.Error(w, "file is required", http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+
+		name, err := sanitizeSongFileName(header.Filename)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		fullPath := filepath.Join(songsDir, name)
+		dst, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			if errors.Is(err, os.ErrExist) {
+				http.Error(w, "song already exists", http.StatusConflict)
+				return
+			}
+			http.Error(w, "failed to create song file", http.StatusInternalServerError)
+			return
+		}
+
+		copyErr := false
+		if _, err := io.Copy(dst, file); err != nil {
+			copyErr = true
+		}
+		if err := dst.Close(); err != nil {
+			copyErr = true
+		}
+		if copyErr {
+			_ = os.Remove(fullPath)
+			http.Error(w, "failed to save song", http.StatusInternalServerError)
+			return
+		}
+
+		info, err := os.Stat(fullPath)
+		if err != nil {
+			_ = os.Remove(fullPath)
+			http.Error(w, "failed to read saved song", http.StatusInternalServerError)
+			return
+		}
+		if info.Size() == 0 {
+			_ = os.Remove(fullPath)
+			http.Error(w, "uploaded file is empty", http.StatusBadRequest)
+			return
+		}
+
+		writeJSON(w, http.StatusCreated, buildSongInfo(name, info))
 	}
 }
 
@@ -930,6 +989,30 @@ func getSongHandler(songsDir string) http.HandlerFunc {
 
 		http.ServeFile(w, r, fullPath)
 	}
+}
+
+func buildSongInfo(name string, info os.FileInfo) songInfo {
+	return songInfo{
+		Name:         name,
+		SizeBytes:    info.Size(),
+		LastModified: info.ModTime(),
+		URL:          "/songs/" + url.PathEscape(name),
+	}
+}
+
+func sanitizeSongFileName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", errors.New("uploaded filename is required")
+	}
+
+	name = strings.ReplaceAll(name, "\\", "/")
+	cleanName := filepath.Base(filepath.Clean(name))
+	if cleanName == "." || cleanName == "/" || cleanName == "" {
+		return "", errors.New("invalid song name")
+	}
+
+	return cleanName, nil
 }
 
 func listTracksHandler(store *trackStore) http.HandlerFunc {

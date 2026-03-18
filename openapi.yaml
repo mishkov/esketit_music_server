@@ -156,6 +156,45 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+    post:
+      tags: [Songs]
+      summary: Upload song
+      operationId: uploadSong
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+              required: [file]
+      responses:
+        '201':
+          description: Uploaded song metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SongInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Song with the same filename already exists
+          content:
+            text/plain:
+              schema:
+                $ref: '#/components/schemas/PlainError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /songs/{name}:
     get:
       tags: [Songs]
