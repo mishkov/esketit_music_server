@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -169,6 +170,7 @@ type loggingResponseWriter struct {
 	status      int
 	wroteHeader bool
 	bytes       int
+	body        bytes.Buffer
 }
 
 func (w *loggingResponseWriter) WriteHeader(status int) {
@@ -187,6 +189,9 @@ func (w *loggingResponseWriter) Write(p []byte) (int, error) {
 	}
 	n, err := w.ResponseWriter.Write(p)
 	w.bytes += n
+	if shouldLogBodyContentType(w.Header().Get("Content-Type")) {
+		_, _ = w.body.Write(p[:n])
+	}
 	return n, err
 }
 
@@ -333,6 +338,16 @@ func withRecovery(next http.Handler) http.Handler {
 func withRequestLogging(next http.Handler, mode string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		requestBody, restoreBody, err := captureRequestBody(r)
+		if err != nil {
+			log.Printf("failed to capture request body method=%s path=%s err=%v", r.Method, r.URL.RequestURI(), err)
+			http.Error(w, "failed to read request body", http.StatusInternalServerError)
+			return
+		}
+		if restoreBody != nil {
+			defer restoreBody()
+		}
+
 		lw := &loggingResponseWriter{
 			ResponseWriter: w,
 			status:         http.StatusOK,
@@ -345,17 +360,65 @@ func withRequestLogging(next http.Handler, mode string) http.Handler {
 		}
 
 		log.Printf(
-			"http request method=%s path=%s status=%d duration=%s request_bytes=%d response_bytes=%d remote=%s user_agent=%q",
+			"http request method=%s path=%s status=%d duration=%s request_bytes=%d request_body=%q response_bytes=%d response_body=%q remote=%s user_agent=%q",
 			r.Method,
 			r.URL.RequestURI(),
 			lw.status,
 			time.Since(start).Round(time.Millisecond),
 			r.ContentLength,
+			requestBody,
 			lw.bytes,
+			responseBodyForLog(lw),
 			r.RemoteAddr,
 			r.UserAgent(),
 		)
 	})
+}
+
+func captureRequestBody(r *http.Request) (string, func(), error) {
+	if r.Body == nil {
+		return "", nil, nil
+	}
+
+	contentType := r.Header.Get("Content-Type")
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		return fmt.Sprintf("[multipart body omitted content_type=%q size=%d]", contentType, r.ContentLength), nil, nil
+	}
+	if !shouldLogBodyContentType(contentType) {
+		return fmt.Sprintf("[body omitted content_type=%q size=%d]", contentType, r.ContentLength), nil, nil
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return "", nil, err
+	}
+
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	return string(body), func() {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+	}, nil
+}
+
+func responseBodyForLog(w *loggingResponseWriter) string {
+	contentType := w.Header().Get("Content-Type")
+	if !shouldLogBodyContentType(contentType) {
+		return fmt.Sprintf("[body omitted content_type=%q size=%d]", contentType, w.bytes)
+	}
+	return w.body.String()
+}
+
+func shouldLogBodyContentType(contentType string) bool {
+	contentType = strings.ToLower(strings.TrimSpace(contentType))
+	if contentType == "" {
+		return true
+	}
+	if strings.HasPrefix(contentType, "text/") {
+		return true
+	}
+	if strings.Contains(contentType, "json") || strings.Contains(contentType, "xml") || strings.Contains(contentType, "yaml") || strings.Contains(contentType, "form-urlencoded") {
+		return true
+	}
+	return false
 }
 
 func resolveLogMode(value string) string {
