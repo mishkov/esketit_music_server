@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -18,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,6 +36,8 @@ const (
 	maxSongUploadSize      = 512 << 20
 	roleAdmin              = "admin"
 	roleListener           = "listener"
+	logModeVerbose         = "verbose"
+	logModeErrorOnly       = "error-only"
 )
 
 type contextKey string
@@ -160,6 +164,32 @@ type trackStore struct {
 	refreshSession map[string]refreshSession
 }
 
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+	bytes       int
+}
+
+func (w *loggingResponseWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		w.ResponseWriter.WriteHeader(status)
+		return
+	}
+	w.status = status
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *loggingResponseWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += n
+	return n, err
+}
+
 type authManager struct {
 	secret          []byte
 	accessTokenTTL  time.Duration
@@ -173,6 +203,10 @@ type accessTokenClaims struct {
 }
 
 func main() {
+	if err := loadDotEnv(".env"); err != nil {
+		log.Fatalf("failed to load .env: %v", err)
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		log.Fatalf("cannot resolve home directory: %v", err)
@@ -204,6 +238,7 @@ func main() {
 	}
 
 	auth := newAuthManager([]byte(authSecret), defaultAccessTokenTTL, defaultRefreshTokenTTL)
+	logMode := resolveLogMode(os.Getenv("LOG_MODE"))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /songs", listSongsHandler(songsDir))
@@ -232,9 +267,11 @@ func main() {
 	log.Printf("server listening on %s", addr)
 	log.Printf("serving songs from %s", songsDir)
 	log.Printf("using tracks database %s", tracksDBPath)
+	log.Printf("http logging mode %s", logMode)
 	log.Printf("swagger docs available at http://localhost%s/docs", addr)
 	log.Printf("redoc available at http://localhost%s/redoc", addr)
-	log.Fatal(http.ListenAndServe(addr, withCORS(mux)))
+	handler := withRequestLogging(withRecovery(withCORS(mux)), logMode)
+	log.Fatal(http.ListenAndServe(addr, handler))
 }
 
 func ensureDir(path string) error {
@@ -271,6 +308,109 @@ func withCORS(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func withRecovery(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf(
+					"panic method=%s path=%s remote=%s err=%v\n%s",
+					r.Method,
+					r.URL.RequestURI(),
+					r.RemoteAddr,
+					rec,
+					debug.Stack(),
+				)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+			}
+		}()
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func withRequestLogging(next http.Handler, mode string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		lw := &loggingResponseWriter{
+			ResponseWriter: w,
+			status:         http.StatusOK,
+		}
+
+		next.ServeHTTP(lw, r)
+
+		if mode == logModeErrorOnly && lw.status < http.StatusInternalServerError {
+			return
+		}
+
+		log.Printf(
+			"http request method=%s path=%s status=%d duration=%s request_bytes=%d response_bytes=%d remote=%s user_agent=%q",
+			r.Method,
+			r.URL.RequestURI(),
+			lw.status,
+			time.Since(start).Round(time.Millisecond),
+			r.ContentLength,
+			lw.bytes,
+			r.RemoteAddr,
+			r.UserAgent(),
+		)
+	})
+}
+
+func resolveLogMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", logModeErrorOnly:
+		return logModeErrorOnly
+	case logModeVerbose:
+		return logModeVerbose
+	default:
+		log.Printf("unknown LOG_MODE=%q, defaulting to %s", value, logModeErrorOnly)
+		return logModeErrorOnly
+	}
+}
+
+func loadDotEnv(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		}
+
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return fmt.Errorf("invalid line %q", line)
+		}
+
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return fmt.Errorf("invalid line %q", line)
+		}
+		if _, exists := os.LookupEnv(key); exists {
+			continue
+		}
+
+		value = strings.TrimSpace(value)
+		value = strings.Trim(value, `"'`)
+		if err := os.Setenv(key, value); err != nil {
+			return err
+		}
+	}
+
+	return scanner.Err()
 }
 
 func isAllowedOrigin(origin, configuredOrigin string) bool {
