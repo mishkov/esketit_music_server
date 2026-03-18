@@ -231,7 +231,7 @@ func main() {
 	log.Printf("using tracks database %s", tracksDBPath)
 	log.Printf("swagger docs available at http://localhost%s/docs", addr)
 	log.Printf("redoc available at http://localhost%s/redoc", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	log.Fatal(http.ListenAndServe(addr, withCORS(mux)))
 }
 
 func ensureDir(path string) error {
@@ -243,6 +243,45 @@ func ensureDir(path string) error {
 		return errors.New("path is not a directory")
 	}
 	return nil
+}
+
+func withCORS(next http.Handler) http.Handler {
+	allowedOrigin := os.Getenv("CORS_ALLOW_ORIGIN")
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" && isAllowedOrigin(origin, allowedOrigin) {
+			headers := w.Header()
+			headers.Set("Access-Control-Allow-Origin", origin)
+			headers.Set("Vary", "Origin")
+			headers.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			headers.Set(
+				"Access-Control-Allow-Headers",
+				"Authorization, Content-Type",
+			)
+		}
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isAllowedOrigin(origin, configuredOrigin string) bool {
+	if configuredOrigin != "" {
+		return origin == configuredOrigin
+	}
+
+	parsedOrigin, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+
+	host := parsedOrigin.Hostname()
+	return host == "localhost" || host == "127.0.0.1"
 }
 
 func newAuthManager(secret []byte, accessTokenTTL, refreshTokenTTL time.Duration) *authManager {
