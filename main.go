@@ -52,19 +52,52 @@ type songInfo struct {
 	URL          string    `json:"url"`
 }
 
+type albumCoverInfo struct {
+	Name         string    `json:"name"`
+	SizeBytes    int64     `json:"sizeBytes"`
+	LastModified time.Time `json:"lastModified"`
+	URL          string    `json:"url"`
+}
+
+type additionalInfo map[string]any
+
+type album struct {
+	ID             int64            `json:"id"`
+	Title          string           `json:"title"`
+	CoverImagePath string           `json:"coverImagePath"`
+	AuthorIDs      []int64          `json:"authorIds"`
+	ReleaseDate    time.Time        `json:"releaseDate"`
+	IsPublished    bool             `json:"isPublished"`
+	TrackIDs       []int64          `json:"trackIds"`
+	AdditionalInfo []additionalInfo `json:"additionalInfo"`
+}
+
+type upsertAlbumRequest struct {
+	Title          string           `json:"title"`
+	CoverImagePath string           `json:"coverImagePath"`
+	AuthorIDs      []int64          `json:"authorIds"`
+	ReleaseDate    time.Time        `json:"releaseDate"`
+	IsPublished    bool             `json:"isPublished"`
+	TrackIDs       []int64          `json:"trackIds"`
+	AdditionalInfo []additionalInfo `json:"additionalInfo"`
+}
+
 type track struct {
-	ID             int64   `json:"id"`
-	Name           string  `json:"name"`
-	AuthorIDs      []int64 `json:"authorIds"`
-	AlbumImagePath string  `json:"albumImagePath"`
-	AudioFilePath  string  `json:"audioFilePath"`
+	ID             int64            `json:"id"`
+	Name           string           `json:"name"`
+	AuthorIDs      []int64          `json:"authorIds"`
+	AlbumID        int64            `json:"albumId"`
+	AudioFilePath  string           `json:"audioFilePath"`
+	AdditionalInfo []additionalInfo `json:"additionalInfo"`
 }
 
 type upsertTrackRequest struct {
-	Name           string  `json:"name"`
-	AuthorIDs      []int64 `json:"authorIds"`
-	AlbumImagePath string  `json:"albumImagePath"`
-	AudioFilePath  string  `json:"audioFilePath"`
+	Name           string           `json:"name"`
+	AuthorIDs      []int64          `json:"authorIds"`
+	AlbumID        int64            `json:"albumId"`
+	AlbumOrder     int              `json:"albumOrder"`
+	AudioFilePath  string           `json:"audioFilePath"`
+	AdditionalInfo []additionalInfo `json:"additionalInfo"`
 }
 
 type author struct {
@@ -125,9 +158,11 @@ type authResponse struct {
 
 type dbFile struct {
 	NextTrackID  int64            `json:"nextTrackId"`
+	NextAlbumID  int64            `json:"nextAlbumId"`
 	NextAuthorID int64            `json:"nextAuthorId"`
 	NextUserID   int64            `json:"nextUserId"`
 	Tracks       []track          `json:"tracks"`
+	Albums       []album          `json:"albums"`
 	Authors      []author         `json:"authors"`
 	Users        []user           `json:"users"`
 	Sessions     []refreshSession `json:"sessions"`
@@ -135,10 +170,12 @@ type dbFile struct {
 
 type diskDBFile struct {
 	NextTrackID  int64             `json:"nextTrackId"`
+	NextAlbumID  int64             `json:"nextAlbumId"`
 	NextAuthorID int64             `json:"nextAuthorId"`
 	NextUserID   int64             `json:"nextUserId"`
 	NextID       int64             `json:"nextId"`
 	Tracks       []json.RawMessage `json:"tracks"`
+	Albums       []album           `json:"albums"`
 	Authors      []author          `json:"authors"`
 	Users        []user            `json:"users"`
 	Sessions     []refreshSession  `json:"sessions"`
@@ -156,13 +193,40 @@ type trackStore struct {
 	mu             sync.RWMutex
 	path           string
 	nextTrackID    int64
+	nextAlbumID    int64
 	nextAuthorID   int64
 	nextUserID     int64
 	tracks         map[int64]track
+	albums         map[int64]album
 	authors        map[int64]author
 	users          map[int64]user
 	usersByEmail   map[string]int64
 	refreshSession map[string]refreshSession
+}
+
+type paginatedAlbums struct {
+	Items      []album `json:"items"`
+	Page       int     `json:"page"`
+	PageSize   int     `json:"pageSize"`
+	TotalItems int     `json:"totalItems"`
+	TotalPages int     `json:"totalPages"`
+}
+
+type albumListFilter struct {
+	Page        int
+	PageSize    int
+	AuthorID    int64
+	Query       string
+	IsPublished *bool
+}
+
+type legacyTrackV1 struct {
+	ID             int64            `json:"id"`
+	Name           string           `json:"name"`
+	AuthorIDs      []int64          `json:"authorIds"`
+	AlbumImagePath string           `json:"albumImagePath"`
+	AudioFilePath  string           `json:"audioFilePath"`
+	AdditionalInfo []additionalInfo `json:"additionalInfo"`
 }
 
 type loggingResponseWriter struct {
@@ -227,6 +291,16 @@ func main() {
 		log.Fatalf("invalid songs directory %q: %v", songsDir, err)
 	}
 
+	defaultAlbumCoversDir := filepath.Join(home, "Projects", "esketit_music", "media_storage", "album_covers")
+	albumCoversDir := os.Getenv("ALBUM_COVERS_DIR")
+	if albumCoversDir == "" {
+		albumCoversDir = defaultAlbumCoversDir
+	}
+
+	if err := ensureDirOrCreate(albumCoversDir); err != nil {
+		log.Fatalf("invalid album covers directory %q: %v", albumCoversDir, err)
+	}
+
 	tracksDBPath := os.Getenv("TRACKS_DB_PATH")
 	if tracksDBPath == "" {
 		tracksDBPath = "tracks_db.json"
@@ -249,6 +323,13 @@ func main() {
 	mux.HandleFunc("GET /songs", listSongsHandler(songsDir))
 	mux.Handle("POST /songs", requireRole(auth, store, roleAdmin, uploadSongHandler(songsDir)))
 	mux.HandleFunc("GET /songs/", getSongHandler(songsDir))
+	mux.HandleFunc("GET /album-covers/", getAlbumCoverHandler(albumCoversDir))
+	mux.HandleFunc("GET /albums", listAlbumsHandler(store))
+	mux.Handle("POST /albums", requireRole(auth, store, roleAdmin, createAlbumHandler(store)))
+	mux.HandleFunc("GET /albums/", getAlbumByRouteHandler(store))
+	mux.Handle("PUT /albums/", requireRole(auth, store, roleAdmin, updateAlbumByRouteHandler(store)))
+	mux.Handle("DELETE /albums/", requireRole(auth, store, roleAdmin, deleteAlbumByRouteHandler(store)))
+	mux.Handle("POST /album-covers", requireRole(auth, store, roleAdmin, uploadAlbumCoverHandler(albumCoversDir)))
 	mux.HandleFunc("GET /tracks", listTracksHandler(store))
 	mux.Handle("POST /tracks", requireRole(auth, store, roleAdmin, createTrackHandler(store)))
 	mux.HandleFunc("GET /tracks/", getTrackByIDHandler(store))
@@ -271,6 +352,7 @@ func main() {
 	addr := ":8080"
 	log.Printf("server listening on %s", addr)
 	log.Printf("serving songs from %s", songsDir)
+	log.Printf("serving album covers from %s", albumCoversDir)
 	log.Printf("using tracks database %s", tracksDBPath)
 	log.Printf("http logging mode %s", logMode)
 	log.Printf("swagger docs available at http://localhost%s/docs", addr)
@@ -288,6 +370,13 @@ func ensureDir(path string) error {
 		return errors.New("path is not a directory")
 	}
 	return nil
+}
+
+func ensureDirOrCreate(path string) error {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return err
+	}
+	return ensureDir(path)
 }
 
 func withCORS(next http.Handler) http.Handler {
@@ -502,9 +591,11 @@ func newTrackStore(path string) (*trackStore, error) {
 	s := &trackStore{
 		path:           path,
 		nextTrackID:    1,
+		nextAlbumID:    1,
 		nextAuthorID:   1,
 		nextUserID:     1,
 		tracks:         make(map[int64]track),
+		albums:         make(map[int64]album),
 		authors:        make(map[int64]author),
 		users:          make(map[int64]user),
 		usersByEmail:   make(map[string]int64),
@@ -539,15 +630,47 @@ func newTrackStore(path string) (*trackStore, error) {
 		}
 	}
 
+	for _, albumItem := range file.Albums {
+		albumItem.Title = strings.TrimSpace(albumItem.Title)
+		albumItem.CoverImagePath = strings.TrimSpace(albumItem.CoverImagePath)
+		albumItem.AuthorIDs = normalizeAuthorIDs(albumItem.AuthorIDs)
+		albumItem.TrackIDs = normalizeTrackIDs(albumItem.TrackIDs)
+		albumItem.AdditionalInfo = normalizeAdditionalInfo(albumItem.AdditionalInfo)
+		if albumItem.ID <= 0 {
+			continue
+		}
+		s.albums[albumItem.ID] = albumItem
+		if albumItem.ID >= s.nextAlbumID {
+			s.nextAlbumID = albumItem.ID + 1
+		}
+	}
+
 	for _, rawTrack := range file.Tracks {
 		var t track
 		if err := json.Unmarshal(rawTrack, &t); err == nil {
 			t.Name = strings.TrimSpace(t.Name)
 			t.AuthorIDs = normalizeAuthorIDs(t.AuthorIDs)
-			t.AlbumImagePath = strings.TrimSpace(t.AlbumImagePath)
+			t.AlbumID = t.AlbumID
 			t.AudioFilePath = strings.TrimSpace(t.AudioFilePath)
-			if t.ID <= 0 {
+			t.AdditionalInfo = normalizeAdditionalInfo(t.AdditionalInfo)
+			if t.ID <= 0 || t.AlbumID <= 0 {
 				continue
+			}
+			s.tracks[t.ID] = t
+			if t.ID >= s.nextTrackID {
+				s.nextTrackID = t.ID + 1
+			}
+			continue
+		}
+
+		var previous legacyTrackV1
+		if err := json.Unmarshal(rawTrack, &previous); err == nil && previous.ID > 0 {
+			t = track{
+				ID:             previous.ID,
+				Name:           strings.TrimSpace(previous.Name),
+				AuthorIDs:      normalizeAuthorIDs(previous.AuthorIDs),
+				AudioFilePath:  strings.TrimSpace(previous.AudioFilePath),
+				AdditionalInfo: normalizeAdditionalInfo(previous.AdditionalInfo),
 			}
 			s.tracks[t.ID] = t
 			if t.ID >= s.nextTrackID {
@@ -570,11 +693,10 @@ func newTrackStore(path string) (*trackStore, error) {
 		}
 
 		t = track{
-			ID:             legacy.ID,
-			Name:           strings.TrimSpace(legacy.Name),
-			AuthorIDs:      normalizeAuthorIDs(authorIDs),
-			AlbumImagePath: strings.TrimSpace(legacy.AlbumImagePath),
-			AudioFilePath:  strings.TrimSpace(legacy.AudioFilePath),
+			ID:            legacy.ID,
+			Name:          strings.TrimSpace(legacy.Name),
+			AuthorIDs:     normalizeAuthorIDs(authorIDs),
+			AudioFilePath: strings.TrimSpace(legacy.AudioFilePath),
 		}
 		s.tracks[t.ID] = t
 		if t.ID >= s.nextTrackID {
@@ -612,6 +734,9 @@ func newTrackStore(path string) (*trackStore, error) {
 	if file.NextTrackID > s.nextTrackID {
 		s.nextTrackID = file.NextTrackID
 	}
+	if file.NextAlbumID > s.nextAlbumID {
+		s.nextAlbumID = file.NextAlbumID
+	}
 	if file.NextID > s.nextTrackID {
 		s.nextTrackID = file.NextID
 	}
@@ -624,11 +749,24 @@ func newTrackStore(path string) (*trackStore, error) {
 	if s.nextTrackID < 1 {
 		s.nextTrackID = 1
 	}
+	if s.nextAlbumID < 1 {
+		s.nextAlbumID = 1
+	}
 	if s.nextAuthorID < 1 {
 		s.nextAuthorID = 1
 	}
 	if s.nextUserID < 1 {
 		s.nextUserID = 1
+	}
+
+	if err := s.migrateLegacyAlbumsLocked(); err != nil {
+		return nil, err
+	}
+	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
+		return nil, err
+	}
+	if err := s.persistLocked(); err != nil {
+		return nil, err
 	}
 
 	return s, nil
@@ -649,6 +787,82 @@ func (s *trackStore) list() []track {
 	return items
 }
 
+func (s *trackStore) listAlbums(filter albumListFilter) paginatedAlbums {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	items := make([]album, 0, len(s.albums))
+	query := strings.ToLower(strings.TrimSpace(filter.Query))
+	for _, a := range s.albums {
+		if filter.AuthorID > 0 && !containsInt64(a.AuthorIDs, filter.AuthorID) {
+			continue
+		}
+		if filter.IsPublished != nil && a.IsPublished != *filter.IsPublished {
+			continue
+		}
+		if query != "" && !strings.Contains(strings.ToLower(a.Title), query) {
+			continue
+		}
+		items = append(items, a)
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].ID < items[j].ID
+	})
+
+	page := normalizePage(filter.Page)
+	pageSize := normalizePageSize(filter.PageSize)
+	totalItems := len(items)
+	totalPages := 0
+	if totalItems > 0 {
+		totalPages = (totalItems + pageSize - 1) / pageSize
+	}
+
+	start := (page - 1) * pageSize
+	if start > totalItems {
+		start = totalItems
+	}
+	end := start + pageSize
+	if end > totalItems {
+		end = totalItems
+	}
+
+	return paginatedAlbums{
+		Items:      items[start:end],
+		Page:       page,
+		PageSize:   pageSize,
+		TotalItems: totalItems,
+		TotalPages: totalPages,
+	}
+}
+
+func (s *trackStore) getAlbum(id int64) (album, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	a, ok := s.albums[id]
+	return a, ok
+}
+
+func (s *trackStore) getAlbumTracks(id int64) ([]track, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	a, ok := s.albums[id]
+	if !ok {
+		return nil, false
+	}
+
+	tracks := make([]track, 0, len(a.TrackIDs))
+	for _, trackID := range a.TrackIDs {
+		t, ok := s.tracks[trackID]
+		if !ok {
+			continue
+		}
+		tracks = append(tracks, t)
+	}
+	return tracks, true
+}
+
 func (s *trackStore) get(id int64) (track, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -656,66 +870,244 @@ func (s *trackStore) get(id int64) (track, bool) {
 	return t, ok
 }
 
+func (s *trackStore) createAlbum(req upsertAlbumRequest) (album, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	albumsSnapshot := cloneAlbumsMap(s.albums)
+	tracksSnapshot := cloneTracksMap(s.tracks)
+	nextAlbumIDSnapshot := s.nextAlbumID
+
+	a := album{
+		ID:             s.nextAlbumID,
+		Title:          strings.TrimSpace(req.Title),
+		CoverImagePath: strings.TrimSpace(req.CoverImagePath),
+		ReleaseDate:    req.ReleaseDate.UTC(),
+		IsPublished:    req.IsPublished,
+		TrackIDs:       normalizeTrackIDs(req.TrackIDs),
+		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
+	}
+	if err := s.validateAlbumLocked(a); err != nil {
+		return album{}, err
+	}
+
+	s.nextAlbumID++
+	s.albums[a.ID] = a
+	if err := s.applyAlbumTrackIDsLocked(a.ID, a.TrackIDs, false); err != nil {
+		s.albums = albumsSnapshot
+		s.tracks = tracksSnapshot
+		s.nextAlbumID = nextAlbumIDSnapshot
+		return album{}, err
+	}
+	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
+		s.albums = albumsSnapshot
+		s.tracks = tracksSnapshot
+		s.nextAlbumID = nextAlbumIDSnapshot
+		return album{}, err
+	}
+	if err := s.persistLocked(); err != nil {
+		s.albums = albumsSnapshot
+		s.tracks = tracksSnapshot
+		s.nextAlbumID = nextAlbumIDSnapshot
+		return album{}, err
+	}
+	return s.albums[a.ID], nil
+}
+
+func (s *trackStore) updateAlbum(id int64, req upsertAlbumRequest) (album, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current, ok := s.albums[id]
+	if !ok {
+		return album{}, false, nil
+	}
+	albumsSnapshot := cloneAlbumsMap(s.albums)
+	tracksSnapshot := cloneTracksMap(s.tracks)
+
+	updated := album{
+		ID:             id,
+		Title:          strings.TrimSpace(req.Title),
+		CoverImagePath: strings.TrimSpace(req.CoverImagePath),
+		ReleaseDate:    req.ReleaseDate.UTC(),
+		IsPublished:    req.IsPublished,
+		TrackIDs:       normalizeTrackIDs(req.TrackIDs),
+		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
+	}
+	if err := s.validateAlbumLocked(updated); err != nil {
+		return album{}, true, err
+	}
+	if removedTrackIDs := subtractTrackIDs(current.TrackIDs, updated.TrackIDs); len(removedTrackIDs) > 0 {
+		return album{}, true, fmt.Errorf("%w: cannot remove tracks from album using album update", errInvalidAlbum)
+	}
+
+	s.albums[id] = updated
+	if err := s.applyAlbumTrackIDsLocked(id, updated.TrackIDs, false); err != nil {
+		s.albums = albumsSnapshot
+		s.tracks = tracksSnapshot
+		return album{}, true, err
+	}
+	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
+		s.albums = albumsSnapshot
+		s.tracks = tracksSnapshot
+		return album{}, true, err
+	}
+	if err := s.persistLocked(); err != nil {
+		s.albums = albumsSnapshot
+		s.tracks = tracksSnapshot
+		return album{}, true, err
+	}
+	return s.albums[id], true, nil
+}
+
+func (s *trackStore) deleteAlbum(id int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	a, ok := s.albums[id]
+	if !ok {
+		return false, nil
+	}
+	if len(a.TrackIDs) > 0 {
+		return false, errAlbumInUse
+	}
+	delete(s.albums, id)
+	if err := s.persistLocked(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *trackStore) create(req upsertTrackRequest) (track, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	albumsSnapshot := cloneAlbumsMap(s.albums)
+	tracksSnapshot := cloneTracksMap(s.tracks)
+	nextTrackIDSnapshot := s.nextTrackID
+
+	if _, ok := s.albums[req.AlbumID]; !ok {
+		return track{}, fmt.Errorf("%w: albumId %d does not exist", errInvalidTrack, req.AlbumID)
+	}
 
 	t := track{
 		ID:             s.nextTrackID,
 		Name:           strings.TrimSpace(req.Name),
 		AuthorIDs:      normalizeAuthorIDs(req.AuthorIDs),
-		AlbumImagePath: strings.TrimSpace(req.AlbumImagePath),
+		AlbumID:        req.AlbumID,
 		AudioFilePath:  strings.TrimSpace(req.AudioFilePath),
+		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
 	}
-	if err := validateTrack(t, s.authors); err != nil {
+	if err := s.validateTrackLocked(t); err != nil {
 		return track{}, err
+	}
+
+	albumOrder, err := normalizeAlbumOrder(req.AlbumOrder, len(s.albums[req.AlbumID].TrackIDs), true)
+	if err != nil {
+		return track{}, fmt.Errorf("%w: %v", errInvalidTrack, err)
 	}
 
 	s.nextTrackID++
 	s.tracks[t.ID] = t
-	if err := s.persistLocked(); err != nil {
-		delete(s.tracks, t.ID)
-		s.nextTrackID--
+	targetAlbum := s.albums[req.AlbumID]
+	insertTrackIntoAlbumLocked(&targetAlbum, t.ID, albumOrder)
+	s.albums[req.AlbumID] = targetAlbum
+	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
+		s.albums = albumsSnapshot
+		s.tracks = tracksSnapshot
+		s.nextTrackID = nextTrackIDSnapshot
 		return track{}, err
 	}
-	return t, nil
+	if err := s.persistLocked(); err != nil {
+		s.albums = albumsSnapshot
+		s.tracks = tracksSnapshot
+		s.nextTrackID = nextTrackIDSnapshot
+		return track{}, err
+	}
+	return s.tracks[t.ID], nil
 }
 
 func (s *trackStore) update(id int64, req upsertTrackRequest) (track, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.tracks[id]; !ok {
+	albumsSnapshot := cloneAlbumsMap(s.albums)
+	tracksSnapshot := cloneTracksMap(s.tracks)
+
+	current, ok := s.tracks[id]
+	if !ok {
 		return track{}, false, nil
 	}
+	if _, ok := s.albums[req.AlbumID]; !ok {
+		return track{}, true, fmt.Errorf("%w: albumId %d does not exist", errInvalidTrack, req.AlbumID)
+	}
 
-	t := track{
+	updated := track{
 		ID:             id,
 		Name:           strings.TrimSpace(req.Name),
 		AuthorIDs:      normalizeAuthorIDs(req.AuthorIDs),
-		AlbumImagePath: strings.TrimSpace(req.AlbumImagePath),
+		AlbumID:        req.AlbumID,
 		AudioFilePath:  strings.TrimSpace(req.AudioFilePath),
+		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
 	}
-	if err := validateTrack(t, s.authors); err != nil {
+	if err := s.validateTrackLocked(updated); err != nil {
 		return track{}, true, err
 	}
 
-	s.tracks[id] = t
-	if err := s.persistLocked(); err != nil {
+	currentAlbum := s.albums[current.AlbumID]
+	targetAlbum := s.albums[updated.AlbumID]
+	targetLength := len(targetAlbum.TrackIDs)
+	if current.AlbumID == updated.AlbumID {
+		targetLength--
+	}
+	albumOrder, err := normalizeAlbumOrder(req.AlbumOrder, targetLength, true)
+	if err != nil {
+		return track{}, true, fmt.Errorf("%w: %v", errInvalidTrack, err)
+	}
+
+	s.tracks[id] = updated
+	removeTrackFromAlbumLocked(&currentAlbum, id)
+	s.albums[current.AlbumID] = currentAlbum
+	targetAlbum = s.albums[updated.AlbumID]
+	insertTrackIntoAlbumLocked(&targetAlbum, id, albumOrder)
+	s.albums[updated.AlbumID] = targetAlbum
+	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
+		s.albums = albumsSnapshot
+		s.tracks = tracksSnapshot
 		return track{}, true, err
 	}
-	return t, true, nil
+	if err := s.persistLocked(); err != nil {
+		s.albums = albumsSnapshot
+		s.tracks = tracksSnapshot
+		return track{}, true, err
+	}
+	return s.tracks[id], true, nil
 }
 
 func (s *trackStore) delete(id int64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.tracks[id]; !ok {
+	albumsSnapshot := cloneAlbumsMap(s.albums)
+	tracksSnapshot := cloneTracksMap(s.tracks)
+
+	t, ok := s.tracks[id]
+	if !ok {
 		return false, nil
 	}
 	delete(s.tracks, id)
+	if albumItem, ok := s.albums[t.AlbumID]; ok {
+		removeTrackFromAlbumLocked(&albumItem, id)
+		s.albums[t.AlbumID] = albumItem
+	}
+	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
+		s.albums = albumsSnapshot
+		s.tracks = tracksSnapshot
+		return false, err
+	}
 	if err := s.persistLocked(); err != nil {
+		s.albums = albumsSnapshot
+		s.tracks = tracksSnapshot
 		return false, err
 	}
 	return true, nil
@@ -1014,6 +1406,14 @@ func (s *trackStore) persistLocked() error {
 		return trackItems[i].ID < trackItems[j].ID
 	})
 
+	albumItems := make([]album, 0, len(s.albums))
+	for _, a := range s.albums {
+		albumItems = append(albumItems, a)
+	}
+	sort.Slice(albumItems, func(i, j int) bool {
+		return albumItems[i].ID < albumItems[j].ID
+	})
+
 	authorItems := make([]author, 0, len(s.authors))
 	for _, a := range s.authors {
 		authorItems = append(authorItems, a)
@@ -1043,9 +1443,11 @@ func (s *trackStore) persistLocked() error {
 
 	payload, err := json.MarshalIndent(dbFile{
 		NextTrackID:  s.nextTrackID,
+		NextAlbumID:  s.nextAlbumID,
 		NextAuthorID: s.nextAuthorID,
 		NextUserID:   s.nextUserID,
 		Tracks:       trackItems,
+		Albums:       albumItems,
 		Authors:      authorItems,
 		Users:        userItems,
 		Sessions:     sessionItems,
@@ -1101,96 +1503,24 @@ func listSongsHandler(songsDir string) http.HandlerFunc {
 
 func uploadSongHandler(songsDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, maxSongUploadSize)
-		if err := r.ParseMultipartForm(maxSongUploadSize); err != nil {
-			http.Error(w, "invalid multipart form", http.StatusBadRequest)
-			return
-		}
-
-		file, header, err := r.FormFile("file")
+		info, err := uploadMediaFile(w, r, songsDir, "song already exists", "failed to create song file", "/songs/")
 		if err != nil {
-			http.Error(w, "file is required", http.StatusBadRequest)
+			writeUploadError(w, err)
 			return
 		}
-		defer file.Close()
-
-		name, err := sanitizeSongFileName(header.Filename)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		fullPath := filepath.Join(songsDir, name)
-		dst, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-		if err != nil {
-			if errors.Is(err, os.ErrExist) {
-				http.Error(w, "song already exists", http.StatusConflict)
-				return
-			}
-			http.Error(w, "failed to create song file", http.StatusInternalServerError)
-			return
-		}
-
-		copyErr := false
-		if _, err := io.Copy(dst, file); err != nil {
-			copyErr = true
-		}
-		if err := dst.Close(); err != nil {
-			copyErr = true
-		}
-		if copyErr {
-			_ = os.Remove(fullPath)
-			http.Error(w, "failed to save song", http.StatusInternalServerError)
-			return
-		}
-
-		info, err := os.Stat(fullPath)
-		if err != nil {
-			_ = os.Remove(fullPath)
-			http.Error(w, "failed to read saved song", http.StatusInternalServerError)
-			return
-		}
-		if info.Size() == 0 {
-			_ = os.Remove(fullPath)
-			http.Error(w, "uploaded file is empty", http.StatusBadRequest)
-			return
-		}
-
-		writeJSON(w, http.StatusCreated, buildSongInfo(name, info))
+		writeJSON(w, http.StatusCreated, info)
 	}
 }
 
 func getSongHandler(songsDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		encodedName := strings.TrimPrefix(r.URL.Path, "/songs/")
-		if encodedName == "" {
-			http.NotFound(w, r)
-			return
-		}
+		serveMediaFile(w, r, "/songs/", songsDir)
+	}
+}
 
-		name, err := url.PathUnescape(encodedName)
-		if err != nil {
-			http.Error(w, "invalid song name", http.StatusBadRequest)
-			return
-		}
-
-		cleanName := filepath.Base(filepath.Clean(name))
-		if cleanName == "." || cleanName == "/" || cleanName == "" {
-			http.Error(w, "invalid song name", http.StatusBadRequest)
-			return
-		}
-
-		fullPath := filepath.Join(songsDir, cleanName)
-		if _, err := os.Stat(fullPath); err != nil {
-			if os.IsNotExist(err) {
-				http.NotFound(w, r)
-				return
-			}
-			http.Error(w, "failed to read song", http.StatusInternalServerError)
-			return
-		}
-
-		http.ServeFile(w, r, fullPath)
+func getAlbumCoverHandler(albumCoversDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		serveMediaFile(w, r, "/album-covers/", albumCoversDir)
 	}
 }
 
@@ -1216,6 +1546,245 @@ func sanitizeSongFileName(name string) (string, error) {
 	}
 
 	return cleanName, nil
+}
+
+func serveMediaFile(w http.ResponseWriter, r *http.Request, prefix, dir string) {
+	encodedName := strings.TrimPrefix(r.URL.Path, prefix)
+	if encodedName == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	name, err := url.PathUnescape(encodedName)
+	if err != nil {
+		http.Error(w, "invalid song name", http.StatusBadRequest)
+		return
+	}
+
+	cleanName := filepath.Base(filepath.Clean(name))
+	if cleanName == "." || cleanName == "/" || cleanName == "" {
+		http.Error(w, "invalid song name", http.StatusBadRequest)
+		return
+	}
+
+	fullPath := filepath.Join(dir, cleanName)
+	if _, err := os.Stat(fullPath); err != nil {
+		if os.IsNotExist(err) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "failed to read file", http.StatusInternalServerError)
+		return
+	}
+
+	http.ServeFile(w, r, fullPath)
+}
+
+func uploadMediaFile(w http.ResponseWriter, r *http.Request, dir, alreadyExistsMessage, createFailureMessage, urlPrefix string) (albumCoverInfo, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxSongUploadSize)
+	if err := r.ParseMultipartForm(maxSongUploadSize); err != nil {
+		return albumCoverInfo{}, errors.New("invalid multipart form")
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		return albumCoverInfo{}, errors.New("file is required")
+	}
+	defer file.Close()
+
+	name, err := sanitizeSongFileName(header.Filename)
+	if err != nil {
+		return albumCoverInfo{}, err
+	}
+
+	fullPath := filepath.Join(dir, name)
+	dst, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return albumCoverInfo{}, errors.New(alreadyExistsMessage)
+		}
+		return albumCoverInfo{}, errors.New(createFailureMessage)
+	}
+
+	copyErr := false
+	if _, err := io.Copy(dst, file); err != nil {
+		copyErr = true
+	}
+	if err := dst.Close(); err != nil {
+		copyErr = true
+	}
+	if copyErr {
+		_ = os.Remove(fullPath)
+		return albumCoverInfo{}, errors.New("failed to save uploaded file")
+	}
+
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		_ = os.Remove(fullPath)
+		return albumCoverInfo{}, errors.New("failed to read saved file")
+	}
+	if info.Size() == 0 {
+		_ = os.Remove(fullPath)
+		return albumCoverInfo{}, errors.New("uploaded file is empty")
+	}
+
+	return albumCoverInfo{
+		Name:         name,
+		SizeBytes:    info.Size(),
+		LastModified: info.ModTime(),
+		URL:          urlPrefix + url.PathEscape(name),
+	}, nil
+}
+
+func writeUploadError(w http.ResponseWriter, err error) {
+	switch err.Error() {
+	case "invalid multipart form", "file is required", "uploaded filename is required", "invalid song name", "uploaded file is empty":
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	case "song already exists", "album cover already exists":
+		http.Error(w, err.Error(), http.StatusConflict)
+	case "failed to create song file", "failed to create album cover file", "failed to save uploaded file", "failed to read saved file":
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	default:
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	}
+}
+
+func listAlbumsHandler(store *trackStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		filter, err := parseAlbumListFilter(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, store.listAlbums(filter))
+	}
+}
+
+func createAlbumHandler(store *trackStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		req, err := decodeUpsertAlbumRequest(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		a, err := store.createAlbum(req)
+		if err != nil {
+			if errors.Is(err, errInvalidAlbum) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			http.Error(w, "failed to create album", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusCreated, a)
+	}
+}
+
+func getAlbumByRouteHandler(store *trackStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/tracks") {
+			getAlbumTracksHandler(store).ServeHTTP(w, r)
+			return
+		}
+		getAlbumByIDHandler(store).ServeHTTP(w, r)
+	}
+}
+
+func getAlbumByIDHandler(store *trackStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := parseAlbumID(r.URL.Path)
+		if err != nil {
+			http.Error(w, "invalid album id", http.StatusBadRequest)
+			return
+		}
+		a, ok := store.getAlbum(id)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, a)
+	}
+}
+
+func getAlbumTracksHandler(store *trackStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := parseAlbumTracksID(r.URL.Path)
+		if err != nil {
+			http.Error(w, "invalid album id", http.StatusBadRequest)
+			return
+		}
+		tracks, ok := store.getAlbumTracks(id)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, tracks)
+	}
+}
+
+func updateAlbumByRouteHandler(store *trackStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := parseAlbumID(r.URL.Path)
+		if err != nil {
+			http.Error(w, "invalid album id", http.StatusBadRequest)
+			return
+		}
+		req, err := decodeUpsertAlbumRequest(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		a, exists, err := store.updateAlbum(id, req)
+		if !exists {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			if errors.Is(err, errInvalidAlbum) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			http.Error(w, "failed to update album", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, a)
+	}
+}
+
+func deleteAlbumByRouteHandler(store *trackStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := parseAlbumID(r.URL.Path)
+		if err != nil {
+			http.Error(w, "invalid album id", http.StatusBadRequest)
+			return
+		}
+		deleted, err := store.deleteAlbum(id)
+		if err != nil {
+			if errors.Is(err, errAlbumInUse) {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
+			http.Error(w, "failed to delete album", http.StatusInternalServerError)
+			return
+		}
+		if !deleted {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func uploadAlbumCoverHandler(albumCoversDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		info, err := uploadMediaFile(w, r, albumCoversDir, "album cover already exists", "failed to create album cover file", "/album-covers/")
+		if err != nil {
+			writeUploadError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, info)
+	}
 }
 
 func listTracksHandler(store *trackStore) http.HandlerFunc {
@@ -1680,6 +2249,14 @@ func decodeUpsertTrackRequest(r *http.Request) (upsertTrackRequest, error) {
 	return req, nil
 }
 
+func decodeUpsertAlbumRequest(r *http.Request) (upsertAlbumRequest, error) {
+	var req upsertAlbumRequest
+	if err := decodeJSON(r, &req); err != nil {
+		return upsertAlbumRequest{}, err
+	}
+	return req, nil
+}
+
 func decodeUpsertAuthorRequest(r *http.Request) (upsertAuthorRequest, error) {
 	var req upsertAuthorRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -1866,6 +2443,18 @@ func parseTrackID(path string) (int64, error) {
 	return parseResourceID(path, "/tracks/")
 }
 
+func parseAlbumID(path string) (int64, error) {
+	return parseResourceID(path, "/albums/")
+}
+
+func parseAlbumTracksID(path string) (int64, error) {
+	const suffix = "/tracks"
+	if !strings.HasSuffix(path, suffix) {
+		return 0, errors.New("invalid id")
+	}
+	return parseResourceID(strings.TrimSuffix(path, suffix), "/albums/")
+}
+
 func parseAuthorID(path string) (int64, error) {
 	return parseResourceID(path, "/authors/")
 }
@@ -1898,6 +2487,22 @@ func normalizePhotos(photos []string) []string {
 	return normalizeNames(photos)
 }
 
+func normalizeTrackIDs(trackIDs []int64) []int64 {
+	normalized := make([]int64, 0, len(trackIDs))
+	seen := make(map[int64]struct{}, len(trackIDs))
+	for _, id := range trackIDs {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		normalized = append(normalized, id)
+	}
+	return normalized
+}
+
 func normalizeAuthorIDs(authorIDs []int64) []int64 {
 	normalized := make([]int64, 0, len(authorIDs))
 	seen := make(map[int64]struct{}, len(authorIDs))
@@ -1914,14 +2519,344 @@ func normalizeAuthorIDs(authorIDs []int64) []int64 {
 	return normalized
 }
 
+func normalizeAdditionalInfo(items []additionalInfo) []additionalInfo {
+	if len(items) == 0 {
+		return []additionalInfo{}
+	}
+	normalized := make([]additionalInfo, 0, len(items))
+	for _, item := range items {
+		copied := make(additionalInfo, len(item))
+		for key, value := range item {
+			copied[key] = value
+		}
+		normalized = append(normalized, copied)
+	}
+	return normalized
+}
+
+func (s *trackStore) validateTrackLocked(t track) error {
+	switch {
+	case t.Name == "":
+		return fmt.Errorf("%w: name is required", errInvalidTrack)
+	case len(t.AuthorIDs) == 0:
+		return fmt.Errorf("%w: at least one authorId is required", errInvalidTrack)
+	case t.AlbumID <= 0:
+		return fmt.Errorf("%w: albumId is required", errInvalidTrack)
+	case t.AudioFilePath == "":
+		return fmt.Errorf("%w: audioFilePath is required", errInvalidTrack)
+	default:
+		for _, authorID := range t.AuthorIDs {
+			if _, ok := s.authors[authorID]; !ok {
+				return fmt.Errorf("%w: authorId %d does not exist", errInvalidTrack, authorID)
+			}
+		}
+		if _, ok := s.albums[t.AlbumID]; !ok {
+			return fmt.Errorf("%w: albumId %d does not exist", errInvalidTrack, t.AlbumID)
+		}
+		if err := validateAdditionalInfo(t.AdditionalInfo); err != nil {
+			return fmt.Errorf("%w: %v", errInvalidTrack, err)
+		}
+		return nil
+	}
+}
+
+func (s *trackStore) validateAlbumLocked(a album) error {
+	switch {
+	case a.Title == "":
+		return fmt.Errorf("%w: title is required", errInvalidAlbum)
+	case a.ReleaseDate.IsZero():
+		return fmt.Errorf("%w: releaseDate is required", errInvalidAlbum)
+	}
+	for _, trackID := range a.TrackIDs {
+		if _, ok := s.tracks[trackID]; !ok {
+			return fmt.Errorf("%w: trackId %d does not exist", errInvalidAlbum, trackID)
+		}
+	}
+	if a.IsPublished && len(a.TrackIDs) == 0 {
+		return fmt.Errorf("%w: album must contain at least one track before publishing", errInvalidAlbum)
+	}
+	if err := validateAdditionalInfo(a.AdditionalInfo); err != nil {
+		return fmt.Errorf("%w: %v", errInvalidAlbum, err)
+	}
+	return nil
+}
+
+func validateAdditionalInfo(items []additionalInfo) error {
+	for index, item := range items {
+		typeValue, ok := item["type"].(string)
+		if !ok || strings.TrimSpace(typeValue) == "" {
+			return fmt.Errorf("additionalInfo[%d].type is required", index)
+		}
+		switch strings.TrimSpace(typeValue) {
+		case "text":
+			title, ok := item["title"].(string)
+			if !ok || strings.TrimSpace(title) == "" {
+				return fmt.Errorf("additionalInfo[%d].title is required for type text", index)
+			}
+			text, ok := item["text"].(string)
+			if !ok || strings.TrimSpace(text) == "" {
+				return fmt.Errorf("additionalInfo[%d].text is required for type text", index)
+			}
+		}
+	}
+	return nil
+}
+
+func (s *trackStore) migrateLegacyAlbumsLocked() error {
+	trackIDs := make([]int64, 0, len(s.tracks))
+	for id := range s.tracks {
+		trackIDs = append(trackIDs, id)
+	}
+	sort.Slice(trackIDs, func(i, j int) bool {
+		return trackIDs[i] < trackIDs[j]
+	})
+
+	for _, trackID := range trackIDs {
+		t := s.tracks[trackID]
+		if t.AlbumID > 0 {
+			continue
+		}
+		albumID := s.nextAlbumID
+		s.nextAlbumID++
+		s.albums[albumID] = album{
+			ID:             albumID,
+			Title:          "STUB ALBUM",
+			CoverImagePath: "",
+			AuthorIDs:      []int64{},
+			ReleaseDate:    time.Now().UTC(),
+			IsPublished:    false,
+			TrackIDs:       []int64{trackID},
+			AdditionalInfo: []additionalInfo{},
+		}
+		t.AlbumID = albumID
+		s.tracks[trackID] = t
+	}
+	return nil
+}
+
+func (s *trackStore) rebuildAlbumDerivedDataLocked() error {
+	for albumID, albumItem := range s.albums {
+		normalizedTrackIDs := make([]int64, 0, len(albumItem.TrackIDs))
+		authorSet := make(map[int64]struct{})
+		for _, trackID := range normalizeTrackIDs(albumItem.TrackIDs) {
+			t, ok := s.tracks[trackID]
+			if !ok {
+				return fmt.Errorf("%w: trackId %d does not exist", errInvalidAlbum, trackID)
+			}
+			if t.AlbumID != albumID {
+				return fmt.Errorf("%w: trackId %d does not belong to albumId %d", errInvalidAlbum, trackID, albumID)
+			}
+			normalizedTrackIDs = append(normalizedTrackIDs, trackID)
+			for _, authorID := range t.AuthorIDs {
+				authorSet[authorID] = struct{}{}
+			}
+		}
+
+		albumItem.TrackIDs = normalizedTrackIDs
+		albumItem.AuthorIDs = setToSortedIDs(authorSet)
+		if len(albumItem.TrackIDs) == 0 {
+			albumItem.IsPublished = false
+		}
+		if err := s.validateAlbumLocked(albumItem); err != nil {
+			return err
+		}
+		s.albums[albumID] = albumItem
+	}
+	return nil
+}
+
+func (s *trackStore) applyAlbumTrackIDsLocked(albumID int64, trackIDs []int64, allowRemoval bool) error {
+	albumItem, ok := s.albums[albumID]
+	if !ok {
+		return fmt.Errorf("%w: albumId %d does not exist", errInvalidAlbum, albumID)
+	}
+
+	if !allowRemoval {
+		for _, existingTrackID := range albumItem.TrackIDs {
+			if !containsInt64(trackIDs, existingTrackID) {
+				return fmt.Errorf("%w: cannot remove tracks from album using album update", errInvalidAlbum)
+			}
+		}
+	}
+
+	for _, trackID := range trackIDs {
+		t, ok := s.tracks[trackID]
+		if !ok {
+			return fmt.Errorf("%w: trackId %d does not exist", errInvalidAlbum, trackID)
+		}
+		if t.AlbumID > 0 && t.AlbumID != albumID {
+			s.removeTrackFromAlbumLocked(t.AlbumID, trackID)
+		}
+		t.AlbumID = albumID
+		s.tracks[trackID] = t
+	}
+
+	albumItem.TrackIDs = normalizeTrackIDs(trackIDs)
+	s.albums[albumID] = albumItem
+	return nil
+}
+
+func (s *trackStore) removeTrackFromAlbumLocked(albumID, trackID int64) {
+	albumItem, ok := s.albums[albumID]
+	if !ok {
+		return
+	}
+	removeTrackFromAlbumLocked(&albumItem, trackID)
+	s.albums[albumID] = albumItem
+}
+
+func removeTrackFromAlbumLocked(albumItem *album, trackID int64) {
+	filtered := make([]int64, 0, len(albumItem.TrackIDs))
+	for _, existingID := range albumItem.TrackIDs {
+		if existingID == trackID {
+			continue
+		}
+		filtered = append(filtered, existingID)
+	}
+	albumItem.TrackIDs = filtered
+}
+
+func insertTrackIntoAlbumLocked(albumItem *album, trackID int64, index int) {
+	filtered := make([]int64, 0, len(albumItem.TrackIDs)+1)
+	for _, existingID := range albumItem.TrackIDs {
+		if existingID == trackID {
+			continue
+		}
+		filtered = append(filtered, existingID)
+	}
+	if index < 0 {
+		index = 0
+	}
+	if index > len(filtered) {
+		index = len(filtered)
+	}
+	filtered = append(filtered[:index], append([]int64{trackID}, filtered[index:]...)...)
+	albumItem.TrackIDs = filtered
+}
+
+func setToSortedIDs(items map[int64]struct{}) []int64 {
+	ids := make([]int64, 0, len(items))
+	for id := range items {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return ids[i] < ids[j]
+	})
+	return ids
+}
+
+func containsInt64(items []int64, target int64) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeAlbumOrder(order, maxIndex int, allowAppend bool) (int, error) {
+	if order < 0 {
+		return 0, errors.New("albumOrder must be greater than or equal to 0")
+	}
+	limit := maxIndex
+	if allowAppend {
+		limit = maxIndex
+	}
+	if order > limit {
+		return 0, fmt.Errorf("albumOrder must be less than or equal to %d", limit)
+	}
+	return order, nil
+}
+
+func normalizePage(page int) int {
+	if page <= 0 {
+		return 1
+	}
+	return page
+}
+
+func normalizePageSize(pageSize int) int {
+	if pageSize <= 0 {
+		return 20
+	}
+	if pageSize > 100 {
+		return 100
+	}
+	return pageSize
+}
+
+func parseAlbumListFilter(values url.Values) (albumListFilter, error) {
+	filter := albumListFilter{
+		Page:     parseIntWithDefault(values.Get("page"), 1),
+		PageSize: parseIntWithDefault(values.Get("pageSize"), 20),
+		Query:    strings.TrimSpace(values.Get("query")),
+	}
+	if rawAuthorID := strings.TrimSpace(values.Get("authorId")); rawAuthorID != "" {
+		authorID, err := strconv.ParseInt(rawAuthorID, 10, 64)
+		if err != nil || authorID <= 0 {
+			return albumListFilter{}, errors.New("authorId must be a positive integer")
+		}
+		filter.AuthorID = authorID
+	}
+	if rawPublished := strings.TrimSpace(values.Get("isPublished")); rawPublished != "" {
+		parsed, err := strconv.ParseBool(rawPublished)
+		if err != nil {
+			return albumListFilter{}, errors.New("isPublished must be true or false")
+		}
+		filter.IsPublished = &parsed
+	}
+	return filter, nil
+}
+
+func parseIntWithDefault(raw string, fallback int) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func cloneTracksMap(src map[int64]track) map[int64]track {
+	cloned := make(map[int64]track, len(src))
+	for id, item := range src {
+		item.AuthorIDs = append([]int64(nil), item.AuthorIDs...)
+		item.AdditionalInfo = normalizeAdditionalInfo(item.AdditionalInfo)
+		cloned[id] = item
+	}
+	return cloned
+}
+
+func cloneAlbumsMap(src map[int64]album) map[int64]album {
+	cloned := make(map[int64]album, len(src))
+	for id, item := range src {
+		item.AuthorIDs = append([]int64(nil), item.AuthorIDs...)
+		item.TrackIDs = append([]int64(nil), item.TrackIDs...)
+		item.AdditionalInfo = normalizeAdditionalInfo(item.AdditionalInfo)
+		cloned[id] = item
+	}
+	return cloned
+}
+
+func subtractTrackIDs(left, right []int64) []int64 {
+	missing := make([]int64, 0)
+	for _, id := range left {
+		if !containsInt64(right, id) {
+			missing = append(missing, id)
+		}
+	}
+	return missing
+}
+
 func validateTrack(t track, authors map[int64]author) error {
 	switch {
 	case t.Name == "":
 		return fmt.Errorf("%w: name is required", errInvalidTrack)
 	case len(t.AuthorIDs) == 0:
 		return fmt.Errorf("%w: at least one authorId is required", errInvalidTrack)
-	case t.AlbumImagePath == "":
-		return fmt.Errorf("%w: albumImagePath is required", errInvalidTrack)
 	case t.AudioFilePath == "":
 		return fmt.Errorf("%w: audioFilePath is required", errInvalidTrack)
 	default:
@@ -2014,7 +2949,9 @@ func redocHandler() http.HandlerFunc {
 }
 
 var errInvalidTrack = errors.New("invalid track payload")
+var errInvalidAlbum = errors.New("invalid album payload")
 var errInvalidAuthor = errors.New("invalid author payload")
+var errAlbumInUse = errors.New("album is used by one or more tracks")
 var errAuthorInUse = errors.New("author is used by one or more tracks")
 var errEmailAlreadyExists = errors.New("user with this email already exists")
 var errInvalidCredentials = errors.New("invalid email or password")

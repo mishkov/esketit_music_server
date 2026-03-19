@@ -1,9 +1,9 @@
 openapi: 3.0.3
 info:
   title: Esketit Music Server API
-  version: 1.2.0
+  version: 1.3.0
   description: |
-    REST API for listing/serving song files, managing tracks and authors,
+    REST API for listing and uploading media files, managing albums, tracks, and authors,
     and authenticating users with access and refresh tokens.
 
 servers:
@@ -12,21 +12,17 @@ servers:
 
 tags:
   - name: Auth
-    description: Authentication endpoints
   - name: Songs
-    description: Read-only endpoints for song files
+  - name: Album Covers
+  - name: Albums
   - name: Tracks
-    description: CRUD endpoints for tracks
   - name: Authors
-    description: CRUD endpoints for authors
 
 paths:
   /auth/register:
     post:
       tags: [Auth]
       summary: Register a new user
-      description: The first registered user becomes `admin`; later users become `listener`.
-      operationId: register
       requestBody:
         required: true
         content:
@@ -55,7 +51,6 @@ paths:
     post:
       tags: [Auth]
       summary: Log in with email and password
-      operationId: login
       requestBody:
         required: true
         content:
@@ -71,8 +66,6 @@ paths:
                 $ref: '#/components/schemas/AuthResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':
@@ -82,7 +75,6 @@ paths:
     post:
       tags: [Auth]
       summary: Rotate refresh token and issue a new access token
-      operationId: refresh
       requestBody:
         required: true
         content:
@@ -107,7 +99,6 @@ paths:
     post:
       tags: [Auth]
       summary: Revoke a refresh token
-      operationId: logout
       requestBody:
         required: true
         content:
@@ -126,7 +117,6 @@ paths:
     get:
       tags: [Auth]
       summary: Get the currently authenticated user
-      operationId: me
       security:
         - bearerAuth: []
       responses:
@@ -143,7 +133,6 @@ paths:
     get:
       tags: [Songs]
       summary: List songs
-      operationId: listSongs
       responses:
         '200':
           description: Song list
@@ -152,14 +141,12 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/SongInfo'
+                  $ref: '#/components/schemas/FileInfo'
         '500':
           $ref: '#/components/responses/InternalServerError'
-
     post:
       tags: [Songs]
       summary: Upload song
-      operationId: uploadSong
       security:
         - bearerAuth: []
       requestBody:
@@ -167,19 +154,14 @@ paths:
         content:
           multipart/form-data:
             schema:
-              type: object
-              properties:
-                file:
-                  type: string
-                  format: binary
-              required: [file]
+              $ref: '#/components/schemas/FileUploadRequest'
       responses:
         '201':
           description: Uploaded song metadata
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SongInfo'
+                $ref: '#/components/schemas/FileInfo'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -187,11 +169,7 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
         '409':
-          description: Song with the same filename already exists
-          content:
-            text/plain:
-              schema:
-                $ref: '#/components/schemas/PlainError'
+          $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalServerError'
 
@@ -199,16 +177,62 @@ paths:
     get:
       tags: [Songs]
       summary: Get song file
-      operationId: getSong
       parameters:
-        - name: name
-          in: path
-          required: true
-          schema:
-            type: string
+        - $ref: '#/components/parameters/FileName'
       responses:
         '200':
           description: Song file stream
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /album-covers:
+    post:
+      tags: [Album Covers]
+      summary: Upload album cover
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/FileUploadRequest'
+      responses:
+        '201':
+          description: Uploaded album cover metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /album-covers/{name}:
+    get:
+      tags: [Album Covers]
+      summary: Get album cover file
+      parameters:
+        - $ref: '#/components/parameters/FileName'
+      responses:
+        '200':
+          description: Album cover file stream
           content:
             application/octet-stream:
               schema:
@@ -225,7 +249,6 @@ paths:
     get:
       tags: [Authors]
       summary: List authors
-      operationId: listAuthors
       responses:
         '200':
           description: Author list sorted by ID asc
@@ -235,11 +258,9 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Author'
-
     post:
       tags: [Authors]
       summary: Create author
-      operationId: createAuthor
       security:
         - bearerAuth: []
       requestBody:
@@ -259,6 +280,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           $ref: '#/components/responses/InternalServerError'
 
@@ -266,15 +289,8 @@ paths:
     get:
       tags: [Authors]
       summary: Get author by ID
-      operationId: getAuthorById
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: integer
-            format: int64
-            minimum: 1
+        - $ref: '#/components/parameters/ResourceId'
       responses:
         '200':
           description: Author
@@ -286,21 +302,13 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
-
     put:
       tags: [Authors]
       summary: Update author by ID
-      operationId: updateAuthor
       security:
         - bearerAuth: []
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: integer
-            format: int64
-            minimum: 1
+        - $ref: '#/components/parameters/ResourceId'
       requestBody:
         required: true
         content:
@@ -316,38 +324,30 @@ paths:
                 $ref: '#/components/schemas/Author'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/InternalServerError'
-
     delete:
       tags: [Authors]
       summary: Delete author by ID
-      operationId: deleteAuthor
       security:
         - bearerAuth: []
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: integer
-            format: int64
-            minimum: 1
+        - $ref: '#/components/parameters/ResourceId'
       responses:
         '204':
           description: Deleted
         '400':
           $ref: '#/components/responses/BadRequest'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -359,11 +359,172 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /albums:
+    get:
+      tags: [Albums]
+      summary: List albums
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: authorId
+          in: query
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: query
+          in: query
+          schema:
+            type: string
+        - name: isPublished
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Album page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedAlbums'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+    post:
+      tags: [Albums]
+      summary: Create album
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertAlbumRequest'
+      responses:
+        '201':
+          description: Created album
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Album'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /albums/{id}:
+    get:
+      tags: [Albums]
+      summary: Get album by ID
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '200':
+          description: Album
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Album'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Albums]
+      summary: Update album by ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertAlbumRequest'
+      responses:
+        '200':
+          description: Updated album
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Album'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Albums]
+      summary: Delete album by ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '204':
+          description: Deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Album is used by one or more tracks
+          content:
+            text/plain:
+              schema:
+                $ref: '#/components/schemas/PlainError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /albums/{id}/tracks:
+    get:
+      tags: [Albums]
+      summary: List album tracks in album order
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '200':
+          description: Tracks in album order
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Track'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /tracks:
     get:
       tags: [Tracks]
       summary: List tracks
-      operationId: listTracks
       responses:
         '200':
           description: Track list sorted by ID asc
@@ -373,11 +534,9 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Track'
-
     post:
       tags: [Tracks]
       summary: Create track
-      operationId: createTrack
       security:
         - bearerAuth: []
       requestBody:
@@ -395,10 +554,10 @@ paths:
                 $ref: '#/components/schemas/Track'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           $ref: '#/components/responses/InternalServerError'
 
@@ -406,15 +565,8 @@ paths:
     get:
       tags: [Tracks]
       summary: Get track by ID
-      operationId: getTrackById
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: integer
-            format: int64
-            minimum: 1
+        - $ref: '#/components/parameters/ResourceId'
       responses:
         '200':
           description: Track
@@ -426,21 +578,13 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
-
     put:
       tags: [Tracks]
       summary: Update track by ID
-      operationId: updateTrack
       security:
         - bearerAuth: []
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: integer
-            format: int64
-            minimum: 1
+        - $ref: '#/components/parameters/ResourceId'
       requestBody:
         required: true
         content:
@@ -456,38 +600,30 @@ paths:
                 $ref: '#/components/schemas/Track'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/InternalServerError'
-
     delete:
       tags: [Tracks]
       summary: Delete track by ID
-      operationId: deleteTrack
       security:
         - bearerAuth: []
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: integer
-            format: int64
-            minimum: 1
+        - $ref: '#/components/parameters/ResourceId'
       responses:
         '204':
           description: Deleted
         '400':
           $ref: '#/components/responses/BadRequest'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
@@ -500,8 +636,73 @@ components:
       scheme: bearer
       bearerFormat: JWT
 
+  parameters:
+    ResourceId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    FileName:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        text/plain:
+          schema:
+            $ref: '#/components/schemas/PlainError'
+    Unauthorized:
+      description: Authentication required or invalid credentials
+      content:
+        text/plain:
+          schema:
+            $ref: '#/components/schemas/PlainError'
+    Forbidden:
+      description: Insufficient permissions
+      content:
+        text/plain:
+          schema:
+            $ref: '#/components/schemas/PlainError'
+    NotFound:
+      description: Resource not found
+      content:
+        text/plain:
+          schema:
+            $ref: '#/components/schemas/PlainError'
+    Conflict:
+      description: Resource already exists or cannot be modified in the requested way
+      content:
+        text/plain:
+          schema:
+            $ref: '#/components/schemas/PlainError'
+    InternalServerError:
+      description: Internal server error
+      content:
+        text/plain:
+          schema:
+            $ref: '#/components/schemas/PlainError'
+
   schemas:
-    SongInfo:
+    PlainError:
+      type: string
+
+    FileUploadRequest:
+      type: object
+      properties:
+        file:
+          type: string
+          format: binary
+      required: [file]
+
+    FileInfo:
       type: object
       properties:
         name:
@@ -515,6 +716,28 @@ components:
         url:
           type: string
       required: [name, sizeBytes, lastModified, url]
+
+    AdditionalInfo:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+      additionalProperties: true
+
+    TextAdditionalInfo:
+      allOf:
+        - $ref: '#/components/schemas/AdditionalInfo'
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [text]
+            title:
+              type: string
+            text:
+              type: string
+          required: [type, title, text]
 
     Author:
       type: object
@@ -542,6 +765,71 @@ components:
             type: string
       required: [currentName, photos]
 
+    Album:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        title:
+          type: string
+        coverImagePath:
+          type: string
+        authorIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        releaseDate:
+          type: string
+          format: date-time
+        isPublished:
+          type: boolean
+        trackIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        additionalInfo:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdditionalInfo'
+      required: [id, title, coverImagePath, authorIds, releaseDate, isPublished, trackIds, additionalInfo]
+
+    UpsertAlbumRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          minLength: 1
+        coverImagePath:
+          type: string
+        authorIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+          description: Ignored on write; server recalculates this field from album tracks.
+        releaseDate:
+          type: string
+          format: date-time
+        isPublished:
+          type: boolean
+        trackIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        additionalInfo:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdditionalInfo'
+      required: [title, releaseDate, isPublished, trackIds, additionalInfo]
+
     Track:
       type: object
       properties:
@@ -556,11 +844,17 @@ components:
             type: integer
             format: int64
             minimum: 1
-        albumImagePath:
-          type: string
+        albumId:
+          type: integer
+          format: int64
+          minimum: 1
         audioFilePath:
           type: string
-      required: [id, name, authorIds, albumImagePath, audioFilePath]
+        additionalInfo:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdditionalInfo'
+      required: [id, name, authorIds, albumId, audioFilePath, additionalInfo]
 
     UpsertTrackRequest:
       type: object
@@ -575,13 +869,38 @@ components:
             type: integer
             format: int64
             minimum: 1
-        albumImagePath:
-          type: string
-          minLength: 1
+        albumId:
+          type: integer
+          format: int64
+          minimum: 1
+        albumOrder:
+          type: integer
+          minimum: 0
         audioFilePath:
           type: string
           minLength: 1
-      required: [name, authorIds, albumImagePath, audioFilePath]
+        additionalInfo:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdditionalInfo'
+      required: [name, authorIds, albumId, albumOrder, audioFilePath, additionalInfo]
+
+    PaginatedAlbums:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Album'
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        totalItems:
+          type: integer
+        totalPages:
+          type: integer
+      required: [items, page, pageSize, totalItems, totalPages]
 
     RegisterRequest:
       type: object
@@ -644,40 +963,8 @@ components:
           type: string
           format: date-time
       required:
-        [user, accessToken, accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt]
-
-    PlainError:
-      type: string
-      example: invalid track id
-
-  responses:
-    BadRequest:
-      description: Bad request
-      content:
-        text/plain:
-          schema:
-            $ref: '#/components/schemas/PlainError'
-    Unauthorized:
-      description: Authentication failed or missing
-      content:
-        text/plain:
-          schema:
-            $ref: '#/components/schemas/PlainError'
-    Forbidden:
-      description: Authenticated user does not have permission for this action
-      content:
-        text/plain:
-          schema:
-            $ref: '#/components/schemas/PlainError'
-    NotFound:
-      description: Not found
-      content:
-        text/plain:
-          schema:
-            $ref: '#/components/schemas/PlainError'
-    InternalServerError:
-      description: Internal server error
-      content:
-        text/plain:
-          schema:
-            $ref: '#/components/schemas/PlainError'
+        - user
+        - accessToken
+        - accessTokenExpiresAt
+        - refreshToken
+        - refreshTokenExpiresAt

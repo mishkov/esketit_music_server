@@ -7,9 +7,11 @@ APP_NAME="esketit_music_server"
 APP_BINARY="$SCRIPT_DIR/$APP_NAME"
 
 DEFAULT_SONGS_DIR="$HOME/Projects/esketit_music/media_storage/songs"
+DEFAULT_ALBUM_COVERS_DIR="$HOME/Projects/esketit_music/media_storage/album_covers"
 DEFAULT_TRACKS_DB_PATH="$SCRIPT_DIR/tracks_db.json"
 
 export SONGS_DIR="${SONGS_DIR:-$DEFAULT_SONGS_DIR}"
+export ALBUM_COVERS_DIR="${ALBUM_COVERS_DIR:-$DEFAULT_ALBUM_COVERS_DIR}"
 export TRACKS_DB_PATH="${TRACKS_DB_PATH:-$DEFAULT_TRACKS_DB_PATH}"
 
 if [[ -z "${AUTH_SECRET:-}" ]]; then
@@ -37,5 +39,6 @@ GOCACHE="${GOCACHE:-/tmp/go-build-cache}" go build -o "$APP_BINARY" .
 
 echo "Starting $APP_NAME..."
 echo "SONGS_DIR=$SONGS_DIR"
+echo "ALBUM_COVERS_DIR=$ALBUM_COVERS_DIR"
 echo "TRACKS_DB_PATH=$TRACKS_DB_PATH"
 exec "$APP_BINARY"
