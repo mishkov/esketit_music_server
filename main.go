@@ -301,6 +301,22 @@ func main() {
 		log.Fatalf("invalid album covers directory %q: %v", albumCoversDir, err)
 	}
 
+	telegramStateDir := os.Getenv("TELEGRAM_STATE_DIR")
+	if telegramStateDir == "" {
+		telegramStateDir = "telegram_state"
+	}
+	if err := ensureDirOrCreate(telegramStateDir); err != nil {
+		log.Fatalf("invalid telegram state directory %q: %v", telegramStateDir, err)
+	}
+
+	telegramImportTempDir := os.Getenv("TELEGRAM_IMPORT_TEMP_DIR")
+	if telegramImportTempDir == "" {
+		telegramImportTempDir = "telegram_import_tmp"
+	}
+	if err := ensureDirOrCreate(telegramImportTempDir); err != nil {
+		log.Fatalf("invalid telegram import temp directory %q: %v", telegramImportTempDir, err)
+	}
+
 	tracksDBPath := os.Getenv("TRACKS_DB_PATH")
 	if tracksDBPath == "" {
 		tracksDBPath = "tracks_db.json"
@@ -318,6 +334,12 @@ func main() {
 
 	auth := newAuthManager([]byte(authSecret), defaultAccessTokenTTL, defaultRefreshTokenTTL)
 	logMode := resolveLogMode(os.Getenv("LOG_MODE"))
+	telegramConfig, err := loadTelegramConfig(telegramStateDir, telegramImportTempDir)
+	if err != nil {
+		log.Fatalf("failed to initialize telegram configuration: %v", err)
+	}
+	telegramGateway := newGotdTelegramGateway(telegramConfig)
+	telegramImport := newTelegramImportService(telegramConfig, telegramGateway, store, songsDir)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /songs", listSongsHandler(songsDir))
@@ -345,6 +367,17 @@ func main() {
 	mux.HandleFunc("POST /auth/refresh", refreshHandler(store, auth))
 	mux.HandleFunc("POST /auth/logout", logoutHandler(store))
 	mux.Handle("GET /auth/me", requireAuth(auth, store, meHandler(store)))
+	mux.Handle("GET /telegram/status", requireRole(auth, store, roleAdmin, telegramStatusHandler(telegramImport)))
+	mux.Handle("POST /telegram/auth/request", requireRole(auth, store, roleAdmin, telegramAuthRequestHandler(telegramImport)))
+	mux.Handle("POST /telegram/auth/confirm", requireRole(auth, store, roleAdmin, telegramAuthConfirmHandler(telegramImport)))
+	mux.Handle("POST /telegram/auth/password", requireRole(auth, store, roleAdmin, telegramAuthPasswordHandler(telegramImport)))
+	mux.Handle("POST /telegram/import-sessions", requireRole(auth, store, roleAdmin, telegramStartImportHandler(telegramImport)))
+	mux.Handle("GET /telegram/import-sessions/current", requireRole(auth, store, roleAdmin, telegramCurrentImportHandler(telegramImport)))
+	mux.Handle("POST /telegram/import-sessions/current/skip", requireRole(auth, store, roleAdmin, telegramSkipImportHandler(telegramImport)))
+	mux.Handle("POST /telegram/import-sessions/current/save", requireRole(auth, store, roleAdmin, telegramSaveImportHandler(telegramImport)))
+	mux.Handle("DELETE /telegram/import-sessions/current", requireRole(auth, store, roleAdmin, telegramCancelImportHandler(telegramImport)))
+	mux.Handle("GET /telegram/import-sessions/current/audio", requireRole(auth, store, roleAdmin, telegramCurrentAudioHandler(telegramImport)))
+	mux.Handle("GET /telegram/import-sessions/current/skipped-report", requireRole(auth, store, roleAdmin, telegramSkippedReportHandler(telegramImport)))
 	mux.HandleFunc("GET /openapi.yaml", serveOpenAPIHandler("openapi.yaml"))
 	mux.HandleFunc("GET /docs", swaggerUIHandler())
 	mux.HandleFunc("GET /redoc", redocHandler())
@@ -354,6 +387,8 @@ func main() {
 	log.Printf("serving songs from %s", songsDir)
 	log.Printf("serving album covers from %s", albumCoversDir)
 	log.Printf("using tracks database %s", tracksDBPath)
+	log.Printf("telegram state directory %s", telegramStateDir)
+	log.Printf("telegram import temp directory %s", telegramImportTempDir)
 	log.Printf("http logging mode %s", logMode)
 	log.Printf("swagger docs available at http://localhost%s/docs", addr)
 	log.Printf("redoc available at http://localhost%s/redoc", addr)

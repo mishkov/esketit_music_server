@@ -2,3 +2,6 @@ tracks_db.json
 esketit_music_server
 
 .env
+.DS_Store
+telegram_state/
+telegram_import_tmp/
