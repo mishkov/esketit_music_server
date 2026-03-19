@@ -198,6 +198,9 @@ paths:
     post:
       tags: [Album Covers]
       summary: Upload album cover
+      description: |
+        Upload an album cover file. The returned file can later be referenced from album
+        `coverImagePath`. Preferred write format is `/album-covers/{name}`.
       security:
         - bearerAuth: []
       requestBody:
@@ -228,6 +231,9 @@ paths:
     get:
       tags: [Album Covers]
       summary: Get album cover file
+      description: |
+        Fetch an album cover file by filename. Album responses expose `coverImagePath`
+        as a full absolute URL pointing to this route.
       parameters:
         - $ref: '#/components/parameters/FileName'
       responses:
@@ -775,6 +781,11 @@ components:
           type: string
         coverImagePath:
           type: string
+          format: uri
+          description: |
+            Absolute URL to the album cover file. API responses normalize this field to a
+            full URL pointing to `/album-covers/{name}`.
+          example: http://192.168.1.6:8080/album-covers/%D0%93%D0%BE%D1%80%D0%B3%D0%BE%D1%80%D0%BE%D0%B4_2.jpg
         authorIds:
           type: array
           items:
@@ -806,6 +817,11 @@ components:
           minLength: 1
         coverImagePath:
           type: string
+          description: |
+            Album cover reference. Preferred form is `/album-covers/{name}`.
+            Absolute URLs are also accepted. Bare filenames may be normalized by the
+            server, but clients should not rely on that form.
+          example: /album-covers/%D0%93%D0%BE%D1%80%D0%B3%D0%BE%D1%80%D0%BE%D0%B4_2.jpg
         authorIds:
           type: array
           items:
