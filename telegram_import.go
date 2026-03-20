@@ -61,9 +61,9 @@ func loadTelegramConfig(stateDir, tempDir string) (telegramConfig, error) {
 		StateDir:        stateDir,
 		SessionFile:     filepath.Join(stateDir, "session.json"),
 		ImportTempDir:   tempDir,
-		RequestTimeout:  2 * time.Minute,
-		ScanTimeout:     10 * time.Minute,
-		DownloadTimeout: 10 * time.Minute,
+		RequestTimeout:  15 * time.Minute,
+		ScanTimeout:     15 * time.Minute,
+		DownloadTimeout: 15 * time.Minute,
 	}
 
 	rawAPIID := strings.TrimSpace(os.Getenv("TELEGRAM_API_ID"))
