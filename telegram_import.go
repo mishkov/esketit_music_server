@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -896,6 +897,7 @@ func telegramStatusHandler(service *telegramImportService) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		status, err := service.Status(r.Context())
 		if err != nil {
+			log.Printf("telegram status error: %v", err)
 			http.Error(w, "failed to read telegram status", http.StatusInternalServerError)
 			return
 		}
