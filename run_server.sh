@@ -34,8 +34,11 @@ if [[ ! -d "$SONGS_DIR" ]]; then
   exit 1
 fi
 
-echo "Building $APP_NAME..."
-GOCACHE="${GOCACHE:-/tmp/go-build-cache}" go build -o "$APP_BINARY" .
+if [[ ! -x "$APP_BINARY" ]]; then
+  echo "Server binary not found or not executable: $APP_BINARY" >&2
+  echo "Build it first with ./build_server.sh or copy a built binary to the server." >&2
+  exit 1
+fi
 
 echo "Starting $APP_NAME..."
 echo "SONGS_DIR=$SONGS_DIR"
