@@ -3,8 +3,8 @@ info:
   title: Esketit Music Server API
   version: 1.3.0
   description: |
-    REST API for listing and uploading media files, managing albums, tracks, and authors,
-    and authenticating users with access and refresh tokens.
+    REST API for listing and uploading media files, managing albums, tracks, authors,
+    user playlists, and authenticating users with access and refresh tokens.
 
 servers:
   - url: http://localhost:8080
@@ -17,6 +17,7 @@ tags:
   - name: Albums
   - name: Tracks
   - name: Authors
+  - name: Playlists
 
 paths:
   /auth/register:
@@ -527,6 +528,278 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /playlists:
+    get:
+      tags: [Playlists]
+      summary: List current user's playlists
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: query
+          in: query
+          schema:
+            type: string
+        - name: visibility
+          in: query
+          schema:
+            $ref: '#/components/schemas/PlaylistVisibility'
+      responses:
+        '200':
+          description: Playlist page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedPlaylists'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Playlists]
+      summary: Create playlist
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertPlaylistRequest'
+      responses:
+        '201':
+          description: Created playlist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Playlist'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /playlists/{id}:
+    get:
+      tags: [Playlists]
+      summary: Get current user's playlist by ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '200':
+          description: Playlist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Playlist'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Playlists]
+      summary: Update playlist by ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertPlaylistRequest'
+      responses:
+        '200':
+          description: Updated playlist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Playlist'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Playlists]
+      summary: Delete playlist by ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '204':
+          description: Deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /playlists/{id}/tracks:
+    get:
+      tags: [Playlists]
+      summary: List playlist tracks in playlist order
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Playlist track page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedTracks'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /playlists/{id}/tracks/order:
+    put:
+      tags: [Playlists]
+      summary: Reorder playlist tracks by full track ID list
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReorderPlaylistTracksRequest'
+      responses:
+        '204':
+          description: Reordered
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /tracks/{id}/playlists:
+    post:
+      tags: [Playlists]
+      summary: Add a track to multiple playlists
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddTrackToPlaylistsRequest'
+      responses:
+        '204':
+          description: Added
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /tracks/{id}/playlists/{playlistId}:
+    delete:
+      tags: [Playlists]
+      summary: Remove a track from a playlist
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - name: playlistId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      responses:
+        '204':
+          description: Removed
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /tracks/{id}/favorite:
+    put:
+      tags: [Playlists]
+      summary: Add a track to the current user's favorites playlist
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '204':
+          description: Favorited
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Playlists]
+      summary: Remove a track from the current user's favorites playlist
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '204':
+          description: Removed from favorites
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /tracks:
     get:
       tags: [Tracks]
@@ -870,7 +1143,11 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AdditionalInfo'
-      required: [id, name, authorIds, albumId, audioFilePath, additionalInfo]
+        isFavorite:
+          type: boolean
+        isAvailable:
+          type: boolean
+      required: [id, name, authorIds, albumId, audioFilePath, additionalInfo, isFavorite, isAvailable]
 
     UpsertTrackRequest:
       type: object
@@ -901,6 +1178,75 @@ components:
             $ref: '#/components/schemas/AdditionalInfo'
       required: [name, authorIds, albumId, albumOrder, audioFilePath, additionalInfo]
 
+    PlaylistVisibility:
+      type: string
+      enum: [private, public, shared]
+
+    Playlist:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        userId:
+          type: integer
+          format: int64
+        name:
+          type: string
+        description:
+          type: string
+        coverImagePath:
+          type: string
+        visibility:
+          $ref: '#/components/schemas/PlaylistVisibility'
+        trackCount:
+          type: integer
+        system:
+          type: boolean
+        isFavorites:
+          type: boolean
+      required: [id, userId, name, description, coverImagePath, visibility, trackCount, system, isFavorites]
+
+    UpsertPlaylistRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          minLength: 1
+          maxLength: 1000
+        coverImagePath:
+          type: string
+        visibility:
+          $ref: '#/components/schemas/PlaylistVisibility'
+      required: [name, description, coverImagePath, visibility]
+
+    AddTrackToPlaylistsRequest:
+      type: object
+      properties:
+        playlistIds:
+          type: array
+          minItems: 1
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+      required: [playlistIds]
+
+    ReorderPlaylistTracksRequest:
+      type: object
+      properties:
+        trackIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+      required: [trackIds]
+
     PaginatedAlbums:
       type: object
       properties:
@@ -908,6 +1254,40 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Album'
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        totalItems:
+          type: integer
+        totalPages:
+          type: integer
+      required: [items, page, pageSize, totalItems, totalPages]
+
+    PaginatedTracks:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Track'
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        totalItems:
+          type: integer
+        totalPages:
+          type: integer
+      required: [items, page, pageSize, totalItems, totalPages]
+
+    PaginatedPlaylists:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Playlist'
         page:
           type: integer
         pageSize:
