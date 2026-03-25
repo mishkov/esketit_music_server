@@ -5,14 +5,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="esketit_music_server"
 APP_BINARY="$SCRIPT_DIR/$APP_NAME"
+DOTENV_PATH="$SCRIPT_DIR/.env"
 
 DEFAULT_SONGS_DIR="$HOME/Projects/esketit_music/media_storage/songs"
 DEFAULT_ALBUM_COVERS_DIR="$HOME/Projects/esketit_music/media_storage/album_covers"
 DEFAULT_TRACKS_DB_PATH="$SCRIPT_DIR/tracks_db.json"
 
+if [[ -f "$DOTENV_PATH" ]]; then
+  set -a
+  # Load local development overrides before applying script defaults.
+  # Values from .env intentionally take precedence over inherited environment variables.
+  source "$DOTENV_PATH"
+  set +a
+fi
+
 export SONGS_DIR="${SONGS_DIR:-$DEFAULT_SONGS_DIR}"
 export ALBUM_COVERS_DIR="${ALBUM_COVERS_DIR:-$DEFAULT_ALBUM_COVERS_DIR}"
 export TRACKS_DB_PATH="${TRACKS_DB_PATH:-$DEFAULT_TRACKS_DB_PATH}"
+export CORS_ALLOW_ORIGIN="${CORS_ALLOW_ORIGIN:-https://esketit-music.web.app}"
 
 if [[ -z "${AUTH_SECRET:-}" ]]; then
   if command -v openssl >/dev/null 2>&1; then
@@ -44,4 +54,5 @@ echo "Starting $APP_NAME..."
 echo "SONGS_DIR=$SONGS_DIR"
 echo "ALBUM_COVERS_DIR=$ALBUM_COVERS_DIR"
 echo "TRACKS_DB_PATH=$TRACKS_DB_PATH"
+echo "CORS_ALLOW_ORIGIN=$CORS_ALLOW_ORIGIN"
 exec "$APP_BINARY"
