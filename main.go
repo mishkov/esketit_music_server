@@ -295,6 +295,14 @@ type playlistListFilter struct {
 	Query      string
 }
 
+type trackListFilter struct {
+	Page     int
+	PageSize int
+	AuthorID int64
+	AlbumID  int64
+	Query    string
+}
+
 type paginatedTracks struct {
 	Items      []trackResponse `json:"items"`
 	Page       int             `json:"page"`
@@ -2438,7 +2446,12 @@ func reorderPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
 
 func listTracksHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, store.listTrackResponses(optionalUserIDFromRequest(r, auth)))
+		filter, err := parseTrackListFilter(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, store.listTrackResponses(optionalUserIDFromRequest(r, auth), filter))
 	}
 }
 
@@ -3655,20 +3668,53 @@ func (s *trackStore) buildPlaylistTrackResponseLocked(item playlistTrack, favori
 	}
 }
 
-func (s *trackStore) listTrackResponses(userID int64) []trackResponse {
+func (s *trackStore) listTrackResponses(userID int64, filter trackListFilter) paginatedTracks {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	items := make([]trackResponse, 0, len(s.tracks))
+	query := strings.ToLower(strings.TrimSpace(filter.Query))
 	favoriteIDs := s.favoriteTrackSetLocked(userID)
 	for _, t := range s.tracks {
+		if filter.AuthorID > 0 && !containsInt64(t.AuthorIDs, filter.AuthorID) {
+			continue
+		}
+		if filter.AlbumID > 0 && t.AlbumID != filter.AlbumID {
+			continue
+		}
+		if query != "" && !strings.Contains(strings.ToLower(t.Name), query) {
+			continue
+		}
 		_, isFavorite := favoriteIDs[t.ID]
 		items = append(items, toTrackResponse(t, isFavorite, true))
 	}
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].ID < items[j].ID
 	})
-	return items
+
+	page := normalizePage(filter.Page)
+	pageSize := normalizePageSize(filter.PageSize)
+	totalItems := len(items)
+	totalPages := 0
+	if totalItems > 0 {
+		totalPages = (totalItems + pageSize - 1) / pageSize
+	}
+	start := (page - 1) * pageSize
+	if start > totalItems {
+		start = totalItems
+	}
+	end := start + pageSize
+	if end > totalItems {
+		end = totalItems
+	}
+
+	return paginatedTracks{
+		Items:      items[start:end],
+		Page:       page,
+		PageSize:   pageSize,
+		TotalItems: totalItems,
+		TotalPages: totalPages,
+	}
 }
 
 func (s *trackStore) getTrackResponse(trackID, userID int64) (trackResponse, bool) {
@@ -3883,6 +3929,29 @@ func parseAlbumListFilter(values url.Values) (albumListFilter, error) {
 			return albumListFilter{}, errors.New("isPublished must be true or false")
 		}
 		filter.IsPublished = &parsed
+	}
+	return filter, nil
+}
+
+func parseTrackListFilter(values url.Values) (trackListFilter, error) {
+	filter := trackListFilter{
+		Page:     parseIntWithDefault(values.Get("page"), 1),
+		PageSize: parseIntWithDefault(values.Get("pageSize"), 20),
+		Query:    strings.TrimSpace(values.Get("query")),
+	}
+	if rawAuthorID := strings.TrimSpace(values.Get("authorId")); rawAuthorID != "" {
+		authorID, err := strconv.ParseInt(rawAuthorID, 10, 64)
+		if err != nil || authorID <= 0 {
+			return trackListFilter{}, errors.New("authorId must be a positive integer")
+		}
+		filter.AuthorID = authorID
+	}
+	if rawAlbumID := strings.TrimSpace(values.Get("albumId")); rawAlbumID != "" {
+		albumID, err := strconv.ParseInt(rawAlbumID, 10, 64)
+		if err != nil || albumID <= 0 {
+			return trackListFilter{}, errors.New("albumId must be a positive integer")
+		}
+		filter.AlbumID = albumID
 	}
 	return filter, nil
 }
