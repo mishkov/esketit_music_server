@@ -282,11 +282,12 @@ type paginatedAlbums struct {
 }
 
 type albumListFilter struct {
-	Page        int
-	PageSize    int
-	AuthorID    int64
-	Query       string
-	IsPublished *bool
+	Page         int
+	PageSize     int
+	AuthorID     int64
+	Query        string
+	IsPublished  *bool
+	IncludeEmpty bool
 }
 
 type playlistListFilter struct {
@@ -448,7 +449,7 @@ func main() {
 	mux.HandleFunc("GET /songs/", getSongHandler(songsDir))
 	mux.Handle("DELETE /songs/", requireRole(auth, store, roleAdmin, deleteSongHandler(store, songsDir)))
 	mux.HandleFunc("GET /album-covers/", getAlbumCoverHandler(albumCoversDir))
-	mux.HandleFunc("GET /albums", listAlbumsHandler(store))
+	mux.HandleFunc("GET /albums", listAlbumsHandler(store, auth))
 	mux.Handle("POST /albums", requireRole(auth, store, roleAdmin, createAlbumHandler(store)))
 	mux.HandleFunc("GET /albums/", getAlbumByRouteHandler(store))
 	mux.Handle("PUT /albums/", requireRole(auth, store, roleAdmin, updateAlbumByRouteHandler(store)))
@@ -968,6 +969,9 @@ func (s *trackStore) listAlbums(filter albumListFilter) paginatedAlbums {
 			continue
 		}
 		if filter.IsPublished != nil && a.IsPublished != *filter.IsPublished {
+			continue
+		}
+		if !filter.IncludeEmpty && len(a.TrackIDs) == 0 {
 			continue
 		}
 		if query != "" && !strings.Contains(strings.ToLower(a.Title), query) {
@@ -2219,12 +2223,21 @@ func writeUploadError(w http.ResponseWriter, err error) {
 	}
 }
 
-func listAlbumsHandler(store *trackStore) http.HandlerFunc {
+func listAlbumsHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		filter, err := parseAlbumListFilter(r.URL.Query())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+		filter.IncludeEmpty = false
+		if auth != nil {
+			userID, err := auth.authenticateRequest(r)
+			if err == nil {
+				if user, ok := store.getUser(userID); ok && user.Role == roleAdmin {
+					filter.IncludeEmpty = true
+				}
+			}
 		}
 		writeJSON(w, http.StatusOK, store.listAlbums(filter))
 	}
@@ -3666,9 +3679,6 @@ func (s *trackStore) validateAlbumLocked(a album) error {
 			return fmt.Errorf("%w: trackId %d does not exist", errInvalidAlbum, trackID)
 		}
 	}
-	if a.IsPublished && len(a.TrackIDs) == 0 {
-		return fmt.Errorf("%w: album must contain at least one track before publishing", errInvalidAlbum)
-	}
 	if err := validateAdditionalInfo(a.AdditionalInfo); err != nil {
 		return fmt.Errorf("%w: %v", errInvalidAlbum, err)
 	}
@@ -3904,9 +3914,6 @@ func (s *trackStore) rebuildAlbumDerivedDataLocked() error {
 
 		albumItem.TrackIDs = normalizedTrackIDs
 		albumItem.AuthorIDs = setToSortedIDs(authorSet)
-		if len(albumItem.TrackIDs) == 0 {
-			albumItem.IsPublished = false
-		}
 		if err := s.validateAlbumLocked(albumItem); err != nil {
 			return err
 		}

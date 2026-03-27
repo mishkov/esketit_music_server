@@ -434,6 +434,10 @@ paths:
     get:
       tags: [Albums]
       summary: List albums
+      description: |
+        Returns albums for both admin and player clients. Admin requests can include
+        albums with no tracks. Anonymous and listener requests omit albums whose
+        `trackIds` array is empty.
       parameters:
         - name: page
           in: query
@@ -474,6 +478,7 @@ paths:
     post:
       tags: [Albums]
       summary: Create album
+      description: Albums may be created as published even when `trackIds` is empty.
       security:
         - bearerAuth: []
       requestBody:
@@ -518,6 +523,7 @@ paths:
     put:
       tags: [Albums]
       summary: Update album by ID
+      description: Albums may remain published even when `trackIds` is empty.
       security:
         - bearerAuth: []
       parameters:
@@ -1198,6 +1204,9 @@ components:
             type: integer
             format: int64
             minimum: 1
+          description: |
+            May be empty. Non-admin album list responses omit albums whose `trackIds`
+            array is empty.
         additionalInfo:
           type: array
           items:
@@ -1235,6 +1244,7 @@ components:
             type: integer
             format: int64
             minimum: 1
+          description: May be empty when creating or updating an album.
         additionalInfo:
           type: array
           items:

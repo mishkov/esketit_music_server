@@ -191,6 +191,117 @@ func TestListTracksHandlerRejectsInvalidTrackFilters(t *testing.T) {
 	}
 }
 
+func TestCreateAlbumAllowsPublishedAlbumWithoutTracks(t *testing.T) {
+	store := newTestTrackStore(t)
+
+	albumItem, err := store.createAlbum(upsertAlbumRequest{
+		Title:       "Empty Release",
+		ReleaseDate: time.Date(2024, time.March, 1, 0, 0, 0, 0, time.UTC),
+		IsPublished: true,
+	})
+	if err != nil {
+		t.Fatalf("createAlbum() error = %v", err)
+	}
+
+	if !albumItem.IsPublished {
+		t.Fatalf("albumItem.IsPublished = false, want true")
+	}
+	if len(albumItem.TrackIDs) != 0 {
+		t.Fatalf("len(albumItem.TrackIDs) = %d, want 0", len(albumItem.TrackIDs))
+	}
+}
+
+func TestListAlbumsHandlerHidesEmptyAlbumsForNonAdmin(t *testing.T) {
+	store := newTestTrackStore(t)
+	auth := newAuthManager([]byte("test-secret"), time.Hour, 24*time.Hour)
+	handler := listAlbumsHandler(store, auth)
+
+	artist, err := store.createAuthor(upsertAuthorRequest{CurrentName: "Artist"})
+	if err != nil {
+		t.Fatalf("createAuthor() error = %v", err)
+	}
+	emptyAlbum, err := store.createAlbum(upsertAlbumRequest{
+		Title:       "Empty",
+		ReleaseDate: time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+		IsPublished: true,
+	})
+	if err != nil {
+		t.Fatalf("createAlbum() empty error = %v", err)
+	}
+	fullAlbum, err := store.createAlbum(upsertAlbumRequest{
+		Title:       "Full",
+		ReleaseDate: time.Date(2024, time.January, 2, 0, 0, 0, 0, time.UTC),
+		IsPublished: true,
+	})
+	if err != nil {
+		t.Fatalf("createAlbum() full error = %v", err)
+	}
+	if _, err := store.create(upsertTrackRequest{
+		Name:          "Track",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       fullAlbum.ID,
+		AlbumOrder:    0,
+		AudioFilePath: "/songs/full.mp3",
+	}); err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+
+	listener, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() listener error = %v", err)
+	}
+	admin, err := store.createUser("admin@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() admin error = %v", err)
+	}
+
+	store.mu.Lock()
+	listener.Role = roleListener
+	store.users[listener.ID] = listener
+	admin.Role = roleAdmin
+	store.users[admin.ID] = admin
+	store.mu.Unlock()
+
+	t.Run("anonymous", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/albums", nil)
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		assertAlbumListResponse(t, rec, []int64{fullAlbum.ID})
+	})
+
+	t.Run("listener", func(t *testing.T) {
+		token, _, err := auth.createAccessToken(listener.ID)
+		if err != nil {
+			t.Fatalf("createAccessToken() error = %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/albums", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		assertAlbumListResponse(t, rec, []int64{fullAlbum.ID})
+	})
+
+	t.Run("admin", func(t *testing.T) {
+		token, _, err := auth.createAccessToken(admin.ID)
+		if err != nil {
+			t.Fatalf("createAccessToken() error = %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/albums", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		assertAlbumListResponse(t, rec, []int64{emptyAlbum.ID, fullAlbum.ID})
+	})
+}
+
 func TestDeleteSongHandlerRejectsReferencedSong(t *testing.T) {
 	store := newTestTrackStore(t)
 	songsDir := t.TempDir()
@@ -391,6 +502,28 @@ func newTestTrackStore(t *testing.T) *trackStore {
 		t.Fatalf("newTrackStore() error = %v", err)
 	}
 	return store
+}
+
+func assertAlbumListResponse(t *testing.T, rec *httptest.ResponseRecorder, wantIDs []int64) {
+	t.Helper()
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var got paginatedAlbums
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+
+	if len(got.Items) != len(wantIDs) {
+		t.Fatalf("len(got.Items) = %d, want %d", len(got.Items), len(wantIDs))
+	}
+	for i, wantID := range wantIDs {
+		if got.Items[i].ID != wantID {
+			t.Fatalf("got.Items[%d].ID = %d, want %d", i, got.Items[i].ID, wantID)
+		}
+	}
 }
 
 func seedPlaylistTrackDependencies(t *testing.T, store *trackStore) (author, album) {
