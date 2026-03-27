@@ -1,9 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -185,6 +191,197 @@ func TestListTracksHandlerRejectsInvalidTrackFilters(t *testing.T) {
 	}
 }
 
+func TestDeleteSongHandlerRejectsReferencedSong(t *testing.T) {
+	store := newTestTrackStore(t)
+	songsDir := t.TempDir()
+	handler := deleteSongHandler(store, songsDir)
+
+	artist, album := seedPlaylistTrackDependencies(t, store)
+	if err := os.WriteFile(filepath.Join(songsDir, "track.mp3"), []byte("mp3"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	_, err := store.create(upsertTrackRequest{
+		Name:          "Track",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       album.ID,
+		AlbumOrder:    0,
+		AudioFilePath: "/songs/track.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/songs/track.mp3", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusConflict)
+	}
+	if _, err := os.Stat(filepath.Join(songsDir, "track.mp3")); err != nil {
+		t.Fatalf("song file should remain on disk, Stat() error = %v", err)
+	}
+}
+
+func TestDeleteSongHandlerDeletesUnreferencedSong(t *testing.T) {
+	store := newTestTrackStore(t)
+	songsDir := t.TempDir()
+	handler := deleteSongHandler(store, songsDir)
+
+	if err := os.WriteFile(filepath.Join(songsDir, "free.mp3"), []byte("mp3"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/songs/free.mp3", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	if _, err := os.Stat(filepath.Join(songsDir, "free.mp3")); !os.IsNotExist(err) {
+		t.Fatalf("song file should be deleted, Stat() error = %v", err)
+	}
+}
+
+func TestListUnusedSongsHandlerReturnsOnlyUnreferencedSongs(t *testing.T) {
+	store := newTestTrackStore(t)
+	songsDir := t.TempDir()
+	handler := listUnusedSongsHandler(store, songsDir)
+
+	artist, album := seedPlaylistTrackDependencies(t, store)
+	for _, name := range []string{"used.mp3", "free.mp3", "Another Free.mp3"} {
+		if err := os.WriteFile(filepath.Join(songsDir, name), []byte("mp3"), 0o644); err != nil {
+			t.Fatalf("WriteFile(%q) error = %v", name, err)
+		}
+	}
+
+	_, err := store.create(upsertTrackRequest{
+		Name:          "Track",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       album.ID,
+		AlbumOrder:    0,
+		AudioFilePath: "https://cdn.example.com/songs/used.mp3?token=abc",
+	})
+	if err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/songs/unused", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var got []songInfo
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("len(got) = %d, want 2", len(got))
+	}
+	if got[0].Name != "Another Free.mp3" {
+		t.Fatalf("got[0].Name = %q, want %q", got[0].Name, "Another Free.mp3")
+	}
+	if got[0].Path != "/songs/Another%20Free.mp3" {
+		t.Fatalf("got[0].Path = %q, want %q", got[0].Path, "/songs/Another%20Free.mp3")
+	}
+	if got[0].URL != got[0].Path {
+		t.Fatalf("got[0].URL = %q, want same as path %q", got[0].URL, got[0].Path)
+	}
+	if got[1].Name != "free.mp3" {
+		t.Fatalf("got[1].Name = %q, want %q", got[1].Name, "free.mp3")
+	}
+	if got[1].Path != "/songs/free.mp3" {
+		t.Fatalf("got[1].Path = %q, want %q", got[1].Path, "/songs/free.mp3")
+	}
+}
+
+func TestUploadSongHandlerRandomizesStoredFileName(t *testing.T) {
+	songsDir := t.TempDir()
+	handler := uploadSongHandler(songsDir)
+
+	rec := httptest.NewRecorder()
+	req := newMultipartUploadRequest(t, http.MethodPost, "/songs", "demo track.mp3", []byte("mp3-data"))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var got albumCoverInfo
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+
+	if !strings.HasPrefix(got.Name, "demo track-") {
+		t.Fatalf("got.Name = %q, want prefix %q", got.Name, "demo track-")
+	}
+	if !strings.HasSuffix(got.Name, ".mp3") {
+		t.Fatalf("got.Name = %q, want .mp3 suffix", got.Name)
+	}
+	if got.URL != "/songs/"+url.PathEscape(got.Name) {
+		t.Fatalf("got.URL = %q, want %q", got.URL, "/songs/"+url.PathEscape(got.Name))
+	}
+	if _, err := os.Stat(filepath.Join(songsDir, got.Name)); err != nil {
+		t.Fatalf("stored file Stat() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(songsDir, "demo track.mp3")); !os.IsNotExist(err) {
+		t.Fatalf("original filename should not be used directly, Stat() error = %v", err)
+	}
+}
+
+func TestUploadAlbumCoverHandlerAllowsSameOriginalFileNameTwice(t *testing.T) {
+	albumCoversDir := t.TempDir()
+	handler := uploadAlbumCoverHandler(albumCoversDir)
+
+	firstRec := httptest.NewRecorder()
+	firstReq := newMultipartUploadRequest(t, http.MethodPost, "/album-covers", "cover.jpg", []byte("first"))
+	handler.ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want %d; body=%s", firstRec.Code, http.StatusCreated, firstRec.Body.String())
+	}
+
+	secondRec := httptest.NewRecorder()
+	secondReq := newMultipartUploadRequest(t, http.MethodPost, "/album-covers", "cover.jpg", []byte("second"))
+	handler.ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusCreated {
+		t.Fatalf("second status = %d, want %d; body=%s", secondRec.Code, http.StatusCreated, secondRec.Body.String())
+	}
+
+	var firstInfo albumCoverInfo
+	if err := json.NewDecoder(firstRec.Body).Decode(&firstInfo); err != nil {
+		t.Fatalf("Decode(first) error = %v", err)
+	}
+	var secondInfo albumCoverInfo
+	if err := json.NewDecoder(secondRec.Body).Decode(&secondInfo); err != nil {
+		t.Fatalf("Decode(second) error = %v", err)
+	}
+
+	if firstInfo.Name == secondInfo.Name {
+		t.Fatalf("stored names should differ, both were %q", firstInfo.Name)
+	}
+	for _, info := range []albumCoverInfo{firstInfo, secondInfo} {
+		if !strings.HasPrefix(info.Name, "cover-") {
+			t.Fatalf("info.Name = %q, want prefix %q", info.Name, "cover-")
+		}
+		if !strings.HasSuffix(info.Name, ".jpg") {
+			t.Fatalf("info.Name = %q, want .jpg suffix", info.Name)
+		}
+		if _, err := os.Stat(filepath.Join(albumCoversDir, info.Name)); err != nil {
+			t.Fatalf("stored file %q Stat() error = %v", info.Name, err)
+		}
+	}
+}
+
 func newTestTrackStore(t *testing.T) *trackStore {
 	t.Helper()
 
@@ -216,4 +413,25 @@ func seedPlaylistTrackDependencies(t *testing.T, store *trackStore) (author, alb
 	}
 
 	return artist, albumItem
+}
+
+func newMultipartUploadRequest(t *testing.T, method, target, fileName string, content []byte) *http.Request {
+	t.Helper()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	fileWriter, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		t.Fatalf("CreateFormFile() error = %v", err)
+	}
+	if _, err := fileWriter.Write(content); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	req := httptest.NewRequest(method, target, &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	return req
 }

@@ -148,6 +148,15 @@ paths:
     post:
       tags: [Songs]
       summary: Upload song
+      description: |
+        Upload a song file and receive a `/songs/{name}` URL that can be stored in
+        track `audioFilePath`.
+
+        The server preserves the original extension but rewrites the stored filename
+        by appending a random suffix before the extension.
+
+        Song files are managed separately from track records. Updating or deleting a
+        track does not remove any previously uploaded file from song storage.
       security:
         - bearerAuth: []
       requestBody:
@@ -169,8 +178,31 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
-        '409':
-          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /songs/unused:
+    get:
+      tags: [Songs]
+      summary: List unused songs
+      description: |
+        List uploaded song files from `/songs` that are not referenced by any track
+        `audioFilePath`.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Unused song list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FileInfo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           $ref: '#/components/responses/InternalServerError'
 
@@ -194,6 +226,37 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Songs]
+      summary: Delete song file
+      description: |
+        Delete an uploaded song file from `/songs/{name}`.
+
+        The server refuses to delete the file while any track still references it
+        through `audioFilePath`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FileName'
+      responses:
+        '204':
+          description: Deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Song file is referenced by one or more tracks
+          content:
+            text/plain:
+              schema:
+                $ref: '#/components/schemas/PlainError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /album-covers:
     post:
@@ -202,6 +265,9 @@ paths:
       description: |
         Upload an album cover file. The returned file can later be referenced from album
         `coverImagePath`. Preferred write format is `/album-covers/{name}`.
+
+        The server preserves the original extension but rewrites the stored filename
+        by appending a random suffix before the extension.
       security:
         - bearerAuth: []
       requestBody:
@@ -223,8 +289,6 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
-        '409':
-          $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalServerError'
 
@@ -847,6 +911,13 @@ paths:
     post:
       tags: [Tracks]
       summary: Create track
+      description: |
+        Create a track record that points to an already uploaded song file via
+        `audioFilePath`, typically `/songs/{name}`.
+
+        This endpoint only creates track metadata. It does not upload an MP3, move
+        an MP3, or delete any MP3 file. The client must upload the song separately
+        before creating the track.
       security:
         - bearerAuth: []
       requestBody:
@@ -891,6 +962,16 @@ paths:
     put:
       tags: [Tracks]
       summary: Update track by ID
+      description: |
+        Update track metadata, including `audioFilePath`.
+
+        If `audioFilePath` is changed from one MP3 to another, the server only
+        updates the stored path on the track record.
+
+        The previously referenced MP3 file is not removed from `/songs`.
+        The newly referenced MP3 file is not uploaded automatically by this
+        endpoint either. Clients must upload the replacement file separately and
+        must remove the old file separately if they want it deleted.
       security:
         - bearerAuth: []
       parameters:
@@ -921,6 +1002,13 @@ paths:
     delete:
       tags: [Tracks]
       summary: Delete track by ID
+      description: |
+        Delete the track record only.
+
+        This operation does not delete the MP3 file referenced by
+        `audioFilePath`, even if that file is no longer used by any track. If the
+        client wants the underlying file removed from `/songs`, it must do that as
+        a separate cleanup step.
       security:
         - bearerAuth: []
       parameters:
@@ -1023,9 +1111,12 @@ components:
         lastModified:
           type: string
           format: date-time
+        path:
+          type: string
+          description: Media path for the file, for example `/songs/example.mp3`.
         url:
           type: string
-      required: [name, sizeBytes, lastModified, url]
+      required: [name, sizeBytes, lastModified, path, url]
 
     AdditionalInfo:
       type: object
@@ -1202,6 +1293,12 @@ components:
           minimum: 0
         audioFilePath:
           type: string
+          description: |
+            Path or URL of an existing song file, typically `/songs/{name}`.
+
+            This is a reference to an existing uploaded MP3, not an owned file
+            object. Changing this field only changes the stored reference.
+            Deleting the track does not delete the referenced MP3 from storage.
           minLength: 1
         additionalInfo:
           type: array

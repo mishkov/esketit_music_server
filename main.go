@@ -56,6 +56,7 @@ type songInfo struct {
 	Name         string    `json:"name"`
 	SizeBytes    int64     `json:"sizeBytes"`
 	LastModified time.Time `json:"lastModified"`
+	Path         string    `json:"path"`
 	URL          string    `json:"url"`
 }
 
@@ -443,7 +444,9 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /songs", listSongsHandler(songsDir))
 	mux.Handle("POST /songs", requireRole(auth, store, roleAdmin, uploadSongHandler(songsDir)))
+	mux.Handle("GET /songs/unused", requireRole(auth, store, roleAdmin, listUnusedSongsHandler(store, songsDir)))
 	mux.HandleFunc("GET /songs/", getSongHandler(songsDir))
+	mux.Handle("DELETE /songs/", requireRole(auth, store, roleAdmin, deleteSongHandler(store, songsDir)))
 	mux.HandleFunc("GET /album-covers/", getAlbumCoverHandler(albumCoversDir))
 	mux.HandleFunc("GET /albums", listAlbumsHandler(store))
 	mux.Handle("POST /albums", requireRole(auth, store, roleAdmin, createAlbumHandler(store)))
@@ -1964,7 +1967,7 @@ func listSongsHandler(songsDir string) http.HandlerFunc {
 
 func uploadSongHandler(songsDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		info, err := uploadMediaFile(w, r, songsDir, "song already exists", "failed to create song file", "/songs/")
+		info, err := uploadMediaFile(w, r, songsDir, "failed to create song file", "/songs/")
 		if err != nil {
 			writeUploadError(w, err)
 			return
@@ -1979,6 +1982,70 @@ func getSongHandler(songsDir string) http.HandlerFunc {
 	}
 }
 
+func listUnusedSongsHandler(store *trackStore, songsDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		entries, err := os.ReadDir(songsDir)
+		if err != nil {
+			http.Error(w, "failed to read songs directory", http.StatusInternalServerError)
+			return
+		}
+
+		referenced := store.referencedSongFiles()
+		songs := make([]songInfo, 0, len(entries))
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+
+			name := entry.Name()
+			if _, ok := referenced[name]; ok {
+				continue
+			}
+
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			songs = append(songs, buildSongInfo(name, info))
+		}
+
+		sort.Slice(songs, func(i, j int) bool {
+			return strings.ToLower(songs[i].Name) < strings.ToLower(songs[j].Name)
+		})
+
+		writeJSON(w, http.StatusOK, songs)
+	}
+}
+
+func deleteSongHandler(store *trackStore, songsDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name, err := extractMediaFileName(r.URL.Path, "/songs/")
+		if err != nil {
+			http.Error(w, "invalid song name", http.StatusBadRequest)
+			return
+		}
+
+		inUse, trackID := store.songFileReferenced(name)
+		if inUse {
+			http.Error(w, fmt.Sprintf("song is referenced by track %d", trackID), http.StatusConflict)
+			return
+		}
+
+		fullPath := filepath.Join(songsDir, name)
+		if err := os.Remove(fullPath); err != nil {
+			if os.IsNotExist(err) {
+				http.NotFound(w, r)
+				return
+			}
+			http.Error(w, "failed to delete file", http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
 func getAlbumCoverHandler(albumCoversDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		serveMediaFile(w, r, "/album-covers/", albumCoversDir)
@@ -1986,11 +2053,13 @@ func getAlbumCoverHandler(albumCoversDir string) http.HandlerFunc {
 }
 
 func buildSongInfo(name string, info os.FileInfo) songInfo {
+	path := "/songs/" + url.PathEscape(name)
 	return songInfo{
 		Name:         name,
 		SizeBytes:    info.Size(),
 		LastModified: info.ModTime(),
-		URL:          "/songs/" + url.PathEscape(name),
+		Path:         path,
+		URL:          path,
 	}
 }
 
@@ -2010,25 +2079,13 @@ func sanitizeSongFileName(name string) (string, error) {
 }
 
 func serveMediaFile(w http.ResponseWriter, r *http.Request, prefix, dir string) {
-	encodedName := strings.TrimPrefix(r.URL.Path, prefix)
-	if encodedName == "" {
-		http.NotFound(w, r)
-		return
-	}
-
-	name, err := url.PathUnescape(encodedName)
+	name, err := extractMediaFileName(r.URL.Path, prefix)
 	if err != nil {
 		http.Error(w, "invalid song name", http.StatusBadRequest)
 		return
 	}
 
-	cleanName := filepath.Base(filepath.Clean(name))
-	if cleanName == "." || cleanName == "/" || cleanName == "" {
-		http.Error(w, "invalid song name", http.StatusBadRequest)
-		return
-	}
-
-	fullPath := filepath.Join(dir, cleanName)
+	fullPath := filepath.Join(dir, name)
 	if _, err := os.Stat(fullPath); err != nil {
 		if os.IsNotExist(err) {
 			http.NotFound(w, r)
@@ -2041,7 +2098,21 @@ func serveMediaFile(w http.ResponseWriter, r *http.Request, prefix, dir string) 
 	http.ServeFile(w, r, fullPath)
 }
 
-func uploadMediaFile(w http.ResponseWriter, r *http.Request, dir, alreadyExistsMessage, createFailureMessage, urlPrefix string) (albumCoverInfo, error) {
+func extractMediaFileName(path, prefix string) (string, error) {
+	encodedName := strings.TrimPrefix(path, prefix)
+	if encodedName == "" {
+		return "", errors.New("missing file name")
+	}
+
+	name, err := url.PathUnescape(encodedName)
+	if err != nil {
+		return "", err
+	}
+
+	return sanitizeSongFileName(name)
+}
+
+func uploadMediaFile(w http.ResponseWriter, r *http.Request, dir, createFailureMessage, urlPrefix string) (albumCoverInfo, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxSongUploadSize)
 	if err := r.ParseMultipartForm(maxSongUploadSize); err != nil {
 		return albumCoverInfo{}, errors.New("invalid multipart form")
@@ -2058,12 +2129,27 @@ func uploadMediaFile(w http.ResponseWriter, r *http.Request, dir, alreadyExistsM
 		return albumCoverInfo{}, err
 	}
 
-	fullPath := filepath.Join(dir, name)
-	dst, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return albumCoverInfo{}, errors.New(alreadyExistsMessage)
+	var (
+		dst      *os.File
+		fullPath string
+	)
+	for attempt := 0; attempt < 10; attempt++ {
+		storedName, err := randomizedStoredFileName(name)
+		if err != nil {
+			return albumCoverInfo{}, errors.New(createFailureMessage)
 		}
+
+		fullPath = filepath.Join(dir, storedName)
+		dst, err = os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			name = storedName
+			break
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return albumCoverInfo{}, errors.New(createFailureMessage)
+		}
+	}
+	if dst == nil {
 		return albumCoverInfo{}, errors.New(createFailureMessage)
 	}
 
@@ -2095,6 +2181,29 @@ func uploadMediaFile(w http.ResponseWriter, r *http.Request, dir, alreadyExistsM
 		LastModified: info.ModTime(),
 		URL:          urlPrefix + url.PathEscape(name),
 	}, nil
+}
+
+func randomizedStoredFileName(name string) (string, error) {
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	if base == "" {
+		base = "file"
+	}
+
+	suffix, err := randomFileNameToken(6)
+	if err != nil {
+		return "", err
+	}
+
+	return base + "-" + suffix + ext, nil
+}
+
+func randomFileNameToken(size int) (string, error) {
+	bytes := make([]byte, size)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(bytes), nil
 }
 
 func writeUploadError(w http.ResponseWriter, err error) {
@@ -2239,7 +2348,7 @@ func deleteAlbumByRouteHandler(store *trackStore) http.HandlerFunc {
 
 func uploadAlbumCoverHandler(albumCoversDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		info, err := uploadMediaFile(w, r, albumCoversDir, "album cover already exists", "failed to create album cover file", "/album-covers/")
+		info, err := uploadMediaFile(w, r, albumCoversDir, "failed to create album cover file", "/album-covers/")
 		if err != nil {
 			writeUploadError(w, err)
 			return
@@ -3463,6 +3572,35 @@ func (s *trackStore) validateTrackLocked(t track) error {
 	}
 }
 
+func (s *trackStore) songFileReferenced(fileName string) (bool, int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, t := range s.tracks {
+		if trackReferencesSongFile(t.AudioFilePath, fileName) {
+			return true, t.ID
+		}
+	}
+
+	return false, 0
+}
+
+func (s *trackStore) referencedSongFiles() map[string]struct{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	referenced := make(map[string]struct{}, len(s.tracks))
+	for _, t := range s.tracks {
+		fileName, ok := extractReferencedSongFileName(t.AudioFilePath)
+		if !ok {
+			continue
+		}
+		referenced[fileName] = struct{}{}
+	}
+
+	return referenced
+}
+
 func validatePlaylist(p playlist) error {
 	switch {
 	case p.UserID <= 0:
@@ -4087,6 +4225,34 @@ func validateTrack(t track, authors map[int64]author) error {
 		}
 		return nil
 	}
+}
+
+func trackReferencesSongFile(audioFilePath, fileName string) bool {
+	name, ok := extractReferencedSongFileName(audioFilePath)
+	if !ok {
+		return false
+	}
+
+	return name == fileName
+}
+
+func extractReferencedSongFileName(audioFilePath string) (string, bool) {
+	audioFilePath = strings.TrimSpace(audioFilePath)
+	if audioFilePath == "" {
+		return "", false
+	}
+
+	parsed, err := url.Parse(audioFilePath)
+	if err == nil && parsed.Path != "" {
+		audioFilePath = parsed.Path
+	}
+
+	name, err := extractMediaFileName(audioFilePath, "/songs/")
+	if err != nil {
+		return "", false
+	}
+
+	return name, true
 }
 
 func validateAuthor(a author) error {
