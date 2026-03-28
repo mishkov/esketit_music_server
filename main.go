@@ -435,6 +435,7 @@ func main() {
 
 	auth := newAuthManager([]byte(authSecret), defaultAccessTokenTTL, defaultRefreshTokenTTL)
 	logMode := resolveLogMode(os.Getenv("LOG_MODE"))
+	albumCoverService := newAlbumCoverServiceFromEnv(albumCoversDir)
 	telegramConfig, err := loadTelegramConfig(telegramStateDir, telegramImportTempDir)
 	if err != nil {
 		log.Fatalf("failed to initialize telegram configuration: %v", err)
@@ -455,6 +456,8 @@ func main() {
 	mux.Handle("PUT /albums/", requireRole(auth, store, roleAdmin, updateAlbumByRouteHandler(store)))
 	mux.Handle("DELETE /albums/", requireRole(auth, store, roleAdmin, deleteAlbumByRouteHandler(store)))
 	mux.Handle("POST /album-covers", requireRole(auth, store, roleAdmin, uploadAlbumCoverHandler(albumCoversDir)))
+	mux.Handle("GET /album-covers/suggestions", requireRole(auth, store, roleAdmin, albumCoverSuggestionsHandler(albumCoverService)))
+	mux.Handle("POST /album-covers/import", requireRole(auth, store, roleAdmin, importAlbumCoverHandler(albumCoverService)))
 	mux.Handle("GET /playlists", requireAuth(auth, store, listPlaylistsHandler(store)))
 	mux.Handle("POST /playlists", requireAuth(auth, store, createPlaylistHandler(store)))
 	mux.Handle("GET /playlists/", requireAuth(auth, store, getPlaylistByRouteHandler(store)))

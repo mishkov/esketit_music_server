@@ -292,6 +292,92 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /album-covers/suggestions:
+    get:
+      tags: [Album Covers]
+      summary: Search album cover suggestions
+      description: |
+        Search for remotely hosted album cover candidates using the configured image-search
+        provider. Returns only results with image URLs and positive dimensions.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: query
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+          example: Nevermind cover image
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 20
+            default: 20
+      responses:
+        '200':
+          description: Album cover suggestions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlbumCoverSuggestionsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          description: Search provider is not configured
+          content:
+            text/plain:
+              schema:
+                $ref: '#/components/schemas/PlainError'
+        '502':
+          description: Search provider request failed
+          content:
+            text/plain:
+              schema:
+                $ref: '#/components/schemas/PlainError'
+
+  /album-covers/import:
+    post:
+      tags: [Album Covers]
+      summary: Import a remote album cover
+      description: |
+        Download a remote image, validate that it is a supported album cover image, and store
+        it using the same mechanism as normal album cover uploads.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlbumCoverImportRequest'
+      responses:
+        '201':
+          description: Imported album cover metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlbumCoverImportResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '502':
+          description: Remote image download failed
+          content:
+            text/plain:
+              schema:
+                $ref: '#/components/schemas/PlainError'
+
   /album-covers/{name}:
     get:
       tags: [Album Covers]
@@ -1123,6 +1209,54 @@ components:
         url:
           type: string
       required: [name, sizeBytes, lastModified, path, url]
+
+    AlbumCoverSuggestionsResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AlbumCoverSuggestion'
+      required: [items]
+
+    AlbumCoverSuggestion:
+      type: object
+      properties:
+        thumbnailUrl:
+          type: string
+          format: uri
+        imageUrl:
+          type: string
+          format: uri
+        width:
+          type: integer
+          minimum: 1
+        height:
+          type: integer
+          minimum: 1
+        sourcePageUrl:
+          type: string
+          format: uri
+      required: [thumbnailUrl, imageUrl, width, height, sourcePageUrl]
+
+    AlbumCoverImportRequest:
+      type: object
+      properties:
+        imageUrl:
+          type: string
+          format: uri
+        suggestedFileName:
+          type: string
+      required: [imageUrl]
+
+    AlbumCoverImportResponse:
+      type: object
+      properties:
+        name:
+          type: string
+        url:
+          type: string
+      required: [name, url]
 
     AdditionalInfo:
       type: object
