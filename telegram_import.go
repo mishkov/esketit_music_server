@@ -433,6 +433,7 @@ type telegramAuthPasswordRequest struct {
 
 type telegramStartImportRequest struct {
 	ChannelUsername string `json:"channelUsername"`
+	StartMessageID  int    `json:"startMessageId"`
 	ReplaceExisting bool   `json:"replaceExisting"`
 }
 
@@ -558,10 +559,13 @@ func (s *telegramImportService) SubmitPassword(ctx context.Context, password str
 	return status, nil
 }
 
-func (s *telegramImportService) StartSession(ctx context.Context, userID int64, channelUsername string, replaceExisting bool) (telegramImportSessionDTO, error) {
+func (s *telegramImportService) StartSession(ctx context.Context, userID int64, channelUsername string, startMessageID int, replaceExisting bool) (telegramImportSessionDTO, error) {
 	channelUsername = normalizeTelegramChannelUsername(channelUsername)
 	if channelUsername == "" {
 		return telegramImportSessionDTO{}, errors.New("channelUsername is required")
+	}
+	if startMessageID < 0 {
+		return telegramImportSessionDTO{}, errors.New("startMessageId must be greater than or equal to 0")
 	}
 
 	s.mu.Lock()
@@ -579,6 +583,19 @@ func (s *telegramImportService) StartSession(ctx context.Context, userID int64, 
 	items, err := s.gateway.ScanPublicChannel(ctx, channelUsername)
 	if err != nil {
 		return telegramImportSessionDTO{}, err
+	}
+	if startMessageID > 0 {
+		filtered := items[:0]
+		for _, item := range items {
+			if item.MessageID < startMessageID {
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		items = filtered
+	}
+	if len(items) == 0 {
+		return telegramImportSessionDTO{}, errTelegramNoAudioTracks
 	}
 
 	sessionID, err := randomToken(16)
@@ -966,7 +983,7 @@ func telegramStartImportHandler(service *telegramImportService) http.Handler {
 			return
 		}
 
-		session, err := service.StartSession(r.Context(), userID, req.ChannelUsername, req.ReplaceExisting)
+		session, err := service.StartSession(r.Context(), userID, req.ChannelUsername, req.StartMessageID, req.ReplaceExisting)
 		if err != nil {
 			writeTelegramError(w, err)
 			return

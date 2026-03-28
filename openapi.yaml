@@ -18,6 +18,7 @@ tags:
   - name: Tracks
   - name: Authors
   - name: Playlists
+  - name: Telegram
 
 paths:
   /auth/register:
@@ -1119,6 +1120,41 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /telegram/import-sessions:
+    post:
+      tags: [Telegram]
+      summary: Start a Telegram import session
+      description: |
+        Scan a public Telegram channel for audio tracks and start an import session.
+
+        When `startMessageId` is provided, only tracks from that Telegram message ID
+        and newer are included in the session.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TelegramStartImportRequest'
+      responses:
+        '201':
+          description: Import session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TelegramImportSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1597,6 +1633,92 @@ components:
         refreshToken:
           type: string
       required: [refreshToken]
+
+    TelegramStartImportRequest:
+      type: object
+      properties:
+        channelUsername:
+          type: string
+          description: Public Telegram channel username, with or without `@`.
+        startMessageId:
+          type: integer
+          description: |
+            Optional Telegram message ID to start from, inclusive. When omitted or
+            set to `0`, the import starts from the earliest scanned track.
+          minimum: 0
+        replaceExisting:
+          type: boolean
+          description: Replace the active Telegram import session for the current user.
+      required: [channelUsername]
+
+    TelegramCurrentTrack:
+      type: object
+      properties:
+        messageId:
+          type: integer
+        telegramMessageLink:
+          type: string
+        parsedTitle:
+          type: string
+        fileName:
+          type: string
+        mimeType:
+          type: string
+        sizeBytes:
+          type: integer
+          format: int64
+        tempFileDownloadUrl:
+          type: string
+      required:
+        - messageId
+        - telegramMessageLink
+        - parsedTitle
+        - fileName
+        - mimeType
+        - sizeBytes
+        - tempFileDownloadUrl
+
+    TelegramImportProgress:
+      type: object
+      properties:
+        total:
+          type: integer
+        processed:
+          type: integer
+        remaining:
+          type: integer
+        skipped:
+          type: integer
+        saved:
+          type: integer
+      required: [total, processed, remaining, skipped, saved]
+
+    TelegramImportSession:
+      type: object
+      properties:
+        sessionId:
+          type: string
+        status:
+          type: string
+        channelUsername:
+          type: string
+        currentTrack:
+          $ref: '#/components/schemas/TelegramCurrentTrack'
+        progress:
+          $ref: '#/components/schemas/TelegramImportProgress'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required:
+        - sessionId
+        - status
+        - channelUsername
+        - progress
+        - createdAt
+        - updatedAt
 
     PublicUser:
       type: object

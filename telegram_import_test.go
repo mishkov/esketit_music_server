@@ -83,12 +83,12 @@ func TestTelegramImportSessionConflictAndSkipReport(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	_, err := service.StartSession(ctx, 1, "@test_channel", false)
+	_, err := service.StartSession(ctx, 1, "@test_channel", 0, false)
 	if err != nil {
 		t.Fatalf("StartSession() error = %v", err)
 	}
 
-	_, err = service.StartSession(ctx, 1, "@test_channel", false)
+	_, err = service.StartSession(ctx, 1, "@test_channel", 0, false)
 	if !errors.Is(err, errTelegramSessionActive) {
 		t.Fatalf("StartSession() conflict error = %v, want %v", err, errTelegramSessionActive)
 	}
@@ -146,7 +146,7 @@ func TestTelegramImportSaveCurrentPromotesFileAndCreatesTrack(t *testing.T) {
 	artist, album := seedTrackDependencies(t, store)
 
 	ctx := context.Background()
-	if _, err := service.StartSession(ctx, 1, "test_channel", false); err != nil {
+	if _, err := service.StartSession(ctx, 1, "test_channel", 0, false); err != nil {
 		t.Fatalf("StartSession() error = %v", err)
 	}
 
@@ -211,7 +211,7 @@ func TestTelegramImportCancelCleansTempFiles(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	session, err := service.StartSession(ctx, 1, "test_channel", false)
+	session, err := service.StartSession(ctx, 1, "test_channel", 0, false)
 	if err != nil {
 		t.Fatalf("StartSession() error = %v", err)
 	}
@@ -269,6 +269,73 @@ func TestTelegramAuthPasswordFlow(t *testing.T) {
 	}
 	if !status.Authorized || status.PasswordRequired {
 		t.Fatalf("SubmitPassword() status = %#v", status)
+	}
+}
+
+func TestTelegramImportStartSessionFiltersFromMessageIDInclusive(t *testing.T) {
+	service, _, _, _ := newTelegramImportTestService(t, &fakeTelegramGateway{
+		status: telegramAuthStatus{Configured: true, Authorized: true},
+		scannedItems: []telegramScannedTrack{
+			{
+				MessageID:   10,
+				MessageLink: "https://t.me/test_channel/10",
+				FileName:    "first.mp3",
+				MimeType:    "audio/mpeg",
+				SizeBytes:   100,
+				ParsedTitle: "First",
+			},
+			{
+				MessageID:   20,
+				MessageLink: "https://t.me/test_channel/20",
+				FileName:    "second.mp3",
+				MimeType:    "audio/mpeg",
+				SizeBytes:   200,
+				ParsedTitle: "Second",
+			},
+			{
+				MessageID:   30,
+				MessageLink: "https://t.me/test_channel/30",
+				FileName:    "third.mp3",
+				MimeType:    "audio/mpeg",
+				SizeBytes:   300,
+				ParsedTitle: "Third",
+			},
+		},
+		downloadData: []byte("mp3-bytes"),
+	})
+
+	ctx := context.Background()
+	current, err := service.StartSession(ctx, 1, "test_channel", 20, false)
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	if current.CurrentTrack == nil || current.CurrentTrack.MessageID != 20 {
+		t.Fatalf("CurrentSession() current track = %#v", current.CurrentTrack)
+	}
+	if current.Progress.Total != 2 || current.Progress.Remaining != 2 {
+		t.Fatalf("CurrentSession() progress = %#v", current.Progress)
+	}
+}
+
+func TestTelegramImportStartSessionReturnsNoTracksWhenStartMessageIDAfterLast(t *testing.T) {
+	service, _, _, _ := newTelegramImportTestService(t, &fakeTelegramGateway{
+		status: telegramAuthStatus{Configured: true, Authorized: true},
+		scannedItems: []telegramScannedTrack{
+			{
+				MessageID:   10,
+				MessageLink: "https://t.me/test_channel/10",
+				FileName:    "first.mp3",
+				MimeType:    "audio/mpeg",
+				SizeBytes:   100,
+				ParsedTitle: "First",
+			},
+		},
+	})
+
+	ctx := context.Background()
+	_, err := service.StartSession(ctx, 1, "test_channel", 11, false)
+	if !errors.Is(err, errTelegramNoAudioTracks) {
+		t.Fatalf("StartSession() error = %v, want %v", err, errTelegramNoAudioTracks)
 	}
 }
 
