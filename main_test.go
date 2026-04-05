@@ -191,6 +191,170 @@ func TestListTracksHandlerRejectsInvalidTrackFilters(t *testing.T) {
 	}
 }
 
+func TestSearchHandlerReturnsCombinedPaginatedResults(t *testing.T) {
+	store := newTestTrackStore(t)
+	handler := searchHandler(store, nil)
+
+	artist, err := store.createAuthor(upsertAuthorRequest{CurrentName: "Dream Runner"})
+	if err != nil {
+		t.Fatalf("createAuthor() error = %v", err)
+	}
+	_, err = store.createAuthor(upsertAuthorRequest{CurrentName: "Other Artist"})
+	if err != nil {
+		t.Fatalf("createAuthor() other error = %v", err)
+	}
+	albumItem, err := store.createAlbum(upsertAlbumRequest{
+		Title:       "Dreamscape",
+		ReleaseDate: time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+		IsPublished: true,
+	})
+	if err != nil {
+		t.Fatalf("createAlbum() error = %v", err)
+	}
+	_, err = store.create(upsertTrackRequest{
+		Name:          "Dream State",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       albumItem.ID,
+		AlbumOrder:    0,
+		AudioFilePath: "/songs/dream-state.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/search?query=dream&page=2&pageSize=2", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var got paginatedSearchResults
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+
+	if got.Page != 2 {
+		t.Fatalf("got.Page = %d, want 2", got.Page)
+	}
+	if got.PageSize != 2 {
+		t.Fatalf("got.PageSize = %d, want 2", got.PageSize)
+	}
+	if got.TotalItems != 3 {
+		t.Fatalf("got.TotalItems = %d, want 3", got.TotalItems)
+	}
+	if got.TotalPages != 2 {
+		t.Fatalf("got.TotalPages = %d, want 2", got.TotalPages)
+	}
+	if len(got.Items) != 1 {
+		t.Fatalf("len(got.Items) = %d, want 1", len(got.Items))
+	}
+	if got.Items[0].Type != "album" {
+		t.Fatalf("got.Items[0].Type = %q, want album", got.Items[0].Type)
+	}
+	if got.Items[0].Album == nil || got.Items[0].Album.Title != "Dreamscape" {
+		t.Fatalf("got.Items[0].Album = %#v, want Dreamscape", got.Items[0].Album)
+	}
+}
+
+func TestSearchHandlerUsesOptionalAuthForFavoritesAndAdminAlbumVisibility(t *testing.T) {
+	store := newTestTrackStore(t)
+	auth := newAuthManager([]byte("test-secret"), time.Hour, 24*time.Hour)
+	handler := searchHandler(store, auth)
+
+	artist, err := store.createAuthor(upsertAuthorRequest{CurrentName: "Echo Artist"})
+	if err != nil {
+		t.Fatalf("createAuthor() error = %v", err)
+	}
+	fullAlbum, err := store.createAlbum(upsertAlbumRequest{
+		Title:       "Echo Full",
+		ReleaseDate: time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+		IsPublished: true,
+	})
+	if err != nil {
+		t.Fatalf("createAlbum() full error = %v", err)
+	}
+	emptyAlbum, err := store.createAlbum(upsertAlbumRequest{
+		Title:       "Echo Empty",
+		ReleaseDate: time.Date(2024, time.January, 2, 0, 0, 0, 0, time.UTC),
+		IsPublished: true,
+	})
+	if err != nil {
+		t.Fatalf("createAlbum() empty error = %v", err)
+	}
+	trackItem, err := store.create(upsertTrackRequest{
+		Name:          "Echo Song",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       fullAlbum.ID,
+		AlbumOrder:    0,
+		AudioFilePath: "/songs/echo-song.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+
+	listener, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() listener error = %v", err)
+	}
+	admin, err := store.createUser("admin@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() admin error = %v", err)
+	}
+
+	store.mu.Lock()
+	listener.Role = roleListener
+	store.users[listener.ID] = listener
+	admin.Role = roleAdmin
+	store.users[admin.ID] = admin
+	store.mu.Unlock()
+
+	if err := store.setFavoriteTrack(listener.ID, trackItem.ID, true); err != nil {
+		t.Fatalf("setFavoriteTrack() error = %v", err)
+	}
+
+	t.Run("anonymous", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/search?query=echo", nil)
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		assertSearchResponse(t, rec, 3, false, false, emptyAlbum.ID)
+	})
+
+	t.Run("listener", func(t *testing.T) {
+		token, _, err := auth.createAccessToken(listener.ID)
+		if err != nil {
+			t.Fatalf("createAccessToken() error = %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/search?query=echo", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		assertSearchResponse(t, rec, 3, true, false, emptyAlbum.ID)
+	})
+
+	t.Run("admin", func(t *testing.T) {
+		token, _, err := auth.createAccessToken(admin.ID)
+		if err != nil {
+			t.Fatalf("createAccessToken() error = %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/search?query=echo", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		assertSearchResponse(t, rec, 4, false, true, emptyAlbum.ID)
+	})
+}
+
 func TestCreateAlbumAllowsPublishedAlbumWithoutTracks(t *testing.T) {
 	store := newTestTrackStore(t)
 
@@ -523,6 +687,41 @@ func assertAlbumListResponse(t *testing.T, rec *httptest.ResponseRecorder, wantI
 		if got.Items[i].ID != wantID {
 			t.Fatalf("got.Items[%d].ID = %d, want %d", i, got.Items[i].ID, wantID)
 		}
+	}
+}
+
+func assertSearchResponse(t *testing.T, rec *httptest.ResponseRecorder, wantTotal int, wantFavorite bool, wantEmptyAlbum bool, emptyAlbumID int64) {
+	t.Helper()
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var got paginatedSearchResults
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+
+	if got.TotalItems != wantTotal {
+		t.Fatalf("got.TotalItems = %d, want %d", got.TotalItems, wantTotal)
+	}
+
+	foundFavorite := false
+	foundEmptyAlbum := false
+	for _, item := range got.Items {
+		if item.Type == "track" && item.Track != nil && item.Track.Name == "Echo Song" {
+			foundFavorite = item.Track.IsFavorite
+		}
+		if item.Type == "album" && item.Album != nil && item.Album.ID == emptyAlbumID {
+			foundEmptyAlbum = true
+		}
+	}
+
+	if foundFavorite != wantFavorite {
+		t.Fatalf("foundFavorite = %v, want %v", foundFavorite, wantFavorite)
+	}
+	if foundEmptyAlbum != wantEmptyAlbum {
+		t.Fatalf("foundEmptyAlbum = %v, want %v", foundEmptyAlbum, wantEmptyAlbum)
 	}
 }
 

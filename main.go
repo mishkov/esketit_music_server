@@ -321,6 +321,28 @@ type paginatedPlaylists struct {
 	TotalPages int                `json:"totalPages"`
 }
 
+type searchListFilter struct {
+	Page         int
+	PageSize     int
+	Query        string
+	IncludeEmpty bool
+}
+
+type searchResultItem struct {
+	Type   string         `json:"type"`
+	Author *author        `json:"author,omitempty"`
+	Album  *album         `json:"album,omitempty"`
+	Track  *trackResponse `json:"track,omitempty"`
+}
+
+type paginatedSearchResults struct {
+	Items      []searchResultItem `json:"items"`
+	Page       int                `json:"page"`
+	PageSize   int                `json:"pageSize"`
+	TotalItems int                `json:"totalItems"`
+	TotalPages int                `json:"totalPages"`
+}
+
 type legacyTrackV1 struct {
 	ID             int64            `json:"id"`
 	Name           string           `json:"name"`
@@ -451,6 +473,7 @@ func main() {
 	mux.Handle("DELETE /songs/", requireRole(auth, store, roleAdmin, deleteSongHandler(store, songsDir)))
 	mux.HandleFunc("GET /album-covers/", getAlbumCoverHandler(albumCoversDir))
 	mux.HandleFunc("GET /albums", listAlbumsHandler(store, auth))
+	mux.HandleFunc("GET /search", searchHandler(store, auth))
 	mux.Handle("POST /albums", requireRole(auth, store, roleAdmin, createAlbumHandler(store)))
 	mux.HandleFunc("GET /albums/", getAlbumByRouteHandler(store))
 	mux.Handle("PUT /albums/", requireRole(auth, store, roleAdmin, updateAlbumByRouteHandler(store)))
@@ -1580,6 +1603,91 @@ func (s *trackStore) listAuthors() []author {
 		return items[i].ID < items[j].ID
 	})
 	return items
+}
+
+func (s *trackStore) search(userID int64, filter searchListFilter) paginatedSearchResults {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	items := make([]searchResultItem, 0, len(s.authors)+len(s.albums)+len(s.tracks))
+	query := strings.ToLower(strings.TrimSpace(filter.Query))
+	favoriteIDs := s.favoriteTrackSetLocked(userID)
+
+	for _, a := range s.authors {
+		if query != "" && !strings.Contains(strings.ToLower(a.CurrentName), query) {
+			continue
+		}
+		authorCopy := a
+		items = append(items, searchResultItem{
+			Type:   "author",
+			Author: &authorCopy,
+		})
+	}
+
+	for _, a := range s.albums {
+		if !filter.IncludeEmpty && len(a.TrackIDs) == 0 {
+			continue
+		}
+		if query != "" && !strings.Contains(strings.ToLower(a.Title), query) {
+			continue
+		}
+		albumCopy := a
+		albumCopy.AuthorIDs = append([]int64(nil), albumCopy.AuthorIDs...)
+		albumCopy.TrackIDs = append([]int64(nil), albumCopy.TrackIDs...)
+		albumCopy.AdditionalInfo = normalizeAdditionalInfo(albumCopy.AdditionalInfo)
+		items = append(items, searchResultItem{
+			Type:  "album",
+			Album: &albumCopy,
+		})
+	}
+
+	for _, t := range s.tracks {
+		if query != "" && !strings.Contains(strings.ToLower(t.Name), query) {
+			continue
+		}
+		_, isFavorite := favoriteIDs[t.ID]
+		trackCopy := toTrackResponse(t, isFavorite, true)
+		items = append(items, searchResultItem{
+			Type:  "track",
+			Track: &trackCopy,
+		})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		leftName, leftType, leftID := searchResultSortKey(items[i])
+		rightName, rightType, rightID := searchResultSortKey(items[j])
+		if leftName != rightName {
+			return leftName < rightName
+		}
+		if leftType != rightType {
+			return leftType < rightType
+		}
+		return leftID < rightID
+	})
+
+	page := normalizePage(filter.Page)
+	pageSize := normalizePageSize(filter.PageSize)
+	totalItems := len(items)
+	totalPages := 0
+	if totalItems > 0 {
+		totalPages = (totalItems + pageSize - 1) / pageSize
+	}
+	start := (page - 1) * pageSize
+	if start > totalItems {
+		start = totalItems
+	}
+	end := start + pageSize
+	if end > totalItems {
+		end = totalItems
+	}
+
+	return paginatedSearchResults{
+		Items:      items[start:end],
+		Page:       page,
+		PageSize:   pageSize,
+		TotalItems: totalItems,
+		TotalPages: totalPages,
+	}
 }
 
 func (s *trackStore) getAuthor(id int64) (author, bool) {
@@ -2793,6 +2901,25 @@ func favoriteTrackHandler(store *trackStore, favorite bool) http.HandlerFunc {
 func listAuthorsHandler(store *trackStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, store.listAuthors())
+	}
+}
+
+func searchHandler(store *trackStore, auth *authManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		filter, err := parseSearchListFilter(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if auth != nil {
+			userID, err := auth.authenticateRequest(r)
+			if err == nil {
+				if user, ok := store.getUser(userID); ok && user.Role == roleAdmin {
+					filter.IncludeEmpty = true
+				}
+			}
+		}
+		writeJSON(w, http.StatusOK, store.search(optionalUserIDFromRequest(r, auth), filter))
 	}
 }
 
@@ -4104,6 +4231,14 @@ func parseTrackListFilter(values url.Values) (trackListFilter, error) {
 	return filter, nil
 }
 
+func parseSearchListFilter(values url.Values) (searchListFilter, error) {
+	return searchListFilter{
+		Page:     parseIntWithDefault(values.Get("page"), 1),
+		PageSize: parseIntWithDefault(values.Get("pageSize"), 20),
+		Query:    strings.TrimSpace(values.Get("query")),
+	}, nil
+}
+
 func parseIntWithDefault(raw string, fallback int) int {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -4217,6 +4352,24 @@ func toTrackResponse(t track, isFavorite, isAvailable bool) trackResponse {
 		IsFavorite:     isFavorite,
 		IsAvailable:    isAvailable,
 	}
+}
+
+func searchResultSortKey(item searchResultItem) (string, string, int64) {
+	switch item.Type {
+	case "author":
+		if item.Author != nil {
+			return strings.ToLower(item.Author.CurrentName), item.Type, item.Author.ID
+		}
+	case "album":
+		if item.Album != nil {
+			return strings.ToLower(item.Album.Title), item.Type, item.Album.ID
+		}
+	case "track":
+		if item.Track != nil {
+			return strings.ToLower(item.Track.Name), item.Type, item.Track.ID
+		}
+	}
+	return "", item.Type, 0
 }
 
 func validateTrack(t track, authors map[int64]author) error {

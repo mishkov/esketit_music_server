@@ -17,6 +17,7 @@ tags:
   - name: Albums
   - name: Tracks
   - name: Authors
+  - name: Search
   - name: Playlists
   - name: Telegram
 
@@ -957,6 +958,43 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /search:
+    get:
+      tags: [Search]
+      summary: Search authors, albums, and tracks
+      description: |
+        Public substring search across author names, album titles, and track names.
+        Results are returned as a single combined paginated list.
+
+        Anonymous and listener requests omit albums whose `trackIds` array is empty.
+        Admin requests may include empty albums when authenticated.
+      parameters:
+        - in: query
+          name: page
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - in: query
+          name: pageSize
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - in: query
+          name: query
+          schema:
+            type: string
+          description: Case-insensitive substring match
+      responses:
+        '200':
+          description: Combined paginated search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedSearchResults'
+
   /tracks:
     get:
       tags: [Tracks]
@@ -1596,6 +1634,37 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Playlist'
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        totalItems:
+          type: integer
+        totalPages:
+          type: integer
+      required: [items, page, pageSize, totalItems, totalPages]
+
+    SearchResultItem:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [author, album, track]
+        author:
+          $ref: '#/components/schemas/Author'
+        album:
+          $ref: '#/components/schemas/Album'
+        track:
+          $ref: '#/components/schemas/Track'
+      required: [type]
+
+    PaginatedSearchResults:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchResultItem'
         page:
           type: integer
         pageSize:
