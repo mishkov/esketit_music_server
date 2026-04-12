@@ -99,6 +99,28 @@ type track struct {
 	AdditionalInfo []additionalInfo `json:"additionalInfo"`
 }
 
+type lyrics struct {
+	ID           int64             `json:"id"`
+	TrackID      int64             `json:"trackId"`
+	Type         string            `json:"type"`
+	PlainText    *string           `json:"plainText"`
+	LanguageCode *string           `json:"languageCode"`
+	Source       *string           `json:"source"`
+	IsVerified   bool              `json:"isVerified"`
+	UpdatedAt    time.Time         `json:"updatedAt"`
+	CreatedAt    time.Time         `json:"createdAt"`
+	Lines        []syncedLyricLine `json:"lines"`
+}
+
+type syncedLyricLine struct {
+	ID         int64  `json:"id"`
+	LyricsID   int64  `json:"lyricsId"`
+	StartMs    int    `json:"startMs"`
+	EndMs      *int   `json:"endMs"`
+	Text       string `json:"text"`
+	OrderIndex int    `json:"orderIndex"`
+}
+
 type playlistTrack struct {
 	TrackID          int64  `json:"trackId"`
 	UnavailableTrack *track `json:"unavailableTrack,omitempty"`
@@ -220,32 +242,38 @@ type playlistResponse struct {
 }
 
 type dbFile struct {
-	NextTrackID    int64            `json:"nextTrackId"`
-	NextAlbumID    int64            `json:"nextAlbumId"`
-	NextAuthorID   int64            `json:"nextAuthorId"`
-	NextUserID     int64            `json:"nextUserId"`
-	NextPlaylistID int64            `json:"nextPlaylistId"`
-	Tracks         []track          `json:"tracks"`
-	Albums         []album          `json:"albums"`
-	Authors        []author         `json:"authors"`
-	Users          []user           `json:"users"`
-	Sessions       []refreshSession `json:"sessions"`
-	Playlists      []playlist       `json:"playlists"`
+	NextTrackID      int64            `json:"nextTrackId"`
+	NextAlbumID      int64            `json:"nextAlbumId"`
+	NextAuthorID     int64            `json:"nextAuthorId"`
+	NextUserID       int64            `json:"nextUserId"`
+	NextPlaylistID   int64            `json:"nextPlaylistId"`
+	NextLyricsID     int64            `json:"nextLyricsId"`
+	NextLyricsLineID int64            `json:"nextLyricsLineId"`
+	Tracks           []track          `json:"tracks"`
+	Albums           []album          `json:"albums"`
+	Authors          []author         `json:"authors"`
+	Users            []user           `json:"users"`
+	Sessions         []refreshSession `json:"sessions"`
+	Playlists        []playlist       `json:"playlists"`
+	Lyrics           []lyrics         `json:"lyrics"`
 }
 
 type diskDBFile struct {
-	NextTrackID    int64             `json:"nextTrackId"`
-	NextAlbumID    int64             `json:"nextAlbumId"`
-	NextAuthorID   int64             `json:"nextAuthorId"`
-	NextUserID     int64             `json:"nextUserId"`
-	NextPlaylistID int64             `json:"nextPlaylistId"`
-	NextID         int64             `json:"nextId"`
-	Tracks         []json.RawMessage `json:"tracks"`
-	Albums         []album           `json:"albums"`
-	Authors        []author          `json:"authors"`
-	Users          []user            `json:"users"`
-	Sessions       []refreshSession  `json:"sessions"`
-	Playlists      []playlist        `json:"playlists"`
+	NextTrackID      int64             `json:"nextTrackId"`
+	NextAlbumID      int64             `json:"nextAlbumId"`
+	NextAuthorID     int64             `json:"nextAuthorId"`
+	NextUserID       int64             `json:"nextUserId"`
+	NextPlaylistID   int64             `json:"nextPlaylistId"`
+	NextLyricsID     int64             `json:"nextLyricsId"`
+	NextLyricsLineID int64             `json:"nextLyricsLineId"`
+	NextID           int64             `json:"nextId"`
+	Tracks           []json.RawMessage `json:"tracks"`
+	Albums           []album           `json:"albums"`
+	Authors          []author          `json:"authors"`
+	Users            []user            `json:"users"`
+	Sessions         []refreshSession  `json:"sessions"`
+	Playlists        []playlist        `json:"playlists"`
+	Lyrics           []lyrics          `json:"lyrics"`
 }
 
 type legacyTrack struct {
@@ -257,20 +285,23 @@ type legacyTrack struct {
 }
 
 type trackStore struct {
-	mu             sync.RWMutex
-	path           string
-	nextTrackID    int64
-	nextAlbumID    int64
-	nextAuthorID   int64
-	nextUserID     int64
-	nextPlaylistID int64
-	tracks         map[int64]track
-	albums         map[int64]album
-	authors        map[int64]author
-	users          map[int64]user
-	usersByEmail   map[string]int64
-	refreshSession map[string]refreshSession
-	playlists      map[int64]playlist
+	mu               sync.RWMutex
+	path             string
+	nextTrackID      int64
+	nextAlbumID      int64
+	nextAuthorID     int64
+	nextUserID       int64
+	nextPlaylistID   int64
+	nextLyricsID     int64
+	nextLyricsLineID int64
+	tracks           map[int64]track
+	albums           map[int64]album
+	authors          map[int64]author
+	users            map[int64]user
+	usersByEmail     map[string]int64
+	refreshSession   map[string]refreshSession
+	playlists        map[int64]playlist
+	lyricsByTrack    map[int64]lyrics
 }
 
 type paginatedAlbums struct {
@@ -488,10 +519,10 @@ func main() {
 	mux.Handle("DELETE /playlists/", requireAuth(auth, store, deletePlaylistByRouteHandler(store)))
 	mux.HandleFunc("GET /tracks", listTracksHandler(store, auth))
 	mux.Handle("POST /tracks", requireRole(auth, store, roleAdmin, createTrackHandler(store)))
-	mux.HandleFunc("GET /tracks/", getTrackByRouteHandler(store, auth))
-	mux.HandleFunc("POST /tracks/", postTrackByRouteHandler(store, auth))
-	mux.HandleFunc("PUT /tracks/", putTrackByRouteHandler(store, auth))
-	mux.HandleFunc("DELETE /tracks/", deleteTrackByRouteHandler(store, auth))
+	mux.Handle("GET /tracks/", getTrackByRouteHandler(store, auth))
+	mux.Handle("POST /tracks/", postTrackByRouteHandler(store, auth))
+	mux.Handle("PUT /tracks/", putTrackByRouteHandler(store, auth))
+	mux.Handle("DELETE /tracks/", deleteTrackByRouteHandler(store, auth))
 	mux.HandleFunc("GET /authors", listAuthorsHandler(store))
 	mux.Handle("POST /authors", requireRole(auth, store, roleAdmin, createAuthorHandler(store)))
 	mux.HandleFunc("GET /authors/", getAuthorByIDHandler(store))
@@ -759,19 +790,22 @@ func newAuthManager(secret []byte, accessTokenTTL, refreshTokenTTL time.Duration
 
 func newTrackStore(path string) (*trackStore, error) {
 	s := &trackStore{
-		path:           path,
-		nextTrackID:    1,
-		nextAlbumID:    1,
-		nextAuthorID:   1,
-		nextUserID:     1,
-		nextPlaylistID: 1,
-		tracks:         make(map[int64]track),
-		albums:         make(map[int64]album),
-		authors:        make(map[int64]author),
-		users:          make(map[int64]user),
-		usersByEmail:   make(map[string]int64),
-		refreshSession: make(map[string]refreshSession),
-		playlists:      make(map[int64]playlist),
+		path:             path,
+		nextTrackID:      1,
+		nextAlbumID:      1,
+		nextAuthorID:     1,
+		nextUserID:       1,
+		nextPlaylistID:   1,
+		nextLyricsID:     1,
+		nextLyricsLineID: 1,
+		tracks:           make(map[int64]track),
+		albums:           make(map[int64]album),
+		authors:          make(map[int64]author),
+		users:            make(map[int64]user),
+		usersByEmail:     make(map[string]int64),
+		refreshSession:   make(map[string]refreshSession),
+		playlists:        make(map[int64]playlist),
+		lyricsByTrack:    make(map[int64]lyrics),
 	}
 
 	data, err := os.ReadFile(path)
@@ -822,7 +856,6 @@ func newTrackStore(path string) (*trackStore, error) {
 		if err := json.Unmarshal(rawTrack, &t); err == nil {
 			t.Name = strings.TrimSpace(t.Name)
 			t.AuthorIDs = normalizeAuthorIDs(t.AuthorIDs)
-			t.AlbumID = t.AlbumID
 			t.AudioFilePath = strings.TrimSpace(t.AudioFilePath)
 			t.AdditionalInfo = normalizeAdditionalInfo(t.AdditionalInfo)
 			if t.ID <= 0 || t.AlbumID <= 0 {
@@ -905,6 +938,25 @@ func newTrackStore(path string) (*trackStore, error) {
 		}
 	}
 
+	for _, lyricsItem := range file.Lyrics {
+		lyricsItem, ok := normalizeLyrics(lyricsItem)
+		if !ok {
+			continue
+		}
+		if _, exists := s.tracks[lyricsItem.TrackID]; !exists {
+			continue
+		}
+		s.lyricsByTrack[lyricsItem.TrackID] = lyricsItem
+		if lyricsItem.ID >= s.nextLyricsID {
+			s.nextLyricsID = lyricsItem.ID + 1
+		}
+		for _, line := range lyricsItem.Lines {
+			if line.ID >= s.nextLyricsLineID {
+				s.nextLyricsLineID = line.ID + 1
+			}
+		}
+	}
+
 	now := time.Now()
 	for _, session := range file.Sessions {
 		if session.ID == "" || session.UserID <= 0 || session.TokenHash == "" {
@@ -937,6 +989,12 @@ func newTrackStore(path string) (*trackStore, error) {
 	if file.NextPlaylistID > s.nextPlaylistID {
 		s.nextPlaylistID = file.NextPlaylistID
 	}
+	if file.NextLyricsID > s.nextLyricsID {
+		s.nextLyricsID = file.NextLyricsID
+	}
+	if file.NextLyricsLineID > s.nextLyricsLineID {
+		s.nextLyricsLineID = file.NextLyricsLineID
+	}
 	if s.nextTrackID < 1 {
 		s.nextTrackID = 1
 	}
@@ -952,6 +1010,12 @@ func newTrackStore(path string) (*trackStore, error) {
 	if s.nextPlaylistID < 1 {
 		s.nextPlaylistID = 1
 	}
+	if s.nextLyricsID < 1 {
+		s.nextLyricsID = 1
+	}
+	if s.nextLyricsLineID < 1 {
+		s.nextLyricsLineID = 1
+	}
 
 	if err := s.migrateLegacyAlbumsLocked(); err != nil {
 		return nil, err
@@ -960,6 +1024,9 @@ func newTrackStore(path string) (*trackStore, error) {
 		return nil, err
 	}
 	if err := s.ensureFavoritesPlaylistsLocked(); err != nil {
+		return nil, err
+	}
+	if err := s.validateLyricsStateLocked(); err != nil {
 		return nil, err
 	}
 	if err := s.persistLocked(); err != nil {
@@ -1291,12 +1358,14 @@ func (s *trackStore) delete(id int64) (bool, error) {
 	albumsSnapshot := cloneAlbumsMap(s.albums)
 	tracksSnapshot := cloneTracksMap(s.tracks)
 	playlistsSnapshot := clonePlaylistsMap(s.playlists)
+	lyricsSnapshot := cloneLyricsMap(s.lyricsByTrack)
 
 	t, ok := s.tracks[id]
 	if !ok {
 		return false, nil
 	}
 	delete(s.tracks, id)
+	delete(s.lyricsByTrack, id)
 	if albumItem, ok := s.albums[t.AlbumID]; ok {
 		removeTrackFromAlbumLocked(&albumItem, id)
 		s.albums[t.AlbumID] = albumItem
@@ -1306,12 +1375,14 @@ func (s *trackStore) delete(id int64) (bool, error) {
 		s.albums = albumsSnapshot
 		s.tracks = tracksSnapshot
 		s.playlists = playlistsSnapshot
+		s.lyricsByTrack = lyricsSnapshot
 		return false, err
 	}
 	if err := s.persistLocked(); err != nil {
 		s.albums = albumsSnapshot
 		s.tracks = tracksSnapshot
 		s.playlists = playlistsSnapshot
+		s.lyricsByTrack = lyricsSnapshot
 		return false, err
 	}
 	return true, nil
@@ -2018,18 +2089,29 @@ func (s *trackStore) persistLocked() error {
 		return playlistItems[i].UserID < playlistItems[j].UserID
 	})
 
+	lyricsItems := make([]lyrics, 0, len(s.lyricsByTrack))
+	for _, item := range s.lyricsByTrack {
+		lyricsItems = append(lyricsItems, cloneLyrics(item))
+	}
+	sort.Slice(lyricsItems, func(i, j int) bool {
+		return lyricsItems[i].TrackID < lyricsItems[j].TrackID
+	})
+
 	payload, err := json.MarshalIndent(dbFile{
-		NextTrackID:    s.nextTrackID,
-		NextAlbumID:    s.nextAlbumID,
-		NextAuthorID:   s.nextAuthorID,
-		NextUserID:     s.nextUserID,
-		NextPlaylistID: s.nextPlaylistID,
-		Tracks:         trackItems,
-		Albums:         albumItems,
-		Authors:        authorItems,
-		Users:          userItems,
-		Sessions:       sessionItems,
-		Playlists:      playlistItems,
+		NextTrackID:      s.nextTrackID,
+		NextAlbumID:      s.nextAlbumID,
+		NextAuthorID:     s.nextAuthorID,
+		NextUserID:       s.nextUserID,
+		NextPlaylistID:   s.nextPlaylistID,
+		NextLyricsID:     s.nextLyricsID,
+		NextLyricsLineID: s.nextLyricsLineID,
+		Tracks:           trackItems,
+		Albums:           albumItems,
+		Authors:          authorItems,
+		Users:            userItems,
+		Sessions:         sessionItems,
+		Playlists:        playlistItems,
+		Lyrics:           lyricsItems,
 	}, "", "  ")
 	if err != nil {
 		return err
@@ -2711,6 +2793,10 @@ func createTrackHandler(store *trackStore) http.HandlerFunc {
 
 func getTrackByRouteHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/lyrics") {
+			getTrackLyricsHandler(store).ServeHTTP(w, r)
+			return
+		}
 		getTrackByIDHandler(store, auth).ServeHTTP(w, r)
 	}
 }
@@ -2795,6 +2881,10 @@ func postTrackByRouteHandler(store *trackStore, auth *authManager) http.HandlerF
 
 func putTrackByRouteHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/lyrics") {
+			requireRole(auth, store, roleAdmin, putTrackLyricsHandler(store)).ServeHTTP(w, r)
+			return
+		}
 		if strings.HasSuffix(r.URL.Path, "/favorite") {
 			requireAuth(auth, store, favoriteTrackHandler(store, true)).ServeHTTP(w, r)
 			return
@@ -2806,6 +2896,8 @@ func putTrackByRouteHandler(store *trackStore, auth *authManager) http.HandlerFu
 func deleteTrackByRouteHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/lyrics"):
+			requireRole(auth, store, roleAdmin, deleteTrackLyricsHandler(store)).ServeHTTP(w, r)
 		case strings.HasSuffix(r.URL.Path, "/favorite"):
 			requireAuth(auth, store, favoriteTrackHandler(store, false)).ServeHTTP(w, r)
 		case strings.Contains(r.URL.Path, "/playlists/"):
@@ -4500,6 +4592,7 @@ func redocHandler() http.HandlerFunc {
 var errInvalidTrack = errors.New("invalid track payload")
 var errInvalidAlbum = errors.New("invalid album payload")
 var errInvalidAuthor = errors.New("invalid author payload")
+var errInvalidLyricsPayload = errors.New("invalid lyrics payload")
 var errInvalidPlaylistPayload = errors.New("invalid playlist payload")
 var errAlbumInUse = errors.New("album is used by one or more tracks")
 var errAuthorInUse = errors.New("author is used by one or more tracks")
@@ -4507,5 +4600,6 @@ var errEmailAlreadyExists = errors.New("user with this email already exists")
 var errInvalidCredentials = errors.New("invalid email or password")
 var errInvalidRefreshToken = errors.New("invalid refresh token")
 var errTrackNotFound = errors.New("track not found")
+var errLyricsNotFound = errors.New("lyrics not found")
 var errPlaylistNotFound = errors.New("playlist not found")
 var errFavoritePlaylistImmutable = errors.New("favorites playlist cannot be modified directly")

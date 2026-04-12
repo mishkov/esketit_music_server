@@ -1158,6 +1158,102 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /tracks/{id}/lyrics:
+    get:
+      tags: [Tracks]
+      summary: Get lyrics for a track
+      description: |
+        Returns the dedicated lyrics aggregate for a track. Lyrics are never embedded
+        into track list endpoints.
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '200':
+          description: Track lyrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackLyrics'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Tracks]
+      summary: Create or fully replace track lyrics
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertTrackLyricsRequest'
+            examples:
+              plain:
+                value:
+                  type: plain
+                  languageCode: en
+                  isVerified: true
+                  source: artist
+                  plainText: Full lyrics here
+              synced:
+                value:
+                  type: synced
+                  languageCode: en
+                  isVerified: true
+                  source: artist
+                  lines:
+                    - startMs: 0
+                      endMs: 4200
+                      text: First line
+                    - startMs: 4200
+                      endMs: 7600
+                      text: Second line
+      responses:
+        '200':
+          description: Replaced existing lyrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackLyrics'
+        '201':
+          description: Created new lyrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackLyrics'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Tracks]
+      summary: Delete track lyrics
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '204':
+          description: Deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /telegram/import-sessions:
     post:
       tags: [Telegram]
@@ -1523,6 +1619,73 @@ components:
           items:
             $ref: '#/components/schemas/AdditionalInfo'
       required: [name, authorIds, albumId, albumOrder, audioFilePath, additionalInfo]
+
+    LyricsType:
+      type: string
+      enum: [plain, synced]
+
+    SyncedLyricsLine:
+      type: object
+      properties:
+        startMs:
+          type: integer
+          minimum: 0
+        endMs:
+          type: integer
+          nullable: true
+          minimum: 0
+        text:
+          type: string
+          minLength: 1
+      required: [startMs, text]
+
+    TrackLyrics:
+      type: object
+      properties:
+        trackId:
+          type: integer
+          format: int64
+          minimum: 1
+        type:
+          $ref: '#/components/schemas/LyricsType'
+        languageCode:
+          type: string
+          nullable: true
+        isVerified:
+          type: boolean
+        source:
+          type: string
+          nullable: true
+        plainText:
+          type: string
+          nullable: true
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncedLyricsLine'
+      required: [trackId, type, isVerified, lines]
+
+    UpsertTrackLyricsRequest:
+      type: object
+      properties:
+        type:
+          $ref: '#/components/schemas/LyricsType'
+        languageCode:
+          type: string
+          nullable: true
+        isVerified:
+          type: boolean
+        source:
+          type: string
+          nullable: true
+        plainText:
+          type: string
+          nullable: true
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncedLyricsLine'
+      required: [type, isVerified]
 
     PlaylistVisibility:
       type: string
