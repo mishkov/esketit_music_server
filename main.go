@@ -16,6 +16,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -37,6 +38,8 @@ const (
 	maxSongUploadSize         = 512 << 20
 	maxPlaylistNameLength     = 200
 	maxPlaylistDescLength     = 1000
+	defaultAutoplayCount      = 1
+	maxAutoplayCount          = 50
 	roleAdmin                 = "admin"
 	roleListener              = "listener"
 	logModeVerbose            = "verbose"
@@ -46,6 +49,11 @@ const (
 	playlistVisibilityShared  = "shared"
 	playlistKindCustom        = "custom"
 	playlistKindFavorites     = "favorites"
+	autoplaySourceMyVibe      = "my_vibe"
+	autoplaySourcePlaylist    = "playlist"
+	autoplaySourceAlbum       = "album"
+	autoplaySourceTrack       = "track"
+	defaultAutoplayProfile    = "default"
 )
 
 type contextKey string
@@ -160,6 +168,23 @@ type addTrackToPlaylistsRequest struct {
 
 type reorderPlaylistTracksRequest struct {
 	TrackIDs []int64 `json:"trackIds"`
+}
+
+type autoplayNextRequest struct {
+	SourceType       string  `json:"sourceType"`
+	SourceID         *int64  `json:"sourceId,omitempty"`
+	Profile          string  `json:"profile,omitempty"`
+	Count            int     `json:"count"`
+	RecentTrackIDs   []int64 `json:"recentTrackIds"`
+	ExcludedTrackIDs []int64 `json:"excludedTrackIds"`
+}
+
+type autoplayNextResponse struct {
+	SourceType string          `json:"sourceType"`
+	SourceID   *int64          `json:"sourceId,omitempty"`
+	Profile    string          `json:"profile"`
+	Strategy   string          `json:"strategy"`
+	Tracks     []trackResponse `json:"tracks"`
 }
 
 type author struct {
@@ -517,6 +542,7 @@ func main() {
 	mux.Handle("GET /playlists/", requireAuth(auth, store, getPlaylistByRouteHandler(store)))
 	mux.Handle("PUT /playlists/", requireAuth(auth, store, updatePlaylistByRouteHandler(store)))
 	mux.Handle("DELETE /playlists/", requireAuth(auth, store, deletePlaylistByRouteHandler(store)))
+	mux.Handle("POST /autoplay/next", requireAuth(auth, store, autoplayNextHandler(store)))
 	mux.HandleFunc("GET /tracks", listTracksHandler(store, auth))
 	mux.Handle("POST /tracks", requireRole(auth, store, roleAdmin, createTrackHandler(store)))
 	mux.Handle("GET /tracks/", getTrackByRouteHandler(store, auth))
@@ -1641,6 +1667,71 @@ func (s *trackStore) setFavoriteTrack(userID, trackID int64, favorite bool) erro
 	}
 	s.playlists[p.ID] = p
 	return s.persistLocked()
+}
+
+func (s *trackStore) nextAutoplayTracks(userID int64, req autoplayNextRequest) (autoplayNextResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if _, ok := s.users[userID]; !ok {
+		return autoplayNextResponse{}, errInvalidAutoplayRequest
+	}
+
+	switch req.SourceType {
+	case autoplaySourceMyVibe:
+	case autoplaySourcePlaylist:
+		p, ok := s.playlists[*req.SourceID]
+		if !ok || p.UserID != userID {
+			return autoplayNextResponse{}, errPlaylistNotFound
+		}
+	case autoplaySourceAlbum:
+		if _, ok := s.albums[*req.SourceID]; !ok {
+			return autoplayNextResponse{}, errAlbumNotFound
+		}
+	case autoplaySourceTrack:
+		if _, ok := s.tracks[*req.SourceID]; !ok {
+			return autoplayNextResponse{}, errTrackNotFound
+		}
+	default:
+		return autoplayNextResponse{}, fmt.Errorf("%w: unsupported sourceType", errInvalidAutoplayRequest)
+	}
+
+	excluded := make(map[int64]struct{}, len(req.RecentTrackIDs)+len(req.ExcludedTrackIDs))
+	for _, trackID := range req.RecentTrackIDs {
+		excluded[trackID] = struct{}{}
+	}
+	for _, trackID := range req.ExcludedTrackIDs {
+		excluded[trackID] = struct{}{}
+	}
+
+	candidates := make([]track, 0, len(s.tracks))
+	for _, t := range s.tracks {
+		if _, skip := excluded[t.ID]; skip {
+			continue
+		}
+		candidates = append(candidates, t)
+	}
+
+	chosen := make([]trackResponse, 0, min(req.Count, len(candidates)))
+	favoriteIDs := s.favoriteTrackSetLocked(userID)
+	for len(candidates) > 0 && len(chosen) < req.Count {
+		index, err := randomInt(len(candidates))
+		if err != nil {
+			return autoplayNextResponse{}, err
+		}
+		selected := candidates[index]
+		_, isFavorite := favoriteIDs[selected.ID]
+		chosen = append(chosen, toTrackResponse(selected, isFavorite, true))
+		candidates = append(candidates[:index], candidates[index+1:]...)
+	}
+
+	return autoplayNextResponse{
+		SourceType: req.SourceType,
+		SourceID:   req.SourceID,
+		Profile:    req.Profile,
+		Strategy:   "random_stub_v1",
+		Tracks:     chosen,
+	}, nil
 }
 
 func (s *trackStore) reorderPlaylistTracks(userID, playlistID int64, trackIDs []int64) (bool, error) {
@@ -2990,6 +3081,37 @@ func favoriteTrackHandler(store *trackStore, favorite bool) http.HandlerFunc {
 	}
 }
 
+func autoplayNextHandler(store *trackStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, ok := userIDFromContext(r.Context())
+		if !ok {
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return
+		}
+
+		req, err := decodeAutoplayNextRequest(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		response, err := store.nextAutoplayTracks(userID, req)
+		if err != nil {
+			switch {
+			case errors.Is(err, errInvalidAutoplayRequest):
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			case errors.Is(err, errTrackNotFound), errors.Is(err, errPlaylistNotFound), errors.Is(err, errAlbumNotFound):
+				http.NotFound(w, r)
+			default:
+				http.Error(w, "failed to build autoplay continuation", http.StatusInternalServerError)
+			}
+			return
+		}
+
+		writeJSON(w, http.StatusOK, response)
+	}
+}
+
 func listAuthorsHandler(store *trackStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, store.listAuthors())
@@ -3416,6 +3538,40 @@ func decodeReorderPlaylistTracksRequest(r *http.Request) (reorderPlaylistTracksR
 	return req, nil
 }
 
+func decodeAutoplayNextRequest(r *http.Request) (autoplayNextRequest, error) {
+	var req autoplayNextRequest
+	if err := decodeJSON(r, &req); err != nil {
+		return autoplayNextRequest{}, err
+	}
+
+	req.SourceType = normalizeAutoplaySourceType(req.SourceType)
+	req.Profile = normalizeAutoplayProfile(req.Profile)
+	req.RecentTrackIDs = normalizeTrackIDs(req.RecentTrackIDs)
+	req.ExcludedTrackIDs = normalizeTrackIDs(req.ExcludedTrackIDs)
+
+	switch req.SourceType {
+	case autoplaySourceMyVibe:
+		if req.SourceID != nil {
+			return autoplayNextRequest{}, fmt.Errorf("%w: sourceId must be omitted for sourceType my_vibe", errInvalidAutoplayRequest)
+		}
+	case autoplaySourcePlaylist, autoplaySourceAlbum, autoplaySourceTrack:
+		if req.SourceID == nil || *req.SourceID <= 0 {
+			return autoplayNextRequest{}, fmt.Errorf("%w: sourceId is required for sourceType %s", errInvalidAutoplayRequest, req.SourceType)
+		}
+	default:
+		return autoplayNextRequest{}, fmt.Errorf("%w: sourceType must be one of my_vibe, playlist, album, track", errInvalidAutoplayRequest)
+	}
+
+	if req.Count == 0 {
+		req.Count = defaultAutoplayCount
+	}
+	if req.Count < 0 || req.Count > maxAutoplayCount {
+		return autoplayNextRequest{}, fmt.Errorf("%w: count must be between 1 and %d", errInvalidAutoplayRequest, maxAutoplayCount)
+	}
+
+	return req, nil
+}
+
 func decodeRegisterRequest(r *http.Request) (registerRequest, error) {
 	var req registerRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -3556,6 +3712,17 @@ func randomToken(length int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
+func randomInt(max int) (int, error) {
+	if max <= 0 {
+		return 0, errors.New("max must be positive")
+	}
+	value, err := rand.Int(rand.Reader, big.NewInt(int64(max)))
+	if err != nil {
+		return 0, err
+	}
+	return int(value.Int64()), nil
+}
+
 func hashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return base64.RawStdEncoding.EncodeToString(sum[:])
@@ -3583,6 +3750,29 @@ func normalizeRole(role string) string {
 	default:
 		return ""
 	}
+}
+
+func normalizeAutoplaySourceType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case autoplaySourceMyVibe:
+		return autoplaySourceMyVibe
+	case autoplaySourcePlaylist:
+		return autoplaySourcePlaylist
+	case autoplaySourceAlbum:
+		return autoplaySourceAlbum
+	case autoplaySourceTrack:
+		return autoplaySourceTrack
+	default:
+		return ""
+	}
+}
+
+func normalizeAutoplayProfile(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return defaultAutoplayProfile
+	}
+	return value
 }
 
 func optionalUserIDFromRequest(r *http.Request, auth *authManager) int64 {
@@ -4591,9 +4781,11 @@ func redocHandler() http.HandlerFunc {
 
 var errInvalidTrack = errors.New("invalid track payload")
 var errInvalidAlbum = errors.New("invalid album payload")
+var errAlbumNotFound = errors.New("album not found")
 var errInvalidAuthor = errors.New("invalid author payload")
 var errInvalidLyricsPayload = errors.New("invalid lyrics payload")
 var errInvalidPlaylistPayload = errors.New("invalid playlist payload")
+var errInvalidAutoplayRequest = errors.New("invalid autoplay request")
 var errAlbumInUse = errors.New("album is used by one or more tracks")
 var errAuthorInUse = errors.New("author is used by one or more tracks")
 var errEmailAlreadyExists = errors.New("user with this email already exists")

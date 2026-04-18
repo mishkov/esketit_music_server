@@ -19,6 +19,7 @@ tags:
   - name: Authors
   - name: Search
   - name: Playlists
+  - name: Autoplay
   - name: Telegram
 
 paths:
@@ -864,6 +865,41 @@ paths:
       responses:
         '204':
           description: Reordered
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /autoplay/next:
+    post:
+      tags: [Autoplay]
+      summary: Build the next continuation queue for the current user
+      description: |
+        Stateless autoplay continuation endpoint. The client sends the current
+        listening context, desired profile, and track IDs that should be avoided
+        because they were recently played or are already queued.
+
+        This first backend version uses a random stub strategy. The request contract
+        is intended to stay stable as smarter ranking is added later.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AutoplayNextRequest'
+      responses:
+        '200':
+          description: Next continuation tracks
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutoplayNextResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -1755,6 +1791,68 @@ components:
             format: int64
             minimum: 1
       required: [trackIds]
+
+    AutoplaySourceType:
+      type: string
+      enum: [my_vibe, playlist, album, track]
+
+    AutoplayNextRequest:
+      type: object
+      properties:
+        sourceType:
+          $ref: '#/components/schemas/AutoplaySourceType'
+        sourceId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+          description: |
+            Required for `playlist`, `album`, and `track`. Must be omitted for
+            `my_vibe`.
+        profile:
+          type: string
+          default: default
+          description: |
+            Future-facing personalization profile such as `default`, `work`,
+            `sleep`, or `workout`.
+        count:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 1
+        recentTrackIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        excludedTrackIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+      required: [sourceType, count, recentTrackIds, excludedTrackIds]
+
+    AutoplayNextResponse:
+      type: object
+      properties:
+        sourceType:
+          $ref: '#/components/schemas/AutoplaySourceType'
+        sourceId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        profile:
+          type: string
+        strategy:
+          type: string
+        tracks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Track'
+      required: [sourceType, profile, strategy, tracks]
 
     PaginatedAlbums:
       type: object

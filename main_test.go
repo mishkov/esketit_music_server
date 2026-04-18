@@ -657,6 +657,169 @@ func TestUploadAlbumCoverHandlerAllowsSameOriginalFileNameTwice(t *testing.T) {
 	}
 }
 
+func TestAutoplayNextHandlerSupportsAllSourceTypes(t *testing.T) {
+	store := newTestTrackStore(t)
+	auth := newAuthManager([]byte("test-secret"), time.Hour, 24*time.Hour)
+	handler := requireAuth(auth, store, autoplayNextHandler(store))
+
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+
+	artist, albumItem := seedPlaylistTrackDependencies(t, store)
+	trackOne, err := store.create(upsertTrackRequest{
+		Name:          "Track One",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       albumItem.ID,
+		AlbumOrder:    0,
+		AudioFilePath: "/songs/track-one.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create(trackOne) error = %v", err)
+	}
+	trackTwo, err := store.create(upsertTrackRequest{
+		Name:          "Track Two",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       albumItem.ID,
+		AlbumOrder:    1,
+		AudioFilePath: "/songs/track-two.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create(trackTwo) error = %v", err)
+	}
+	playlistItem, err := store.createPlaylist(user.ID, upsertPlaylistRequest{
+		Name:        "Queue",
+		Description: "Queue description",
+		Visibility:  playlistVisibilityPrivate,
+	})
+	if err != nil {
+		t.Fatalf("createPlaylist() error = %v", err)
+	}
+	if err := store.addTrackToPlaylists(user.ID, trackOne.ID, []int64{playlistItem.ID}); err != nil {
+		t.Fatalf("addTrackToPlaylists() error = %v", err)
+	}
+
+	token, _, err := auth.createAccessToken(user.ID)
+	if err != nil {
+		t.Fatalf("createAccessToken() error = %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		sourceType string
+		sourceID   *int64
+	}{
+		{name: "my vibe", sourceType: autoplaySourceMyVibe},
+		{name: "playlist", sourceType: autoplaySourcePlaylist, sourceID: &playlistItem.ID},
+		{name: "album", sourceType: autoplaySourceAlbum, sourceID: &albumItem.ID},
+		{name: "track", sourceType: autoplaySourceTrack, sourceID: &trackOne.ID},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := autoplayNextRequest{
+				SourceType:       tt.sourceType,
+				SourceID:         tt.sourceID,
+				Profile:          "work",
+				Count:            1,
+				RecentTrackIDs:   []int64{trackOne.ID},
+				ExcludedTrackIDs: []int64{trackOne.ID},
+			}
+			body, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatalf("Marshal() error = %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/autoplay/next", bytes.NewReader(body))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+
+			var response autoplayNextResponse
+			if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+				t.Fatalf("Decode() error = %v", err)
+			}
+
+			if response.SourceType != tt.sourceType {
+				t.Fatalf("response.SourceType = %q, want %q", response.SourceType, tt.sourceType)
+			}
+			if response.Profile != "work" {
+				t.Fatalf("response.Profile = %q, want work", response.Profile)
+			}
+			if response.Strategy != "random_stub_v1" {
+				t.Fatalf("response.Strategy = %q, want random_stub_v1", response.Strategy)
+			}
+			if len(response.Tracks) != 1 {
+				t.Fatalf("len(response.Tracks) = %d, want 1", len(response.Tracks))
+			}
+			if response.Tracks[0].ID != trackTwo.ID {
+				t.Fatalf("response.Tracks[0].ID = %d, want %d", response.Tracks[0].ID, trackTwo.ID)
+			}
+		})
+	}
+}
+
+func TestAutoplayNextHandlerRejectsMissingSourceIDForPlaylist(t *testing.T) {
+	store := newTestTrackStore(t)
+	auth := newAuthManager([]byte("test-secret"), time.Hour, 24*time.Hour)
+	handler := requireAuth(auth, store, autoplayNextHandler(store))
+
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	token, _, err := auth.createAccessToken(user.ID)
+	if err != nil {
+		t.Fatalf("createAccessToken() error = %v", err)
+	}
+
+	body := strings.NewReader(`{"sourceType":"playlist","count":1,"recentTrackIds":[],"excludedTrackIds":[]}`)
+	req := httptest.NewRequest(http.MethodPost, "/autoplay/next", body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestAutoplayNextHandlerReturnsNotFoundForMissingTrackContext(t *testing.T) {
+	store := newTestTrackStore(t)
+	auth := newAuthManager([]byte("test-secret"), time.Hour, 24*time.Hour)
+	handler := requireAuth(auth, store, autoplayNextHandler(store))
+
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	token, _, err := auth.createAccessToken(user.ID)
+	if err != nil {
+		t.Fatalf("createAccessToken() error = %v", err)
+	}
+
+	body := strings.NewReader(`{"sourceType":"track","sourceId":999,"count":1,"recentTrackIds":[],"excludedTrackIds":[]}`)
+	req := httptest.NewRequest(http.MethodPost, "/autoplay/next", body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
 func newTestTrackStore(t *testing.T) *trackStore {
 	t.Helper()
 
