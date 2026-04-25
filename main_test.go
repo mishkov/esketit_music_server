@@ -820,6 +820,51 @@ func TestAutoplayNextHandlerReturnsNotFoundForMissingTrackContext(t *testing.T) 
 	}
 }
 
+func TestNewTrackStoreNormalizesLegacyBareAudioFilePath(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "tracks_db.json")
+	file := diskDBFile{
+		NextTrackID:  2,
+		NextAlbumID:  2,
+		NextAuthorID: 2,
+		Tracks: []json.RawMessage{
+			json.RawMessage(`{"id":1,"name":"Legacy Track","authorIds":[1],"albumId":1,"audioFilePath":"Kino_-_Kamchatka_(SkySound.cc)-0HGJwR05.mp3","additionalInfo":[],"sourceMetadata":[]}`),
+		},
+		Albums: []album{
+			{
+				ID:             1,
+				Title:          "Album",
+				AuthorIDs:      []int64{1},
+				ReleaseDate:    time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+				TrackIDs:       []int64{1},
+				AdditionalInfo: []additionalInfo{},
+			},
+		},
+		Authors: []author{
+			{ID: 1, CurrentName: "Author", Photos: []string{}},
+		},
+	}
+	data, err := json.Marshal(file)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if err := os.WriteFile(dbPath, data, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	store, err := newTrackStore(dbPath)
+	if err != nil {
+		t.Fatalf("newTrackStore() error = %v", err)
+	}
+
+	got, ok := store.getTrackResponse(1, 0)
+	if !ok {
+		t.Fatalf("getTrackResponse() ok = false, want true")
+	}
+	if got.AudioFilePath != "/songs/Kino_-_Kamchatka_%28SkySound.cc%29-0HGJwR05.mp3" {
+		t.Fatalf("got.AudioFilePath = %q", got.AudioFilePath)
+	}
+}
+
 func newTestTrackStore(t *testing.T) *trackStore {
 	t.Helper()
 

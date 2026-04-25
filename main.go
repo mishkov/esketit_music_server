@@ -882,7 +882,7 @@ func newTrackStore(path string) (*trackStore, error) {
 		if err := json.Unmarshal(rawTrack, &t); err == nil {
 			t.Name = strings.TrimSpace(t.Name)
 			t.AuthorIDs = normalizeAuthorIDs(t.AuthorIDs)
-			t.AudioFilePath = strings.TrimSpace(t.AudioFilePath)
+			t.AudioFilePath = normalizeAudioFilePath(t.AudioFilePath)
 			t.AdditionalInfo = normalizeAdditionalInfo(t.AdditionalInfo)
 			if t.ID <= 0 || t.AlbumID <= 0 {
 				continue
@@ -900,7 +900,7 @@ func newTrackStore(path string) (*trackStore, error) {
 				ID:             previous.ID,
 				Name:           strings.TrimSpace(previous.Name),
 				AuthorIDs:      normalizeAuthorIDs(previous.AuthorIDs),
-				AudioFilePath:  strings.TrimSpace(previous.AudioFilePath),
+				AudioFilePath:  normalizeAudioFilePath(previous.AudioFilePath),
 				AdditionalInfo: normalizeAdditionalInfo(previous.AdditionalInfo),
 			}
 			s.tracks[t.ID] = t
@@ -927,7 +927,7 @@ func newTrackStore(path string) (*trackStore, error) {
 			ID:            legacy.ID,
 			Name:          strings.TrimSpace(legacy.Name),
 			AuthorIDs:     normalizeAuthorIDs(authorIDs),
-			AudioFilePath: strings.TrimSpace(legacy.AudioFilePath),
+			AudioFilePath: normalizeAudioFilePath(legacy.AudioFilePath),
 		}
 		s.tracks[t.ID] = t
 		if t.ID >= s.nextTrackID {
@@ -1288,7 +1288,7 @@ func (s *trackStore) create(req upsertTrackRequest) (track, error) {
 		Name:           strings.TrimSpace(req.Name),
 		AuthorIDs:      normalizeAuthorIDs(req.AuthorIDs),
 		AlbumID:        req.AlbumID,
-		AudioFilePath:  strings.TrimSpace(req.AudioFilePath),
+		AudioFilePath:  normalizeAudioFilePath(req.AudioFilePath),
 		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
 	}
 	if err := s.validateTrackLocked(t); err != nil {
@@ -1340,7 +1340,7 @@ func (s *trackStore) update(id int64, req upsertTrackRequest) (track, bool, erro
 		Name:           strings.TrimSpace(req.Name),
 		AuthorIDs:      normalizeAuthorIDs(req.AuthorIDs),
 		AlbumID:        req.AlbumID,
-		AudioFilePath:  strings.TrimSpace(req.AudioFilePath),
+		AudioFilePath:  normalizeAudioFilePath(req.AudioFilePath),
 		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
 	}
 	if err := s.validateTrackLocked(updated); err != nil {
@@ -2349,6 +2349,27 @@ func buildSongInfo(name string, info os.FileInfo) songInfo {
 		Path:         path,
 		URL:          path,
 	}
+}
+
+func normalizeAudioFilePath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if strings.HasPrefix(value, "/songs/") {
+		return value
+	}
+
+	parsed, err := url.Parse(value)
+	if err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		return value
+	}
+
+	name, err := sanitizeSongFileName(value)
+	if err != nil {
+		return value
+	}
+	return "/songs/" + url.PathEscape(name)
 }
 
 func sanitizeSongFileName(name string) (string, error) {
@@ -4629,7 +4650,7 @@ func toTrackResponse(t track, isFavorite, isAvailable bool) trackResponse {
 		Name:           t.Name,
 		AuthorIDs:      append([]int64(nil), t.AuthorIDs...),
 		AlbumID:        t.AlbumID,
-		AudioFilePath:  t.AudioFilePath,
+		AudioFilePath:  normalizeAudioFilePath(t.AudioFilePath),
 		AdditionalInfo: normalizeAdditionalInfo(t.AdditionalInfo),
 		IsFavorite:     isFavorite,
 		IsAvailable:    isAvailable,
