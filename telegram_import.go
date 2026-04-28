@@ -443,6 +443,7 @@ type telegramSaveTrackRequest struct {
 	AlbumID        int64            `json:"albumId"`
 	AlbumOrder     int              `json:"albumOrder"`
 	AdditionalInfo []additionalInfo `json:"additionalInfo"`
+	SourceMetadata []sourceMetadata `json:"sourceMetadata"`
 }
 
 type telegramImportService struct {
@@ -717,6 +718,7 @@ func (s *telegramImportService) SaveCurrent(ctx context.Context, userID int64, r
 		AlbumOrder:     req.AlbumOrder,
 		AudioFilePath:  audioPath,
 		AdditionalInfo: req.AdditionalInfo,
+		SourceMetadata: req.SourceMetadata,
 	})
 	if err != nil {
 		_ = os.Remove(filepath.Join(s.songsDir, finalName))

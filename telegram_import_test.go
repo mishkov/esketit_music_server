@@ -155,6 +155,23 @@ func TestTelegramImportSaveCurrentPromotesFileAndCreatesTrack(t *testing.T) {
 		AuthorIDs:  []int64{artist.ID},
 		AlbumID:    album.ID,
 		AlbumOrder: 0,
+		AdditionalInfo: []additionalInfo{
+			{
+				"type":     "external_link",
+				"provider": "youtube_music",
+				"url":      "https://music.youtube.com/watch?v=save-me",
+			},
+		},
+		SourceMetadata: []sourceMetadata{
+			{
+				"provider": "telegram",
+				"identity": map[string]any{
+					"chatId":    "test_channel",
+					"messageId": "10",
+				},
+				"url": "https://t.me/test_channel/10",
+			},
+		},
 	})
 	if err != nil {
 		t.Fatalf("SaveCurrent() error = %v", err)
@@ -167,6 +184,16 @@ func TestTelegramImportSaveCurrentPromotesFileAndCreatesTrack(t *testing.T) {
 	}
 	if !strings.HasPrefix(createdTrack.AudioFilePath, "/songs/") {
 		t.Fatalf("created track audio path = %q", createdTrack.AudioFilePath)
+	}
+	if len(createdTrack.SourceMetadata) != 1 {
+		t.Fatalf("created track source metadata = %#v", createdTrack.SourceMetadata)
+	}
+	identity, ok := createdTrack.SourceMetadata[0]["identity"].(map[string]any)
+	if !ok {
+		t.Fatalf("created track sourceMetadata identity = %#v, want object", createdTrack.SourceMetadata[0]["identity"])
+	}
+	if got := identity["messageId"]; got != "10" {
+		t.Fatalf("created track sourceMetadata identity.messageId = %#v, want 10", got)
 	}
 
 	savedFiles, err := os.ReadDir(songsDir)

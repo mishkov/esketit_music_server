@@ -191,6 +191,77 @@ func TestListTracksHandlerRejectsInvalidTrackFilters(t *testing.T) {
 	}
 }
 
+func TestCreateTrackAcceptsExternalLinkAndSourceMetadata(t *testing.T) {
+	store := newTestTrackStore(t)
+	artist, album := seedTrackDependencies(t, store)
+
+	createdTrack, err := store.create(upsertTrackRequest{
+		Name:          "Imported Track",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       album.ID,
+		AlbumOrder:    0,
+		AudioFilePath: "/songs/imported-track.mp3",
+		AdditionalInfo: []additionalInfo{
+			{
+				"type":     "external_link",
+				"provider": "youtube_music",
+				"url":      " https://music.youtube.com/watch?v=abc123 ",
+				"title":    " YouTube Music ",
+			},
+		},
+		SourceMetadata: []sourceMetadata{
+			{
+				"provider": " youtube_music ",
+				"kind":     " track ",
+				"identity": map[string]any{
+					"videoId": " abc123 ",
+				},
+				"url": " https://music.youtube.com/watch?v=abc123 ",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+
+	if got := createdTrack.AdditionalInfo[0]["url"]; got != "https://music.youtube.com/watch?v=abc123" {
+		t.Fatalf("additionalInfo url = %#v, want trimmed URL", got)
+	}
+	if got := createdTrack.SourceMetadata[0]["provider"]; got != "youtube_music" {
+		t.Fatalf("sourceMetadata provider = %#v, want youtube_music", got)
+	}
+	identity, ok := createdTrack.SourceMetadata[0]["identity"].(map[string]any)
+	if !ok {
+		t.Fatalf("sourceMetadata identity = %#v, want object", createdTrack.SourceMetadata[0]["identity"])
+	}
+	if got := identity["videoId"]; got != "abc123" {
+		t.Fatalf("sourceMetadata identity.videoId = %#v, want abc123", got)
+	}
+}
+
+func TestCreateTrackRejectsDuplicateSourceMetadataProviderIdentity(t *testing.T) {
+	store := newTestTrackStore(t)
+	artist, album := seedTrackDependencies(t, store)
+
+	_, err := store.create(upsertTrackRequest{
+		Name:          "Duplicate Source",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       album.ID,
+		AlbumOrder:    0,
+		AudioFilePath: "/songs/duplicate-source.mp3",
+		SourceMetadata: []sourceMetadata{
+			{"provider": "telegram", "identity": map[string]any{"chatId": "chan", "messageId": "42"}},
+			{"provider": " Telegram ", "identity": map[string]any{"messageId": "42", "chatId": "chan"}},
+		},
+	})
+	if err == nil {
+		t.Fatal("create() error = nil, want validation error")
+	}
+	if !strings.Contains(err.Error(), "duplicates provider/identity pair") {
+		t.Fatalf("create() error = %v, want duplicate sourceMetadata error", err)
+	}
+}
+
 func TestSearchHandlerReturnsCombinedPaginatedResults(t *testing.T) {
 	store := newTestTrackStore(t)
 	handler := searchHandler(store, nil)

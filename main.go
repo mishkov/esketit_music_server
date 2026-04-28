@@ -76,6 +76,7 @@ type albumCoverInfo struct {
 }
 
 type additionalInfo map[string]any
+type sourceMetadata map[string]any
 
 type album struct {
 	ID             int64            `json:"id"`
@@ -105,6 +106,7 @@ type track struct {
 	AlbumID        int64            `json:"albumId"`
 	AudioFilePath  string           `json:"audioFilePath"`
 	AdditionalInfo []additionalInfo `json:"additionalInfo"`
+	SourceMetadata []sourceMetadata `json:"sourceMetadata"`
 }
 
 type lyrics struct {
@@ -153,6 +155,7 @@ type upsertTrackRequest struct {
 	AlbumOrder     int              `json:"albumOrder"`
 	AudioFilePath  string           `json:"audioFilePath"`
 	AdditionalInfo []additionalInfo `json:"additionalInfo"`
+	SourceMetadata []sourceMetadata `json:"sourceMetadata"`
 }
 
 type upsertPlaylistRequest struct {
@@ -250,6 +253,7 @@ type trackResponse struct {
 	AlbumID        int64            `json:"albumId"`
 	AudioFilePath  string           `json:"audioFilePath"`
 	AdditionalInfo []additionalInfo `json:"additionalInfo"`
+	SourceMetadata []sourceMetadata `json:"sourceMetadata"`
 	IsFavorite     bool             `json:"isFavorite"`
 	IsAvailable    bool             `json:"isAvailable"`
 }
@@ -406,6 +410,7 @@ type legacyTrackV1 struct {
 	AlbumImagePath string           `json:"albumImagePath"`
 	AudioFilePath  string           `json:"audioFilePath"`
 	AdditionalInfo []additionalInfo `json:"additionalInfo"`
+	SourceMetadata []sourceMetadata `json:"sourceMetadata"`
 }
 
 type loggingResponseWriter struct {
@@ -884,6 +889,7 @@ func newTrackStore(path string) (*trackStore, error) {
 			t.AuthorIDs = normalizeAuthorIDs(t.AuthorIDs)
 			t.AudioFilePath = normalizeAudioFilePath(t.AudioFilePath)
 			t.AdditionalInfo = normalizeAdditionalInfo(t.AdditionalInfo)
+			t.SourceMetadata = normalizeSourceMetadata(t.SourceMetadata)
 			if t.ID <= 0 || t.AlbumID <= 0 {
 				continue
 			}
@@ -902,6 +908,7 @@ func newTrackStore(path string) (*trackStore, error) {
 				AuthorIDs:      normalizeAuthorIDs(previous.AuthorIDs),
 				AudioFilePath:  normalizeAudioFilePath(previous.AudioFilePath),
 				AdditionalInfo: normalizeAdditionalInfo(previous.AdditionalInfo),
+				SourceMetadata: normalizeSourceMetadata(previous.SourceMetadata),
 			}
 			s.tracks[t.ID] = t
 			if t.ID >= s.nextTrackID {
@@ -1290,6 +1297,7 @@ func (s *trackStore) create(req upsertTrackRequest) (track, error) {
 		AlbumID:        req.AlbumID,
 		AudioFilePath:  normalizeAudioFilePath(req.AudioFilePath),
 		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
+		SourceMetadata: normalizeSourceMetadata(req.SourceMetadata),
 	}
 	if err := s.validateTrackLocked(t); err != nil {
 		return track{}, err
@@ -1342,6 +1350,7 @@ func (s *trackStore) update(id int64, req upsertTrackRequest) (track, bool, erro
 		AlbumID:        req.AlbumID,
 		AudioFilePath:  normalizeAudioFilePath(req.AudioFilePath),
 		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
+		SourceMetadata: normalizeSourceMetadata(req.SourceMetadata),
 	}
 	if err := s.validateTrackLocked(updated); err != nil {
 		return track{}, true, err
@@ -3937,11 +3946,50 @@ func normalizeAdditionalInfo(items []additionalInfo) []additionalInfo {
 	for _, item := range items {
 		copied := make(additionalInfo, len(item))
 		for key, value := range item {
+			if text, ok := value.(string); ok {
+				value = strings.TrimSpace(text)
+			}
 			copied[key] = value
 		}
 		normalized = append(normalized, copied)
 	}
 	return normalized
+}
+
+func normalizeSourceMetadata(items []sourceMetadata) []sourceMetadata {
+	if len(items) == 0 {
+		return []sourceMetadata{}
+	}
+	normalized := make([]sourceMetadata, 0, len(items))
+	for _, item := range items {
+		copied := make(sourceMetadata, len(item))
+		for key, value := range item {
+			copied[key] = normalizeMetadataValue(value)
+		}
+		normalized = append(normalized, copied)
+	}
+	return normalized
+}
+
+func normalizeMetadataValue(value any) any {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case map[string]any:
+		normalized := make(map[string]any, len(typed))
+		for key, nested := range typed {
+			normalized[key] = normalizeMetadataValue(nested)
+		}
+		return normalized
+	case []any:
+		normalized := make([]any, len(typed))
+		for index, nested := range typed {
+			normalized[index] = normalizeMetadataValue(nested)
+		}
+		return normalized
+	default:
+		return value
+	}
 }
 
 func normalizePlaylistTrackItems(items []playlistTrack) []playlistTrack {
@@ -4012,6 +4060,9 @@ func (s *trackStore) validateTrackLocked(t track) error {
 			return fmt.Errorf("%w: albumId %d does not exist", errInvalidTrack, t.AlbumID)
 		}
 		if err := validateAdditionalInfo(t.AdditionalInfo); err != nil {
+			return fmt.Errorf("%w: %v", errInvalidTrack, err)
+		}
+		if err := validateSourceMetadata(t.SourceMetadata); err != nil {
 			return fmt.Errorf("%w: %v", errInvalidTrack, err)
 		}
 		return nil
@@ -4134,9 +4185,64 @@ func validateAdditionalInfo(items []additionalInfo) error {
 			if !ok || strings.TrimSpace(text) == "" {
 				return fmt.Errorf("additionalInfo[%d].text is required for type text", index)
 			}
+		case "external_link":
+			provider, ok := item["provider"].(string)
+			if !ok || strings.TrimSpace(provider) == "" {
+				return fmt.Errorf("additionalInfo[%d].provider is required for type external_link", index)
+			}
+			urlValue, ok := item["url"].(string)
+			if !ok || strings.TrimSpace(urlValue) == "" {
+				return fmt.Errorf("additionalInfo[%d].url is required for type external_link", index)
+			}
 		}
 	}
 	return nil
+}
+
+func validateSourceMetadata(items []sourceMetadata) error {
+	seen := make(map[string]struct{}, len(items))
+	for index, item := range items {
+		provider, ok := item["provider"].(string)
+		if !ok || strings.TrimSpace(provider) == "" {
+			return fmt.Errorf("sourceMetadata[%d].provider is required", index)
+		}
+		identity, ok := item["identity"].(map[string]any)
+		if !ok || len(identity) == 0 {
+			return fmt.Errorf("sourceMetadata[%d].identity is required", index)
+		}
+		identityKey, err := sourceMetadataIdentityKey(identity)
+		if err != nil {
+			return fmt.Errorf("sourceMetadata[%d].identity is invalid", index)
+		}
+		if urlValue, ok := item["url"]; ok {
+			urlString, ok := urlValue.(string)
+			if !ok || strings.TrimSpace(urlString) == "" {
+				return fmt.Errorf("sourceMetadata[%d].url must be a non-empty string when present", index)
+			}
+		}
+		key := strings.ToLower(strings.TrimSpace(provider)) + "\x00" + identityKey
+		if _, ok := seen[key]; ok {
+			return fmt.Errorf("sourceMetadata[%d] duplicates provider/identity pair", index)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+func sourceMetadataIdentityKey(identity map[string]any) (string, error) {
+	normalized := normalizeMetadataValue(identity)
+	identityMap, ok := normalized.(map[string]any)
+	if !ok || len(identityMap) == 0 {
+		return "", errors.New("identity must be an object")
+	}
+	encoded, err := json.Marshal(identityMap)
+	if err != nil {
+		return "", err
+	}
+	if string(encoded) == "{}" {
+		return "", errors.New("identity must not be empty")
+	}
+	return string(encoded), nil
 }
 
 func (s *trackStore) migrateLegacyAlbumsLocked() error {
@@ -4559,6 +4665,7 @@ func cloneTracksMap(src map[int64]track) map[int64]track {
 	for id, item := range src {
 		item.AuthorIDs = append([]int64(nil), item.AuthorIDs...)
 		item.AdditionalInfo = normalizeAdditionalInfo(item.AdditionalInfo)
+		item.SourceMetadata = normalizeSourceMetadata(item.SourceMetadata)
 		cloned[id] = item
 	}
 	return cloned
@@ -4567,6 +4674,7 @@ func cloneTracksMap(src map[int64]track) map[int64]track {
 func cloneTrack(t track) track {
 	t.AuthorIDs = append([]int64(nil), t.AuthorIDs...)
 	t.AdditionalInfo = normalizeAdditionalInfo(t.AdditionalInfo)
+	t.SourceMetadata = normalizeSourceMetadata(t.SourceMetadata)
 	return t
 }
 
@@ -4652,6 +4760,7 @@ func toTrackResponse(t track, isFavorite, isAvailable bool) trackResponse {
 		AlbumID:        t.AlbumID,
 		AudioFilePath:  normalizeAudioFilePath(t.AudioFilePath),
 		AdditionalInfo: normalizeAdditionalInfo(t.AdditionalInfo),
+		SourceMetadata: normalizeSourceMetadata(t.SourceMetadata),
 		IsFavorite:     isFavorite,
 		IsAvailable:    isAvailable,
 	}

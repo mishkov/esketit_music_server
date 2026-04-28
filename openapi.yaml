@@ -1486,6 +1486,41 @@ components:
               type: string
           required: [type, title, text]
 
+    ExternalLinkAdditionalInfo:
+      allOf:
+        - $ref: '#/components/schemas/AdditionalInfo'
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [external_link]
+            id:
+              type: string
+            provider:
+              type: string
+            title:
+              type: string
+            url:
+              type: string
+              format: uri
+          required: [type, provider, url]
+
+    SourceMetadata:
+      type: object
+      properties:
+        provider:
+          type: string
+        kind:
+          type: string
+        identity:
+          type: object
+          additionalProperties: true
+        url:
+          type: string
+          format: uri
+      required: [provider, identity]
+      additionalProperties: true
+
     Author:
       type: object
       properties:
@@ -1615,11 +1650,15 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AdditionalInfo'
+        sourceMetadata:
+          type: array
+          items:
+            $ref: '#/components/schemas/SourceMetadata'
         isFavorite:
           type: boolean
         isAvailable:
           type: boolean
-      required: [id, name, authorIds, albumId, audioFilePath, additionalInfo, isFavorite, isAvailable]
+      required: [id, name, authorIds, albumId, audioFilePath, additionalInfo, sourceMetadata, isFavorite, isAvailable]
 
     UpsertTrackRequest:
       type: object
@@ -1654,7 +1693,11 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AdditionalInfo'
-      required: [name, authorIds, albumId, albumOrder, audioFilePath, additionalInfo]
+        sourceMetadata:
+          type: array
+          items:
+            $ref: '#/components/schemas/SourceMetadata'
+      required: [name, authorIds, albumId, albumOrder, audioFilePath, additionalInfo, sourceMetadata]
 
     LyricsType:
       type: string
