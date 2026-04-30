@@ -501,6 +501,33 @@ func main() {
 		log.Fatalf("invalid telegram import temp directory %q: %v", telegramImportTempDir, err)
 	}
 
+	youtubeImportTempDir := os.Getenv("YOUTUBE_IMPORT_TEMP_DIR")
+	if youtubeImportTempDir == "" {
+		youtubeImportTempDir = "youtube_import_tmp"
+	}
+	if err := ensureDirOrCreate(youtubeImportTempDir); err != nil {
+		log.Fatalf("invalid youtube import temp directory %q: %v", youtubeImportTempDir, err)
+	}
+
+	youtubeCookiesFile := os.Getenv("YOUTUBE_COOKIES_FILE")
+	if youtubeCookiesFile == "" {
+		youtubeCookiesFile = "youtube_cookies.txt"
+	}
+	youtubeCookiesDir := filepath.Dir(youtubeCookiesFile)
+	if youtubeCookiesDir != "." {
+		if err := ensureDirOrCreate(youtubeCookiesDir); err != nil {
+			log.Fatalf("invalid youtube cookies directory %q: %v", youtubeCookiesDir, err)
+		}
+	}
+	ytdlpBinary := strings.TrimSpace(os.Getenv("YTDLP_BINARY"))
+	if ytdlpBinary == "" {
+		ytdlpBinary = "yt-dlp"
+	}
+	ffmpegBinary := strings.TrimSpace(os.Getenv("FFMPEG_BINARY"))
+	if ffmpegBinary == "" {
+		ffmpegBinary = "ffmpeg"
+	}
+
 	tracksDBPath := os.Getenv("TRACKS_DB_PATH")
 	if tracksDBPath == "" {
 		tracksDBPath = "tracks_db.json"
@@ -525,6 +552,16 @@ func main() {
 	}
 	telegramGateway := newGotdTelegramGateway(telegramConfig)
 	telegramImport := newTelegramImportService(telegramConfig, telegramGateway, store, songsDir)
+	youtubeCookieStore := newYouTubeCookieStore(youtubeCookiesFile)
+	youtubeImportConfig := youtubeImportConfig{
+		ImportTempDir:   youtubeImportTempDir,
+		RequestTimeout:  2 * time.Minute,
+		DownloadTimeout: 15 * time.Minute,
+		YTDLPBinary:     ytdlpBinary,
+		FFmpegBinary:    ffmpegBinary,
+	}
+	youtubeImportGateway := newLiveYouTubeImportGateway(youtubeImportConfig, youtubeCookieStore)
+	youtubeImport := newYouTubeImportService(youtubeImportConfig, youtubeImportGateway, store, songsDir)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /songs", listSongsHandler(songsDir))
@@ -575,6 +612,14 @@ func main() {
 	mux.Handle("DELETE /telegram/import-sessions/current", requireRole(auth, store, roleAdmin, telegramCancelImportHandler(telegramImport)))
 	mux.Handle("GET /telegram/import-sessions/current/audio", requireRole(auth, store, roleAdmin, telegramCurrentAudioHandler(telegramImport)))
 	mux.Handle("GET /telegram/import-sessions/current/skipped-report", requireRole(auth, store, roleAdmin, telegramSkippedReportHandler(telegramImport)))
+	mux.Handle("POST /youtube/import-sessions", requireRole(auth, store, roleAdmin, youtubeStartImportHandler(youtubeImport)))
+	mux.Handle("GET /youtube/import-sessions/current", requireRole(auth, store, roleAdmin, youtubeCurrentImportHandler(youtubeImport)))
+	mux.Handle("POST /youtube/import-sessions/current/skip", requireRole(auth, store, roleAdmin, youtubeSkipImportHandler(youtubeImport)))
+	mux.Handle("POST /youtube/import-sessions/current/add", requireRole(auth, store, roleAdmin, youtubeAddImportHandler(youtubeImport)))
+	mux.Handle("DELETE /youtube/import-sessions/current", requireRole(auth, store, roleAdmin, youtubeCancelImportHandler(youtubeImport)))
+	mux.Handle("GET /youtube/cookies/status", requireRole(auth, store, roleAdmin, youtubeCookiesStatusHandler(youtubeCookieStore)))
+	mux.Handle("POST /youtube/cookies", requireRole(auth, store, roleAdmin, youtubeCookiesUploadHandler(youtubeCookieStore)))
+	mux.Handle("DELETE /youtube/cookies", requireRole(auth, store, roleAdmin, youtubeCookiesDeleteHandler(youtubeCookieStore)))
 	mux.HandleFunc("GET /openapi.yaml", serveOpenAPIHandler("openapi.yaml"))
 	mux.HandleFunc("GET /docs", swaggerUIHandler())
 	mux.HandleFunc("GET /redoc", redocHandler())
@@ -586,6 +631,10 @@ func main() {
 	log.Printf("using tracks database %s", tracksDBPath)
 	log.Printf("telegram state directory %s", telegramStateDir)
 	log.Printf("telegram import temp directory %s", telegramImportTempDir)
+	log.Printf("youtube import temp directory %s", youtubeImportTempDir)
+	log.Printf("youtube cookies file %s", youtubeCookiesFile)
+	log.Printf("yt-dlp binary %s", ytdlpBinary)
+	log.Printf("ffmpeg binary %s", ffmpegBinary)
 	log.Printf("http logging mode %s", logMode)
 	log.Printf("swagger docs available at http://localhost%s/docs", addr)
 	log.Printf("redoc available at http://localhost%s/redoc", addr)

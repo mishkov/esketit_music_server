@@ -1325,6 +1325,196 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /youtube/import-sessions:
+    post:
+      tags: [YouTube]
+      summary: Start a YouTube import session
+      description: |
+        Resolve a YouTube or YouTube Music track, playlist, or artist/channel URL
+        into a reviewable import session.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/YouTubeStartImportRequest'
+      responses:
+        '201':
+          description: Import session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/YouTubeImportSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /youtube/import-sessions/current:
+    get:
+      tags: [YouTube]
+      summary: Get the current YouTube import item
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Current import session state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/YouTubeImportSession'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [YouTube]
+      summary: Cancel the current YouTube import session
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Session cancelled
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /youtube/import-sessions/current/skip:
+    post:
+      tags: [YouTube]
+      summary: Skip the current YouTube import item
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Updated import session state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/YouTubeImportSession'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /youtube/import-sessions/current/add:
+    post:
+      tags: [YouTube]
+      summary: Add the current YouTube import item
+      description: |
+        Creates a new local track or attaches the current YouTube item to an
+        existing track, then advances the session.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/YouTubeAddImportRequest'
+      responses:
+        '200':
+          description: Updated session and created or updated track
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/YouTubeImportAddResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /youtube/cookies/status:
+    get:
+      tags: [YouTube]
+      summary: Read YouTube cookies upload status
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Cookie configuration status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/YouTubeCookiesStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /youtube/cookies:
+    post:
+      tags: [YouTube]
+      summary: Upload YouTube authentication cookies
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/FileUploadRequest'
+      responses:
+        '201':
+          description: Cookies uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/YouTubeCookiesStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [YouTube]
+      summary: Delete stored YouTube authentication cookies
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Cookies deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -2092,6 +2282,164 @@ components:
         - progress
         - createdAt
         - updatedAt
+
+    YouTubeStartImportRequest:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+        releaseDateCutoff:
+          type: string
+          format: date-time
+          nullable: true
+        replaceExisting:
+          type: boolean
+      required: [url]
+
+    YouTubeImportSuggestion:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [exact_source_match, possible_track_match]
+        trackId:
+          type: integer
+          format: int64
+        confidence:
+          type: number
+          format: float
+        metadata:
+          type: object
+          additionalProperties: true
+      required: [type, trackId, confidence]
+
+    YouTubeCurrentImportItem:
+      type: object
+      properties:
+        sourceType:
+          type: string
+          enum: [track, playlist, artist]
+        sourceUrl:
+          type: string
+          format: uri
+        originalSourceUrl:
+          type: string
+          format: uri
+        videoId:
+          type: string
+        parsedTitle:
+          type: string
+        parsedAuthorNames:
+          type: array
+          items:
+            type: string
+        parsedAlbumTitle:
+          type: string
+        parsedReleaseDate:
+          type: string
+          format: date-time
+          nullable: true
+        coverImageUrl:
+          type: string
+          format: uri
+        durationSeconds:
+          type: integer
+        suggestions:
+          type: array
+          items:
+            $ref: '#/components/schemas/YouTubeImportSuggestion'
+      required: [sourceType, sourceUrl, originalSourceUrl, videoId, parsedTitle, parsedAuthorNames, suggestions]
+
+    YouTubeImportProgress:
+      type: object
+      properties:
+        total:
+          type: integer
+        processed:
+          type: integer
+        remaining:
+          type: integer
+        skipped:
+          type: integer
+        saved:
+          type: integer
+      required: [total, processed, remaining, skipped, saved]
+
+    YouTubeImportSession:
+      type: object
+      properties:
+        sessionId:
+          type: string
+        status:
+          type: string
+          enum: [active, completed]
+        sourceType:
+          type: string
+          enum: [track, playlist, artist]
+        sourceUrl:
+          type: string
+          format: uri
+        currentItem:
+          $ref: '#/components/schemas/YouTubeCurrentImportItem'
+        progress:
+          $ref: '#/components/schemas/YouTubeImportProgress'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required: [sessionId, status, sourceType, sourceUrl, progress, createdAt, updatedAt]
+
+    YouTubeAddImportRequest:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [create, attach]
+        trackId:
+          type: integer
+          format: int64
+          minimum: 1
+        name:
+          type: string
+        authorIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        albumId:
+          type: integer
+          format: int64
+          minimum: 1
+        albumOrder:
+          type: integer
+          minimum: 0
+      required: [mode]
+
+    YouTubeImportAddResponse:
+      type: object
+      properties:
+        session:
+          $ref: '#/components/schemas/YouTubeImportSession'
+        track:
+          $ref: '#/components/schemas/Track'
+      required: [session, track]
+
+    YouTubeCookiesStatus:
+      type: object
+      properties:
+        configured:
+          type: boolean
+        filePresent:
+          type: boolean
+        lastModified:
+          type: string
+          format: date-time
+          nullable: true
+      required: [configured, filePresent]
 
     PublicUser:
       type: object
