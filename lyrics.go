@@ -133,7 +133,7 @@ func decodeUpsertLyricsRequest(r *http.Request) (upsertLyricsRequest, error) {
 }
 
 func parseTrackLyricsID(path string) (int64, error) {
-	return parseResourceID(strings.TrimSuffix(path, "/lyrics"), "/tracks/")
+	return parseResourceID(strings.TrimSuffix(path, "/lyrics"), "/api/tracks/")
 }
 
 func (s *trackStore) getLyrics(trackID int64) (lyrics, error) {

@@ -548,7 +548,7 @@ func (s *youtubeImportService) downloadCurrentToSongs(ctx context.Context, index
 		}
 		_ = os.Remove(finalPath)
 	}
-	return "/songs/" + url.PathEscape(finalName), cleanup, nil
+	return "/api/songs/" + url.PathEscape(finalName), cleanup, nil
 }
 
 func youtubeImportFileName(item youtubeImportItem) (string, error) {

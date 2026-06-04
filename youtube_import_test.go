@@ -156,7 +156,7 @@ func TestYouTubeImportAddCurrentCreateDownloadsAndCreatesTrack(t *testing.T) {
 	if dto.Status != youtubeImportStatusCompleted || dto.Progress.Saved != 1 {
 		t.Fatalf("AddCurrent() dto = %#v", dto)
 	}
-	if !strings.HasPrefix(createdTrack.AudioFilePath, "/songs/") {
+	if !strings.HasPrefix(createdTrack.AudioFilePath, "/api/songs/") {
 		t.Fatalf("created track audio path = %q", createdTrack.AudioFilePath)
 	}
 	if !strings.HasSuffix(createdTrack.AudioFilePath, ".mp3") {
@@ -209,7 +209,7 @@ func TestYouTubeImportAddCurrentAttachMergesMetadata(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
 		AlbumOrder:    0,
-		AudioFilePath: "/songs/existing-track.mp3",
+		AudioFilePath: "/api/songs/existing-track.mp3",
 	})
 	if err != nil {
 		t.Fatalf("create() error = %v", err)
@@ -265,7 +265,7 @@ func TestYouTubeImportSuggestionsIncludeExactSourceMatch(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
 		AlbumOrder:    0,
-		AudioFilePath: "/songs/matched-track.mp3",
+		AudioFilePath: "/api/songs/matched-track.mp3",
 		SourceMetadata: []sourceMetadata{
 			{
 				"provider": "youtube",
@@ -366,7 +366,7 @@ func TestYouTubeCookiesUploadHandlerStoresFile(t *testing.T) {
 		t.Fatalf("Close() error = %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/youtube/cookies", body)
+	req := httptest.NewRequest(http.MethodPost, "/api/youtube/cookies", body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	rec := httptest.NewRecorder()
 

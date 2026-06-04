@@ -53,7 +53,7 @@ func TestDeleteTrackKeepsUnavailablePlaylistEntry(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
 		AlbumOrder:    0,
-		AudioFilePath: "/songs/track.mp3",
+		AudioFilePath: "/api/songs/track.mp3",
 	})
 	if err != nil {
 		t.Fatalf("create() error = %v", err)
@@ -116,7 +116,7 @@ func TestListTrackResponsesAppliesPaginationFiltersAndSearch(t *testing.T) {
 		Name:          "Skyline",
 		AuthorIDs:     []int64{artistOne.ID},
 		AlbumID:       albumOne.ID,
-		AudioFilePath: "/songs/skyline.mp3",
+		AudioFilePath: "/api/songs/skyline.mp3",
 	})
 	if err != nil {
 		t.Fatalf("create() skyline error = %v", err)
@@ -125,7 +125,7 @@ func TestListTrackResponsesAppliesPaginationFiltersAndSearch(t *testing.T) {
 		Name:          "Night Drive",
 		AuthorIDs:     []int64{artistOne.ID, artistTwo.ID},
 		AlbumID:       albumTwo.ID,
-		AudioFilePath: "/songs/night-drive.mp3",
+		AudioFilePath: "/api/songs/night-drive.mp3",
 	})
 	if err != nil {
 		t.Fatalf("create() night drive error = %v", err)
@@ -134,7 +134,7 @@ func TestListTrackResponsesAppliesPaginationFiltersAndSearch(t *testing.T) {
 		Name:          "Morning Light",
 		AuthorIDs:     []int64{artistTwo.ID},
 		AlbumID:       albumOne.ID,
-		AudioFilePath: "/songs/morning-light.mp3",
+		AudioFilePath: "/api/songs/morning-light.mp3",
 	})
 	if err != nil {
 		t.Fatalf("create() morning light error = %v", err)
@@ -181,7 +181,7 @@ func TestListTracksHandlerRejectsInvalidTrackFilters(t *testing.T) {
 	store := newTestTrackStore(t)
 	handler := listTracksHandler(store, nil)
 
-	req := httptest.NewRequest(http.MethodGet, "/tracks?authorId=0", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/tracks?authorId=0", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -200,7 +200,7 @@ func TestCreateTrackAcceptsExternalLinkAndSourceMetadata(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
 		AlbumOrder:    0,
-		AudioFilePath: "/songs/imported-track.mp3",
+		AudioFilePath: "/api/songs/imported-track.mp3",
 		AdditionalInfo: []additionalInfo{
 			{
 				"type":     "external_link",
@@ -248,7 +248,7 @@ func TestCreateTrackRejectsDuplicateSourceMetadataProviderIdentity(t *testing.T)
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
 		AlbumOrder:    0,
-		AudioFilePath: "/songs/duplicate-source.mp3",
+		AudioFilePath: "/api/songs/duplicate-source.mp3",
 		SourceMetadata: []sourceMetadata{
 			{"provider": "telegram", "identity": map[string]any{"chatId": "chan", "messageId": "42"}},
 			{"provider": " Telegram ", "identity": map[string]any{"messageId": "42", "chatId": "chan"}},
@@ -287,13 +287,13 @@ func TestSearchHandlerReturnsCombinedPaginatedResults(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       albumItem.ID,
 		AlbumOrder:    0,
-		AudioFilePath: "/songs/dream-state.mp3",
+		AudioFilePath: "/api/songs/dream-state.mp3",
 	})
 	if err != nil {
 		t.Fatalf("create() error = %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/search?query=dream&page=2&pageSize=2", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/search?query=dream&page=2&pageSize=2", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -360,7 +360,7 @@ func TestSearchHandlerUsesOptionalAuthForFavoritesAndAdminAlbumVisibility(t *tes
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       fullAlbum.ID,
 		AlbumOrder:    0,
-		AudioFilePath: "/songs/echo-song.mp3",
+		AudioFilePath: "/api/songs/echo-song.mp3",
 	})
 	if err != nil {
 		t.Fatalf("create() error = %v", err)
@@ -387,7 +387,7 @@ func TestSearchHandlerUsesOptionalAuthForFavoritesAndAdminAlbumVisibility(t *tes
 	}
 
 	t.Run("anonymous", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/search?query=echo", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/search?query=echo", nil)
 		rec := httptest.NewRecorder()
 
 		handler.ServeHTTP(rec, req)
@@ -401,7 +401,7 @@ func TestSearchHandlerUsesOptionalAuthForFavoritesAndAdminAlbumVisibility(t *tes
 			t.Fatalf("createAccessToken() error = %v", err)
 		}
 
-		req := httptest.NewRequest(http.MethodGet, "/search?query=echo", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/search?query=echo", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		rec := httptest.NewRecorder()
 
@@ -416,7 +416,7 @@ func TestSearchHandlerUsesOptionalAuthForFavoritesAndAdminAlbumVisibility(t *tes
 			t.Fatalf("createAccessToken() error = %v", err)
 		}
 
-		req := httptest.NewRequest(http.MethodGet, "/search?query=echo", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/search?query=echo", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		rec := httptest.NewRecorder()
 
@@ -476,7 +476,7 @@ func TestListAlbumsHandlerHidesEmptyAlbumsForNonAdmin(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       fullAlbum.ID,
 		AlbumOrder:    0,
-		AudioFilePath: "/songs/full.mp3",
+		AudioFilePath: "/api/songs/full.mp3",
 	}); err != nil {
 		t.Fatalf("create() error = %v", err)
 	}
@@ -498,7 +498,7 @@ func TestListAlbumsHandlerHidesEmptyAlbumsForNonAdmin(t *testing.T) {
 	store.mu.Unlock()
 
 	t.Run("anonymous", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/albums", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/albums", nil)
 		rec := httptest.NewRecorder()
 
 		handler.ServeHTTP(rec, req)
@@ -512,7 +512,7 @@ func TestListAlbumsHandlerHidesEmptyAlbumsForNonAdmin(t *testing.T) {
 			t.Fatalf("createAccessToken() error = %v", err)
 		}
 
-		req := httptest.NewRequest(http.MethodGet, "/albums", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/albums", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		rec := httptest.NewRecorder()
 
@@ -527,7 +527,7 @@ func TestListAlbumsHandlerHidesEmptyAlbumsForNonAdmin(t *testing.T) {
 			t.Fatalf("createAccessToken() error = %v", err)
 		}
 
-		req := httptest.NewRequest(http.MethodGet, "/albums", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/albums", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		rec := httptest.NewRecorder()
 
@@ -552,13 +552,13 @@ func TestDeleteSongHandlerRejectsReferencedSong(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
 		AlbumOrder:    0,
-		AudioFilePath: "/songs/track.mp3",
+		AudioFilePath: "/api/songs/track.mp3",
 	})
 	if err != nil {
 		t.Fatalf("create() error = %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodDelete, "/songs/track.mp3", nil)
+	req := httptest.NewRequest(http.MethodDelete, "/api/songs/track.mp3", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -580,7 +580,7 @@ func TestDeleteSongHandlerDeletesUnreferencedSong(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodDelete, "/songs/free.mp3", nil)
+	req := httptest.NewRequest(http.MethodDelete, "/api/songs/free.mp3", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -616,7 +616,7 @@ func TestListUnusedSongsHandlerReturnsOnlyUnreferencedSongs(t *testing.T) {
 		t.Fatalf("create() error = %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/songs/unused", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/songs/unused", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -636,8 +636,8 @@ func TestListUnusedSongsHandlerReturnsOnlyUnreferencedSongs(t *testing.T) {
 	if got[0].Name != "Another Free.mp3" {
 		t.Fatalf("got[0].Name = %q, want %q", got[0].Name, "Another Free.mp3")
 	}
-	if got[0].Path != "/songs/Another%20Free.mp3" {
-		t.Fatalf("got[0].Path = %q, want %q", got[0].Path, "/songs/Another%20Free.mp3")
+	if got[0].Path != "/api/songs/Another%20Free.mp3" {
+		t.Fatalf("got[0].Path = %q, want %q", got[0].Path, "/api/songs/Another%20Free.mp3")
 	}
 	if got[0].URL != got[0].Path {
 		t.Fatalf("got[0].URL = %q, want same as path %q", got[0].URL, got[0].Path)
@@ -645,8 +645,8 @@ func TestListUnusedSongsHandlerReturnsOnlyUnreferencedSongs(t *testing.T) {
 	if got[1].Name != "free.mp3" {
 		t.Fatalf("got[1].Name = %q, want %q", got[1].Name, "free.mp3")
 	}
-	if got[1].Path != "/songs/free.mp3" {
-		t.Fatalf("got[1].Path = %q, want %q", got[1].Path, "/songs/free.mp3")
+	if got[1].Path != "/api/songs/free.mp3" {
+		t.Fatalf("got[1].Path = %q, want %q", got[1].Path, "/api/songs/free.mp3")
 	}
 }
 
@@ -655,7 +655,7 @@ func TestUploadSongHandlerRandomizesStoredFileName(t *testing.T) {
 	handler := uploadSongHandler(songsDir)
 
 	rec := httptest.NewRecorder()
-	req := newMultipartUploadRequest(t, http.MethodPost, "/songs", "demo track.mp3", []byte("mp3-data"))
+	req := newMultipartUploadRequest(t, http.MethodPost, "/api/songs", "demo track.mp3", []byte("mp3-data"))
 
 	handler.ServeHTTP(rec, req)
 
@@ -674,8 +674,8 @@ func TestUploadSongHandlerRandomizesStoredFileName(t *testing.T) {
 	if !strings.HasSuffix(got.Name, ".mp3") {
 		t.Fatalf("got.Name = %q, want .mp3 suffix", got.Name)
 	}
-	if got.URL != "/songs/"+url.PathEscape(got.Name) {
-		t.Fatalf("got.URL = %q, want %q", got.URL, "/songs/"+url.PathEscape(got.Name))
+	if got.URL != "/api/songs/"+url.PathEscape(got.Name) {
+		t.Fatalf("got.URL = %q, want %q", got.URL, "/api/songs/"+url.PathEscape(got.Name))
 	}
 	if _, err := os.Stat(filepath.Join(songsDir, got.Name)); err != nil {
 		t.Fatalf("stored file Stat() error = %v", err)
@@ -690,14 +690,14 @@ func TestUploadAlbumCoverHandlerAllowsSameOriginalFileNameTwice(t *testing.T) {
 	handler := uploadAlbumCoverHandler(albumCoversDir)
 
 	firstRec := httptest.NewRecorder()
-	firstReq := newMultipartUploadRequest(t, http.MethodPost, "/album-covers", "cover.jpg", []byte("first"))
+	firstReq := newMultipartUploadRequest(t, http.MethodPost, "/api/album-covers", "cover.jpg", []byte("first"))
 	handler.ServeHTTP(firstRec, firstReq)
 	if firstRec.Code != http.StatusCreated {
 		t.Fatalf("first status = %d, want %d; body=%s", firstRec.Code, http.StatusCreated, firstRec.Body.String())
 	}
 
 	secondRec := httptest.NewRecorder()
-	secondReq := newMultipartUploadRequest(t, http.MethodPost, "/album-covers", "cover.jpg", []byte("second"))
+	secondReq := newMultipartUploadRequest(t, http.MethodPost, "/api/album-covers", "cover.jpg", []byte("second"))
 	handler.ServeHTTP(secondRec, secondReq)
 	if secondRec.Code != http.StatusCreated {
 		t.Fatalf("second status = %d, want %d; body=%s", secondRec.Code, http.StatusCreated, secondRec.Body.String())
@@ -744,7 +744,7 @@ func TestAutoplayNextHandlerSupportsAllSourceTypes(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       albumItem.ID,
 		AlbumOrder:    0,
-		AudioFilePath: "/songs/track-one.mp3",
+		AudioFilePath: "/api/songs/track-one.mp3",
 	})
 	if err != nil {
 		t.Fatalf("create(trackOne) error = %v", err)
@@ -754,7 +754,7 @@ func TestAutoplayNextHandlerSupportsAllSourceTypes(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       albumItem.ID,
 		AlbumOrder:    1,
-		AudioFilePath: "/songs/track-two.mp3",
+		AudioFilePath: "/api/songs/track-two.mp3",
 	})
 	if err != nil {
 		t.Fatalf("create(trackTwo) error = %v", err)
@@ -802,7 +802,7 @@ func TestAutoplayNextHandlerSupportsAllSourceTypes(t *testing.T) {
 				t.Fatalf("Marshal() error = %v", err)
 			}
 
-			req := httptest.NewRequest(http.MethodPost, "/autoplay/next", bytes.NewReader(body))
+			req := httptest.NewRequest(http.MethodPost, "/api/autoplay/next", bytes.NewReader(body))
 			req.Header.Set("Authorization", "Bearer "+token)
 			req.Header.Set("Content-Type", "application/json")
 			rec := httptest.NewRecorder()
@@ -852,7 +852,7 @@ func TestAutoplayNextHandlerRejectsMissingSourceIDForPlaylist(t *testing.T) {
 	}
 
 	body := strings.NewReader(`{"sourceType":"playlist","count":1,"recentTrackIds":[],"excludedTrackIds":[]}`)
-	req := httptest.NewRequest(http.MethodPost, "/autoplay/next", body)
+	req := httptest.NewRequest(http.MethodPost, "/api/autoplay/next", body)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -879,7 +879,7 @@ func TestAutoplayNextHandlerReturnsNotFoundForMissingTrackContext(t *testing.T) 
 	}
 
 	body := strings.NewReader(`{"sourceType":"track","sourceId":999,"count":1,"recentTrackIds":[],"excludedTrackIds":[]}`)
-	req := httptest.NewRequest(http.MethodPost, "/autoplay/next", body)
+	req := httptest.NewRequest(http.MethodPost, "/api/autoplay/next", body)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -931,7 +931,7 @@ func TestNewTrackStoreNormalizesLegacyBareAudioFilePath(t *testing.T) {
 	if !ok {
 		t.Fatalf("getTrackResponse() ok = false, want true")
 	}
-	if got.AudioFilePath != "/songs/Kino_-_Kamchatka_%28SkySound.cc%29-0HGJwR05.mp3" {
+	if got.AudioFilePath != "/api/songs/Kino_-_Kamchatka_%28SkySound.cc%29-0HGJwR05.mp3" {
 		t.Fatalf("got.AudioFilePath = %q", got.AudioFilePath)
 	}
 }

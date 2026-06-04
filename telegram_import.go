@@ -856,7 +856,7 @@ func (s *telegramImportService) promoteTempFile(tempPath, originalFileName strin
 	if err := moveFile(tempPath, finalPath); err != nil {
 		return "", "", err
 	}
-	return finalName, "/songs/" + url.PathEscape(finalName), nil
+	return finalName, "/api/songs/" + url.PathEscape(finalName), nil
 }
 
 func (s *telegramImportService) cleanupSessionFiles(session *telegramImportSession) error {
@@ -900,7 +900,7 @@ func (s *telegramImportService) buildSessionDTO(session *telegramImportSession) 
 		FileName:            item.FileName,
 		MimeType:            item.MimeType,
 		SizeBytes:           item.SizeBytes,
-		TempFileDownloadURL: "/telegram/import-sessions/current/audio",
+		TempFileDownloadURL: "/api/telegram/import-sessions/current/audio",
 	}
 	return dto
 }

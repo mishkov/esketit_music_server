@@ -182,7 +182,7 @@ func TestTelegramImportSaveCurrentPromotesFileAndCreatesTrack(t *testing.T) {
 	if createdTrack.Name != "Final Track" {
 		t.Fatalf("created track = %#v", createdTrack)
 	}
-	if !strings.HasPrefix(createdTrack.AudioFilePath, "/songs/") {
+	if !strings.HasPrefix(createdTrack.AudioFilePath, "/api/songs/") {
 		t.Fatalf("created track audio path = %q", createdTrack.AudioFilePath)
 	}
 	if len(createdTrack.SourceMetadata) != 1 {

@@ -23,7 +23,7 @@ func TestGetTrackLyricsHandlerReturnsPlainLyrics(t *testing.T) {
 		t.Fatalf("upsertLyrics() error = %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/tracks/1/lyrics", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/tracks/1/lyrics", nil)
 	rec := httptest.NewRecorder()
 
 	getTrackLyricsHandler(store).ServeHTTP(rec, req)
@@ -65,7 +65,7 @@ func TestGetTrackLyricsHandlerReturnsSyncedLyrics(t *testing.T) {
 		t.Fatalf("upsertLyrics() error = %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/tracks/1/lyrics", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/tracks/1/lyrics", nil)
 	rec := httptest.NewRecorder()
 
 	getTrackLyricsHandler(store).ServeHTTP(rec, req)
@@ -96,7 +96,7 @@ func TestPutTrackLyricsHandlerCreatesAndReplacesPlainLyrics(t *testing.T) {
 	handler := putTrackLyricsHandler(store)
 
 	first := `{"type":"plain","languageCode":"en","isVerified":true,"source":"artist","plainText":"First"}`
-	firstReq := httptest.NewRequest(http.MethodPut, "/tracks/1/lyrics", bytes.NewBufferString(first))
+	firstReq := httptest.NewRequest(http.MethodPut, "/api/tracks/1/lyrics", bytes.NewBufferString(first))
 	firstRec := httptest.NewRecorder()
 
 	handler.ServeHTTP(firstRec, firstReq)
@@ -106,7 +106,7 @@ func TestPutTrackLyricsHandlerCreatesAndReplacesPlainLyrics(t *testing.T) {
 	}
 
 	second := `{"type":"plain","languageCode":"uk","isVerified":false,"source":"moderator","plainText":"Second"}`
-	secondReq := httptest.NewRequest(http.MethodPut, "/tracks/1/lyrics", bytes.NewBufferString(second))
+	secondReq := httptest.NewRequest(http.MethodPut, "/api/tracks/1/lyrics", bytes.NewBufferString(second))
 	secondRec := httptest.NewRecorder()
 
 	handler.ServeHTTP(secondRec, secondReq)
@@ -133,7 +133,7 @@ func TestPutTrackLyricsHandlerCreatesAndReplacesSyncedLyrics(t *testing.T) {
 	handler := putTrackLyricsHandler(store)
 
 	first := `{"type":"synced","languageCode":"en","isVerified":true,"source":"artist","lines":[{"startMs":0,"endMs":1000,"text":"One"}]}`
-	firstReq := httptest.NewRequest(http.MethodPut, "/tracks/1/lyrics", bytes.NewBufferString(first))
+	firstReq := httptest.NewRequest(http.MethodPut, "/api/tracks/1/lyrics", bytes.NewBufferString(first))
 	firstRec := httptest.NewRecorder()
 
 	handler.ServeHTTP(firstRec, firstReq)
@@ -143,7 +143,7 @@ func TestPutTrackLyricsHandlerCreatesAndReplacesSyncedLyrics(t *testing.T) {
 	}
 
 	second := `{"type":"synced","languageCode":"en","isVerified":false,"source":"moderator","lines":[{"startMs":0,"endMs":1200,"text":"First line"},{"startMs":1200,"endMs":2000,"text":"Second line"}]}`
-	secondReq := httptest.NewRequest(http.MethodPut, "/tracks/1/lyrics", bytes.NewBufferString(second))
+	secondReq := httptest.NewRequest(http.MethodPut, "/api/tracks/1/lyrics", bytes.NewBufferString(second))
 	secondRec := httptest.NewRecorder()
 
 	handler.ServeHTTP(secondRec, secondReq)
@@ -165,7 +165,7 @@ func TestPutTrackLyricsHandlerRejectsInvalidPayload(t *testing.T) {
 	store := newTestTrackStore(t)
 	_ = seedLyricsTrack(t, store)
 
-	req := httptest.NewRequest(http.MethodPut, "/tracks/1/lyrics", bytes.NewBufferString(`{"type":"synced","plainText":"wrong","lines":[]}`))
+	req := httptest.NewRequest(http.MethodPut, "/api/tracks/1/lyrics", bytes.NewBufferString(`{"type":"synced","plainText":"wrong","lines":[]}`))
 	rec := httptest.NewRecorder()
 
 	putTrackLyricsHandler(store).ServeHTTP(rec, req)
@@ -178,7 +178,7 @@ func TestPutTrackLyricsHandlerRejectsInvalidPayload(t *testing.T) {
 func TestGetTrackLyricsHandlerReturnsNotFoundForMissingTrack(t *testing.T) {
 	store := newTestTrackStore(t)
 
-	req := httptest.NewRequest(http.MethodGet, "/tracks/999/lyrics", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/tracks/999/lyrics", nil)
 	rec := httptest.NewRecorder()
 
 	getTrackLyricsHandler(store).ServeHTTP(rec, req)
@@ -192,7 +192,7 @@ func TestGetTrackLyricsHandlerReturnsNotFoundForMissingLyrics(t *testing.T) {
 	store := newTestTrackStore(t)
 	_ = seedLyricsTrack(t, store)
 
-	req := httptest.NewRequest(http.MethodGet, "/tracks/1/lyrics", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/tracks/1/lyrics", nil)
 	rec := httptest.NewRecorder()
 
 	getTrackLyricsHandler(store).ServeHTTP(rec, req)
@@ -206,7 +206,7 @@ func TestPutTrackLyricsHandlerRejectsInvalidSyncedTimelineOrdering(t *testing.T)
 	store := newTestTrackStore(t)
 	_ = seedLyricsTrack(t, store)
 
-	req := httptest.NewRequest(http.MethodPut, "/tracks/1/lyrics", bytes.NewBufferString(`{"type":"synced","lines":[{"startMs":1000,"endMs":2000,"text":"Second"},{"startMs":500,"endMs":900,"text":"First"}]}`))
+	req := httptest.NewRequest(http.MethodPut, "/api/tracks/1/lyrics", bytes.NewBufferString(`{"type":"synced","lines":[{"startMs":1000,"endMs":2000,"text":"Second"},{"startMs":500,"endMs":900,"text":"First"}]}`))
 	rec := httptest.NewRecorder()
 
 	putTrackLyricsHandler(store).ServeHTTP(rec, req)
@@ -225,7 +225,7 @@ func seedLyricsTrack(t *testing.T, store *trackStore) track {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
 		AlbumOrder:    0,
-		AudioFilePath: "/songs/lyrics-track.mp3",
+		AudioFilePath: "/api/songs/lyrics-track.mp3",
 	})
 	if err != nil {
 		t.Fatalf("create() error = %v", err)

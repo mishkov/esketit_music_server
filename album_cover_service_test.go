@@ -36,7 +36,7 @@ func TestAlbumCoverSuggestionsHandlerSuccess(t *testing.T) {
 	}
 
 	handler := newAdminOnlyTestHandler(t, albumCoverSuggestionsHandler(service))
-	req := httptest.NewRequest(http.MethodGet, "/album-covers/suggestions?query=Nevermind+cover+image&limit=20", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/album-covers/suggestions?query=Nevermind+cover+image&limit=20", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -63,7 +63,7 @@ func TestAlbumCoverSuggestionsHandlerUnavailableWithoutConfig(t *testing.T) {
 	}
 
 	handler := newAdminOnlyTestHandler(t, albumCoverSuggestionsHandler(service))
-	req := httptest.NewRequest(http.MethodGet, "/album-covers/suggestions?query=Nevermind", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/album-covers/suggestions?query=Nevermind", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -167,7 +167,7 @@ func TestImportAlbumCoverHandlerSuccess(t *testing.T) {
 
 	handler := newAdminOnlyTestHandler(t, importAlbumCoverHandler(service))
 	body := strings.NewReader(`{"imageUrl":"https://cdn.example.com/nevermind","suggestedFileName":"nevermind.jpg"}`)
-	req := httptest.NewRequest(http.MethodPost, "/album-covers/import", body)
+	req := httptest.NewRequest(http.MethodPost, "/api/album-covers/import", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -187,8 +187,8 @@ func TestImportAlbumCoverHandlerSuccess(t *testing.T) {
 	if !strings.HasSuffix(got.Name, ".png") {
 		t.Fatalf("got.Name = %q, want .png suffix", got.Name)
 	}
-	if got.URL != "/album-covers/"+got.Name {
-		t.Fatalf("got.URL = %q, want %q", got.URL, "/album-covers/"+got.Name)
+	if got.URL != "/api/album-covers/"+got.Name {
+		t.Fatalf("got.URL = %q, want %q", got.URL, "/api/album-covers/"+got.Name)
 	}
 	if _, err := os.Stat(filepath.Join(albumCoversDir, got.Name)); err != nil {
 		t.Fatalf("stored file Stat() error = %v", err)
@@ -208,7 +208,7 @@ func TestImportAlbumCoverHandlerRejectsNonImage(t *testing.T) {
 	}
 
 	handler := newAdminOnlyTestHandler(t, importAlbumCoverHandler(service))
-	req := httptest.NewRequest(http.MethodPost, "/album-covers/import", strings.NewReader(`{"imageUrl":"https://example.com/file.txt"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/album-covers/import", strings.NewReader(`{"imageUrl":"https://example.com/file.txt"}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -229,7 +229,7 @@ func TestImportAlbumCoverHandlerRejectsBlockedPrivateTarget(t *testing.T) {
 	}
 
 	handler := newAdminOnlyTestHandler(t, importAlbumCoverHandler(service))
-	req := httptest.NewRequest(http.MethodPost, "/album-covers/import", strings.NewReader(`{"imageUrl":"http://127.0.0.1/cover.jpg"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/album-covers/import", strings.NewReader(`{"imageUrl":"http://127.0.0.1/cover.jpg"}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 

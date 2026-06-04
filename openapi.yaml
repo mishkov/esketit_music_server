@@ -23,7 +23,7 @@ tags:
   - name: Telegram
 
 paths:
-  /auth/register:
+  /api/auth/register:
     post:
       tags: [Auth]
       summary: Register a new user
@@ -51,7 +51,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /auth/login:
+  /api/auth/login:
     post:
       tags: [Auth]
       summary: Log in with email and password
@@ -75,7 +75,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /auth/refresh:
+  /api/auth/refresh:
     post:
       tags: [Auth]
       summary: Rotate refresh token and issue a new access token
@@ -99,7 +99,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /auth/logout:
+  /api/auth/logout:
     post:
       tags: [Auth]
       summary: Revoke a refresh token
@@ -117,7 +117,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /auth/me:
+  /api/auth/me:
     get:
       tags: [Auth]
       summary: Get the currently authenticated user
@@ -133,7 +133,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
-  /songs:
+  /api/songs:
     get:
       tags: [Songs]
       summary: List songs
@@ -152,7 +152,7 @@ paths:
       tags: [Songs]
       summary: Upload song
       description: |
-        Upload a song file and receive a `/songs/{name}` URL that can be stored in
+        Upload a song file and receive a `/api/songs/{name}` URL that can be stored in
         track `audioFilePath`.
 
         The server preserves the original extension but rewrites the stored filename
@@ -184,12 +184,12 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /songs/unused:
+  /api/songs/unused:
     get:
       tags: [Songs]
       summary: List unused songs
       description: |
-        List uploaded song files from `/songs` that are not referenced by any track
+        List uploaded song files from `/api/songs` that are not referenced by any track
         `audioFilePath`.
       security:
         - bearerAuth: []
@@ -209,7 +209,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /songs/{name}:
+  /api/songs/{name}:
     get:
       tags: [Songs]
       summary: Get song file
@@ -233,7 +233,7 @@ paths:
       tags: [Songs]
       summary: Delete song file
       description: |
-        Delete an uploaded song file from `/songs/{name}`.
+        Delete an uploaded song file from `/api/songs/{name}`.
 
         The server refuses to delete the file while any track still references it
         through `audioFilePath`.
@@ -261,13 +261,13 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /album-covers:
+  /api/album-covers:
     post:
       tags: [Album Covers]
       summary: Upload album cover
       description: |
         Upload an album cover file. The returned file can later be referenced from album
-        `coverImagePath`. Preferred write format is `/album-covers/{name}`.
+        `coverImagePath`. Preferred write format is `/api/album-covers/{name}`.
 
         The server preserves the original extension but rewrites the stored filename
         by appending a random suffix before the extension.
@@ -295,7 +295,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /album-covers/suggestions:
+  /api/album-covers/suggestions:
     get:
       tags: [Album Covers]
       summary: Search album cover suggestions
@@ -346,7 +346,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/PlainError'
 
-  /album-covers/import:
+  /api/album-covers/import:
     post:
       tags: [Album Covers]
       summary: Import a remote album cover
@@ -381,7 +381,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/PlainError'
 
-  /album-covers/{name}:
+  /api/album-covers/{name}:
     get:
       tags: [Album Covers]
       summary: Get album cover file
@@ -405,7 +405,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /authors:
+  /api/authors:
     get:
       tags: [Authors]
       summary: List authors
@@ -445,7 +445,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /authors/{id}:
+  /api/authors/{id}:
     get:
       tags: [Authors]
       summary: Get author by ID
@@ -519,7 +519,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /albums:
+  /api/albums:
     get:
       tags: [Albums]
       summary: List albums
@@ -592,7 +592,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /albums/{id}:
+  /api/albums/{id}:
     get:
       tags: [Albums]
       summary: Get album by ID
@@ -667,7 +667,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /albums/{id}/tracks:
+  /api/albums/{id}/tracks:
     get:
       tags: [Albums]
       summary: List album tracks in album order
@@ -687,7 +687,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
-  /playlists:
+  /api/playlists:
     get:
       tags: [Playlists]
       summary: List current user's playlists
@@ -749,7 +749,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /playlists/{id}:
+  /api/playlists/{id}:
     get:
       tags: [Playlists]
       summary: Get current user's playlist by ID
@@ -815,7 +815,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /playlists/{id}/tracks:
+  /api/playlists/{id}/tracks:
     get:
       tags: [Playlists]
       summary: List playlist tracks in playlist order
@@ -848,7 +848,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
-  /playlists/{id}/tracks/order:
+  /api/playlists/{id}/tracks/order:
     put:
       tags: [Playlists]
       summary: Reorder playlist tracks by full track ID list
@@ -874,7 +874,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /autoplay/next:
+  /api/autoplay/next:
     post:
       tags: [Autoplay]
       summary: Build the next continuation queue for the current user
@@ -909,7 +909,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /tracks/{id}/playlists:
+  /api/tracks/{id}/playlists:
     post:
       tags: [Playlists]
       summary: Add a track to multiple playlists
@@ -935,7 +935,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /tracks/{id}/playlists/{playlistId}:
+  /api/tracks/{id}/playlists/{playlistId}:
     delete:
       tags: [Playlists]
       summary: Remove a track from a playlist
@@ -960,7 +960,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /tracks/{id}/favorite:
+  /api/tracks/{id}/favorite:
     put:
       tags: [Playlists]
       summary: Add a track to the current user's favorites playlist
@@ -994,7 +994,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /search:
+  /api/search:
     get:
       tags: [Search]
       summary: Search authors, albums, and tracks
@@ -1031,7 +1031,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/PaginatedSearchResults'
 
-  /tracks:
+  /api/tracks:
     get:
       tags: [Tracks]
       summary: List tracks
@@ -1080,7 +1080,7 @@ paths:
       summary: Create track
       description: |
         Create a track record that points to an already uploaded song file via
-        `audioFilePath`, typically `/songs/{name}`.
+        `audioFilePath`, typically `/api/songs/{name}`.
 
         This endpoint only creates track metadata. It does not upload an MP3, move
         an MP3, or delete any MP3 file. The client must upload the song separately
@@ -1109,7 +1109,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /tracks/{id}:
+  /api/tracks/{id}:
     get:
       tags: [Tracks]
       summary: Get track by ID
@@ -1135,7 +1135,7 @@ paths:
         If `audioFilePath` is changed from one MP3 to another, the server only
         updates the stored path on the track record.
 
-        The previously referenced MP3 file is not removed from `/songs`.
+        The previously referenced MP3 file is not removed from `/api/songs`.
         The newly referenced MP3 file is not uploaded automatically by this
         endpoint either. Clients must upload the replacement file separately and
         must remove the old file separately if they want it deleted.
@@ -1174,7 +1174,7 @@ paths:
 
         This operation does not delete the MP3 file referenced by
         `audioFilePath`, even if that file is no longer used by any track. If the
-        client wants the underlying file removed from `/songs`, it must do that as
+        client wants the underlying file removed from `/api/songs`, it must do that as
         a separate cleanup step.
       security:
         - bearerAuth: []
@@ -1194,7 +1194,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /tracks/{id}/lyrics:
+  /api/tracks/{id}/lyrics:
     get:
       tags: [Tracks]
       summary: Get lyrics for a track
@@ -1290,7 +1290,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /telegram/import-sessions:
+  /api/telegram/import-sessions:
     post:
       tags: [Telegram]
       summary: Start a Telegram import session
@@ -1325,7 +1325,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /youtube/import-sessions:
+  /api/youtube/import-sessions:
     post:
       tags: [YouTube]
       summary: Start a YouTube import session
@@ -1358,7 +1358,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /youtube/import-sessions/current:
+  /api/youtube/import-sessions/current:
     get:
       tags: [YouTube]
       summary: Get the current YouTube import item
@@ -1396,7 +1396,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /youtube/import-sessions/current/skip:
+  /api/youtube/import-sessions/current/skip:
     post:
       tags: [YouTube]
       summary: Skip the current YouTube import item
@@ -1418,7 +1418,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /youtube/import-sessions/current/add:
+  /api/youtube/import-sessions/current/add:
     post:
       tags: [YouTube]
       summary: Add the current YouTube import item
@@ -1453,7 +1453,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /youtube/cookies/status:
+  /api/youtube/cookies/status:
     get:
       tags: [YouTube]
       summary: Read YouTube cookies upload status
@@ -1473,7 +1473,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /youtube/cookies:
+  /api/youtube/cookies:
     post:
       tags: [YouTube]
       summary: Upload YouTube authentication cookies
@@ -1601,7 +1601,7 @@ components:
           format: date-time
         path:
           type: string
-          description: Media path for the file, for example `/songs/example.mp3`.
+          description: Media path for the file, for example `/api/songs/example.mp3`.
         url:
           type: string
       required: [name, sizeBytes, lastModified, path, url]
@@ -1750,8 +1750,8 @@ components:
           format: uri
           description: |
             Absolute URL to the album cover file. API responses normalize this field to a
-            full URL pointing to `/album-covers/{name}`.
-          example: http://192.168.1.6:8080/album-covers/%D0%93%D0%BE%D1%80%D0%B3%D0%BE%D1%80%D0%BE%D0%B4_2.jpg
+            full URL pointing to `/api/album-covers/{name}`.
+          example: http://192.168.1.6:8080/api/album-covers/%D0%93%D0%BE%D1%80%D0%B3%D0%BE%D1%80%D0%BE%D0%B4_2.jpg
         authorIds:
           type: array
           items:
@@ -1787,10 +1787,10 @@ components:
         coverImagePath:
           type: string
           description: |
-            Album cover reference. Preferred form is `/album-covers/{name}`.
+            Album cover reference. Preferred form is `/api/album-covers/{name}`.
             Absolute URLs are also accepted. Bare filenames may be normalized by the
             server, but clients should not rely on that form.
-          example: /album-covers/%D0%93%D0%BE%D1%80%D0%B3%D0%BE%D1%80%D0%BE%D0%B4_2.jpg
+          example: /api/album-covers/%D0%93%D0%BE%D1%80%D0%B3%D0%BE%D1%80%D0%BE%D0%B4_2.jpg
         authorIds:
           type: array
           items:
@@ -1873,7 +1873,7 @@ components:
         audioFilePath:
           type: string
           description: |
-            Path or URL of an existing song file, typically `/songs/{name}`.
+            Path or URL of an existing song file, typically `/api/songs/{name}`.
 
             This is a reference to an existing uploaded MP3, not an owned file
             object. Changing this field only changes the stored reference.

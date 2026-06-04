@@ -411,7 +411,7 @@ func (s *albumCoverService) importRemoteCover(ctx context.Context, imageURL, sug
 		return albumCoverImportResponse{}, err
 	}
 
-	info, err := storeMediaBytes(s.albumCoversDir, fileName, result.Data, "/album-covers/")
+	info, err := storeMediaBytes(s.albumCoversDir, fileName, result.Data, "/api/album-covers/")
 	if err != nil {
 		return albumCoverImportResponse{}, err
 	}

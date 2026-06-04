@@ -564,65 +564,65 @@ func main() {
 	youtubeImport := newYouTubeImportService(youtubeImportConfig, youtubeImportGateway, store, songsDir)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /songs", listSongsHandler(songsDir))
-	mux.Handle("POST /songs", requireRole(auth, store, roleAdmin, uploadSongHandler(songsDir)))
-	mux.Handle("GET /songs/unused", requireRole(auth, store, roleAdmin, listUnusedSongsHandler(store, songsDir)))
-	mux.HandleFunc("GET /songs/", getSongHandler(songsDir))
-	mux.Handle("DELETE /songs/", requireRole(auth, store, roleAdmin, deleteSongHandler(store, songsDir)))
-	mux.HandleFunc("GET /album-covers/", getAlbumCoverHandler(albumCoversDir))
-	mux.HandleFunc("GET /albums", listAlbumsHandler(store, auth))
-	mux.HandleFunc("GET /search", searchHandler(store, auth))
-	mux.Handle("POST /albums", requireRole(auth, store, roleAdmin, createAlbumHandler(store)))
-	mux.HandleFunc("GET /albums/", getAlbumByRouteHandler(store))
-	mux.Handle("PUT /albums/", requireRole(auth, store, roleAdmin, updateAlbumByRouteHandler(store)))
-	mux.Handle("DELETE /albums/", requireRole(auth, store, roleAdmin, deleteAlbumByRouteHandler(store)))
-	mux.Handle("POST /album-covers", requireRole(auth, store, roleAdmin, uploadAlbumCoverHandler(albumCoversDir)))
-	mux.Handle("GET /album-covers/suggestions", requireRole(auth, store, roleAdmin, albumCoverSuggestionsHandler(albumCoverService)))
-	mux.Handle("POST /album-covers/import", requireRole(auth, store, roleAdmin, importAlbumCoverHandler(albumCoverService)))
-	mux.Handle("GET /playlists", requireAuth(auth, store, listPlaylistsHandler(store)))
-	mux.Handle("POST /playlists", requireAuth(auth, store, createPlaylistHandler(store)))
-	mux.Handle("GET /playlists/", requireAuth(auth, store, getPlaylistByRouteHandler(store)))
-	mux.Handle("PUT /playlists/", requireAuth(auth, store, updatePlaylistByRouteHandler(store)))
-	mux.Handle("DELETE /playlists/", requireAuth(auth, store, deletePlaylistByRouteHandler(store)))
-	mux.Handle("POST /autoplay/next", requireAuth(auth, store, autoplayNextHandler(store)))
-	mux.HandleFunc("GET /tracks", listTracksHandler(store, auth))
-	mux.Handle("POST /tracks", requireRole(auth, store, roleAdmin, createTrackHandler(store)))
-	mux.Handle("GET /tracks/", getTrackByRouteHandler(store, auth))
-	mux.Handle("POST /tracks/", postTrackByRouteHandler(store, auth))
-	mux.Handle("PUT /tracks/", putTrackByRouteHandler(store, auth))
-	mux.Handle("DELETE /tracks/", deleteTrackByRouteHandler(store, auth))
-	mux.HandleFunc("GET /authors", listAuthorsHandler(store))
-	mux.Handle("POST /authors", requireRole(auth, store, roleAdmin, createAuthorHandler(store)))
-	mux.HandleFunc("GET /authors/", getAuthorByIDHandler(store))
-	mux.Handle("PUT /authors/", requireRole(auth, store, roleAdmin, updateAuthorHandler(store)))
-	mux.Handle("DELETE /authors/", requireRole(auth, store, roleAdmin, deleteAuthorHandler(store)))
-	mux.HandleFunc("POST /auth/register", registerHandler(store, auth))
-	mux.HandleFunc("POST /auth/login", loginHandler(store, auth))
-	mux.HandleFunc("POST /auth/refresh", refreshHandler(store, auth))
-	mux.HandleFunc("POST /auth/logout", logoutHandler(store))
-	mux.Handle("GET /auth/me", requireAuth(auth, store, meHandler(store)))
-	mux.Handle("GET /telegram/status", requireRole(auth, store, roleAdmin, telegramStatusHandler(telegramImport)))
-	mux.Handle("POST /telegram/auth/request", requireRole(auth, store, roleAdmin, telegramAuthRequestHandler(telegramImport)))
-	mux.Handle("POST /telegram/auth/confirm", requireRole(auth, store, roleAdmin, telegramAuthConfirmHandler(telegramImport)))
-	mux.Handle("POST /telegram/auth/password", requireRole(auth, store, roleAdmin, telegramAuthPasswordHandler(telegramImport)))
-	mux.Handle("POST /telegram/import-sessions", requireRole(auth, store, roleAdmin, telegramStartImportHandler(telegramImport)))
-	mux.Handle("GET /telegram/import-sessions/current", requireRole(auth, store, roleAdmin, telegramCurrentImportHandler(telegramImport)))
-	mux.Handle("POST /telegram/import-sessions/current/skip", requireRole(auth, store, roleAdmin, telegramSkipImportHandler(telegramImport)))
-	mux.Handle("POST /telegram/import-sessions/current/save", requireRole(auth, store, roleAdmin, telegramSaveImportHandler(telegramImport)))
-	mux.Handle("DELETE /telegram/import-sessions/current", requireRole(auth, store, roleAdmin, telegramCancelImportHandler(telegramImport)))
-	mux.Handle("GET /telegram/import-sessions/current/audio", requireRole(auth, store, roleAdmin, telegramCurrentAudioHandler(telegramImport)))
-	mux.Handle("GET /telegram/import-sessions/current/skipped-report", requireRole(auth, store, roleAdmin, telegramSkippedReportHandler(telegramImport)))
-	mux.Handle("POST /youtube/import-sessions", requireRole(auth, store, roleAdmin, youtubeStartImportHandler(youtubeImport)))
-	mux.Handle("GET /youtube/import-sessions/current", requireRole(auth, store, roleAdmin, youtubeCurrentImportHandler(youtubeImport)))
-	mux.Handle("POST /youtube/import-sessions/current/skip", requireRole(auth, store, roleAdmin, youtubeSkipImportHandler(youtubeImport)))
-	mux.Handle("POST /youtube/import-sessions/current/add", requireRole(auth, store, roleAdmin, youtubeAddImportHandler(youtubeImport)))
-	mux.Handle("DELETE /youtube/import-sessions/current", requireRole(auth, store, roleAdmin, youtubeCancelImportHandler(youtubeImport)))
-	mux.Handle("GET /youtube/cookies/status", requireRole(auth, store, roleAdmin, youtubeCookiesStatusHandler(youtubeCookieStore)))
-	mux.Handle("POST /youtube/cookies", requireRole(auth, store, roleAdmin, youtubeCookiesUploadHandler(youtubeCookieStore)))
-	mux.Handle("DELETE /youtube/cookies", requireRole(auth, store, roleAdmin, youtubeCookiesDeleteHandler(youtubeCookieStore)))
-	mux.HandleFunc("GET /openapi.yaml", serveOpenAPIHandler("openapi.yaml"))
-	mux.HandleFunc("GET /docs", swaggerUIHandler())
-	mux.HandleFunc("GET /redoc", redocHandler())
+	mux.HandleFunc("GET /api/songs", listSongsHandler(songsDir))
+	mux.Handle("POST /api/songs", requireRole(auth, store, roleAdmin, uploadSongHandler(songsDir)))
+	mux.Handle("GET /api/songs/unused", requireRole(auth, store, roleAdmin, listUnusedSongsHandler(store, songsDir)))
+	mux.HandleFunc("GET /api/songs/", getSongHandler(songsDir))
+	mux.Handle("DELETE /api/songs/", requireRole(auth, store, roleAdmin, deleteSongHandler(store, songsDir)))
+	mux.HandleFunc("GET /api/album-covers/", getAlbumCoverHandler(albumCoversDir))
+	mux.HandleFunc("GET /api/albums", listAlbumsHandler(store, auth))
+	mux.HandleFunc("GET /api/search", searchHandler(store, auth))
+	mux.Handle("POST /api/albums", requireRole(auth, store, roleAdmin, createAlbumHandler(store)))
+	mux.HandleFunc("GET /api/albums/", getAlbumByRouteHandler(store))
+	mux.Handle("PUT /api/albums/", requireRole(auth, store, roleAdmin, updateAlbumByRouteHandler(store)))
+	mux.Handle("DELETE /api/albums/", requireRole(auth, store, roleAdmin, deleteAlbumByRouteHandler(store)))
+	mux.Handle("POST /api/album-covers", requireRole(auth, store, roleAdmin, uploadAlbumCoverHandler(albumCoversDir)))
+	mux.Handle("GET /api/album-covers/suggestions", requireRole(auth, store, roleAdmin, albumCoverSuggestionsHandler(albumCoverService)))
+	mux.Handle("POST /api/album-covers/import", requireRole(auth, store, roleAdmin, importAlbumCoverHandler(albumCoverService)))
+	mux.Handle("GET /api/playlists", requireAuth(auth, store, listPlaylistsHandler(store)))
+	mux.Handle("POST /api/playlists", requireAuth(auth, store, createPlaylistHandler(store)))
+	mux.Handle("GET /api/playlists/", requireAuth(auth, store, getPlaylistByRouteHandler(store)))
+	mux.Handle("PUT /api/playlists/", requireAuth(auth, store, updatePlaylistByRouteHandler(store)))
+	mux.Handle("DELETE /api/playlists/", requireAuth(auth, store, deletePlaylistByRouteHandler(store)))
+	mux.Handle("POST /api/autoplay/next", requireAuth(auth, store, autoplayNextHandler(store)))
+	mux.HandleFunc("GET /api/tracks", listTracksHandler(store, auth))
+	mux.Handle("POST /api/tracks", requireRole(auth, store, roleAdmin, createTrackHandler(store)))
+	mux.Handle("GET /api/tracks/", getTrackByRouteHandler(store, auth))
+	mux.Handle("POST /api/tracks/", postTrackByRouteHandler(store, auth))
+	mux.Handle("PUT /api/tracks/", putTrackByRouteHandler(store, auth))
+	mux.Handle("DELETE /api/tracks/", deleteTrackByRouteHandler(store, auth))
+	mux.HandleFunc("GET /api/authors", listAuthorsHandler(store))
+	mux.Handle("POST /api/authors", requireRole(auth, store, roleAdmin, createAuthorHandler(store)))
+	mux.HandleFunc("GET /api/authors/", getAuthorByIDHandler(store))
+	mux.Handle("PUT /api/authors/", requireRole(auth, store, roleAdmin, updateAuthorHandler(store)))
+	mux.Handle("DELETE /api/authors/", requireRole(auth, store, roleAdmin, deleteAuthorHandler(store)))
+	mux.HandleFunc("POST /api/auth/register", registerHandler(store, auth))
+	mux.HandleFunc("POST /api/auth/login", loginHandler(store, auth))
+	mux.HandleFunc("POST /api/auth/refresh", refreshHandler(store, auth))
+	mux.HandleFunc("POST /api/auth/logout", logoutHandler(store))
+	mux.Handle("GET /api/auth/me", requireAuth(auth, store, meHandler(store)))
+	mux.Handle("GET /api/telegram/status", requireRole(auth, store, roleAdmin, telegramStatusHandler(telegramImport)))
+	mux.Handle("POST /api/telegram/auth/request", requireRole(auth, store, roleAdmin, telegramAuthRequestHandler(telegramImport)))
+	mux.Handle("POST /api/telegram/auth/confirm", requireRole(auth, store, roleAdmin, telegramAuthConfirmHandler(telegramImport)))
+	mux.Handle("POST /api/telegram/auth/password", requireRole(auth, store, roleAdmin, telegramAuthPasswordHandler(telegramImport)))
+	mux.Handle("POST /api/telegram/import-sessions", requireRole(auth, store, roleAdmin, telegramStartImportHandler(telegramImport)))
+	mux.Handle("GET /api/telegram/import-sessions/current", requireRole(auth, store, roleAdmin, telegramCurrentImportHandler(telegramImport)))
+	mux.Handle("POST /api/telegram/import-sessions/current/skip", requireRole(auth, store, roleAdmin, telegramSkipImportHandler(telegramImport)))
+	mux.Handle("POST /api/telegram/import-sessions/current/save", requireRole(auth, store, roleAdmin, telegramSaveImportHandler(telegramImport)))
+	mux.Handle("DELETE /api/telegram/import-sessions/current", requireRole(auth, store, roleAdmin, telegramCancelImportHandler(telegramImport)))
+	mux.Handle("GET /api/telegram/import-sessions/current/audio", requireRole(auth, store, roleAdmin, telegramCurrentAudioHandler(telegramImport)))
+	mux.Handle("GET /api/telegram/import-sessions/current/skipped-report", requireRole(auth, store, roleAdmin, telegramSkippedReportHandler(telegramImport)))
+	mux.Handle("POST /api/youtube/import-sessions", requireRole(auth, store, roleAdmin, youtubeStartImportHandler(youtubeImport)))
+	mux.Handle("GET /api/youtube/import-sessions/current", requireRole(auth, store, roleAdmin, youtubeCurrentImportHandler(youtubeImport)))
+	mux.Handle("POST /api/youtube/import-sessions/current/skip", requireRole(auth, store, roleAdmin, youtubeSkipImportHandler(youtubeImport)))
+	mux.Handle("POST /api/youtube/import-sessions/current/add", requireRole(auth, store, roleAdmin, youtubeAddImportHandler(youtubeImport)))
+	mux.Handle("DELETE /api/youtube/import-sessions/current", requireRole(auth, store, roleAdmin, youtubeCancelImportHandler(youtubeImport)))
+	mux.Handle("GET /api/youtube/cookies/status", requireRole(auth, store, roleAdmin, youtubeCookiesStatusHandler(youtubeCookieStore)))
+	mux.Handle("POST /api/youtube/cookies", requireRole(auth, store, roleAdmin, youtubeCookiesUploadHandler(youtubeCookieStore)))
+	mux.Handle("DELETE /api/youtube/cookies", requireRole(auth, store, roleAdmin, youtubeCookiesDeleteHandler(youtubeCookieStore)))
+	mux.HandleFunc("GET /api/openapi.yaml", serveOpenAPIHandler("openapi.yaml"))
+	mux.HandleFunc("GET /api/docs", swaggerUIHandler())
+	mux.HandleFunc("GET /api/redoc", redocHandler())
 
 	addr := ":8080"
 	log.Printf("server listening on %s", addr)
@@ -636,8 +636,8 @@ func main() {
 	log.Printf("yt-dlp binary %s", ytdlpBinary)
 	log.Printf("ffmpeg binary %s", ffmpegBinary)
 	log.Printf("http logging mode %s", logMode)
-	log.Printf("swagger docs available at http://localhost%s/docs", addr)
-	log.Printf("redoc available at http://localhost%s/redoc", addr)
+	log.Printf("swagger docs available at http://localhost%s/api/docs", addr)
+	log.Printf("redoc available at http://localhost%s/api/redoc", addr)
 	handler := withRequestLogging(withRecovery(withCORS(mux)), logMode)
 	log.Fatal(http.ListenAndServe(addr, handler))
 }
@@ -2313,7 +2313,7 @@ func listSongsHandler(songsDir string) http.HandlerFunc {
 
 func uploadSongHandler(songsDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		info, err := uploadMediaFile(w, r, songsDir, "failed to create song file", "/songs/")
+		info, err := uploadMediaFile(w, r, songsDir, "failed to create song file", "/api/songs/")
 		if err != nil {
 			writeUploadError(w, err)
 			return
@@ -2324,7 +2324,7 @@ func uploadSongHandler(songsDir string) http.HandlerFunc {
 
 func getSongHandler(songsDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		serveMediaFile(w, r, "/songs/", songsDir)
+		serveMediaFile(w, r, "/api/songs/", songsDir)
 	}
 }
 
@@ -2366,7 +2366,7 @@ func listUnusedSongsHandler(store *trackStore, songsDir string) http.HandlerFunc
 
 func deleteSongHandler(store *trackStore, songsDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		name, err := extractMediaFileName(r.URL.Path, "/songs/")
+		name, err := extractMediaFileName(r.URL.Path, "/api/songs/")
 		if err != nil {
 			http.Error(w, "invalid song name", http.StatusBadRequest)
 			return
@@ -2394,12 +2394,12 @@ func deleteSongHandler(store *trackStore, songsDir string) http.HandlerFunc {
 
 func getAlbumCoverHandler(albumCoversDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		serveMediaFile(w, r, "/album-covers/", albumCoversDir)
+		serveMediaFile(w, r, "/api/album-covers/", albumCoversDir)
 	}
 }
 
 func buildSongInfo(name string, info os.FileInfo) songInfo {
-	path := "/songs/" + url.PathEscape(name)
+	path := "/api/songs/" + url.PathEscape(name)
 	return songInfo{
 		Name:         name,
 		SizeBytes:    info.Size(),
@@ -2414,7 +2414,7 @@ func normalizeAudioFilePath(value string) string {
 	if value == "" {
 		return ""
 	}
-	if strings.HasPrefix(value, "/songs/") {
+	if strings.HasPrefix(value, "/api/songs/") {
 		return value
 	}
 
@@ -2427,7 +2427,7 @@ func normalizeAudioFilePath(value string) string {
 	if err != nil {
 		return value
 	}
-	return "/songs/" + url.PathEscape(name)
+	return "/api/songs/" + url.PathEscape(name)
 }
 
 func sanitizeSongFileName(name string) (string, error) {
@@ -2724,7 +2724,7 @@ func deleteAlbumByRouteHandler(store *trackStore) http.HandlerFunc {
 
 func uploadAlbumCoverHandler(albumCoversDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		info, err := uploadMediaFile(w, r, albumCoversDir, "failed to create album cover file", "/album-covers/")
+		info, err := uploadMediaFile(w, r, albumCoversDir, "failed to create album cover file", "/api/album-covers/")
 		if err != nil {
 			writeUploadError(w, err)
 			return
@@ -3871,15 +3871,15 @@ func userIDFromContext(ctx context.Context) (int64, bool) {
 }
 
 func parseTrackID(path string) (int64, error) {
-	return parseResourceID(path, "/tracks/")
+	return parseResourceID(path, "/api/tracks/")
 }
 
 func parseTrackFavoriteID(path string) (int64, error) {
-	return parseResourceID(strings.TrimSuffix(path, "/favorite"), "/tracks/")
+	return parseResourceID(strings.TrimSuffix(path, "/favorite"), "/api/tracks/")
 }
 
 func parseTrackPlaylistsTrackID(path string) (int64, error) {
-	return parseResourceID(strings.TrimSuffix(path, "/playlists"), "/tracks/")
+	return parseResourceID(strings.TrimSuffix(path, "/playlists"), "/api/tracks/")
 }
 
 func parseTrackPlaylistMembershipIDs(path string) (int64, int64, error) {
@@ -3888,7 +3888,7 @@ func parseTrackPlaylistMembershipIDs(path string) (int64, int64, error) {
 	if len(parts) != 2 {
 		return 0, 0, errors.New("invalid membership route")
 	}
-	trackID, err := parseResourceID(parts[0], "/tracks/")
+	trackID, err := parseResourceID(parts[0], "/api/tracks/")
 	if err != nil {
 		return 0, 0, err
 	}
@@ -3900,7 +3900,7 @@ func parseTrackPlaylistMembershipIDs(path string) (int64, int64, error) {
 }
 
 func parseAlbumID(path string) (int64, error) {
-	return parseResourceID(path, "/albums/")
+	return parseResourceID(path, "/api/albums/")
 }
 
 func parseAlbumTracksID(path string) (int64, error) {
@@ -3908,23 +3908,23 @@ func parseAlbumTracksID(path string) (int64, error) {
 	if !strings.HasSuffix(path, suffix) {
 		return 0, errors.New("invalid id")
 	}
-	return parseResourceID(strings.TrimSuffix(path, suffix), "/albums/")
+	return parseResourceID(strings.TrimSuffix(path, suffix), "/api/albums/")
 }
 
 func parseAuthorID(path string) (int64, error) {
-	return parseResourceID(path, "/authors/")
+	return parseResourceID(path, "/api/authors/")
 }
 
 func parsePlaylistID(path string) (int64, error) {
-	return parseResourceID(path, "/playlists/")
+	return parseResourceID(path, "/api/playlists/")
 }
 
 func parsePlaylistTracksID(path string) (int64, error) {
-	return parseResourceID(strings.TrimSuffix(path, "/tracks"), "/playlists/")
+	return parseResourceID(strings.TrimSuffix(path, "/tracks"), "/api/playlists/")
 }
 
 func parsePlaylistTrackOrderID(path string) (int64, error) {
-	return parseResourceID(strings.TrimSuffix(path, "/tracks/order"), "/playlists/")
+	return parseResourceID(strings.TrimSuffix(path, "/tracks/order"), "/api/playlists/")
 }
 
 func parseResourceID(path, prefix string) (int64, error) {
@@ -4871,7 +4871,7 @@ func extractReferencedSongFileName(audioFilePath string) (string, bool) {
 		audioFilePath = parsed.Path
 	}
 
-	name, err := extractMediaFileName(audioFilePath, "/songs/")
+	name, err := extractMediaFileName(audioFilePath, "/api/songs/")
 	if err != nil {
 		return "", false
 	}
@@ -4919,7 +4919,7 @@ func swaggerUIHandler() http.HandlerFunc {
   <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
   <script>
     window.ui = SwaggerUIBundle({
-      url: '/openapi.yaml',
+      url: '/api/openapi.yaml',
       dom_id: '#swagger-ui'
     });
   </script>
@@ -4944,7 +4944,7 @@ func redocHandler() http.HandlerFunc {
   <title>Esketit Music API ReDoc</title>
 </head>
 <body>
-  <redoc spec-url="/openapi.yaml"></redoc>
+  <redoc spec-url="/api/openapi.yaml"></redoc>
   <script src="https://cdn.jsdelivr.net/npm/redoc@2.1.3/bundles/redoc.standalone.js"></script>
 </body>
 </html>`
