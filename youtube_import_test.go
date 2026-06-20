@@ -491,6 +491,69 @@ func TestLiveYouTubeImportGatewayScanArtistUsesYTDLPDump(t *testing.T) {
 	}
 }
 
+func TestLiveYouTubeImportGatewayScanTrackUsesYTDLPCookies(t *testing.T) {
+	root := t.TempDir()
+	cookiesPath := filepath.Join(root, "youtube-cookies.txt")
+	if err := os.WriteFile(cookiesPath, []byte("cookie-data"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", cookiesPath, err)
+	}
+
+	argsPath := filepath.Join(root, "args.txt")
+	binaryPath := filepath.Join(root, "fake-yt-dlp.sh")
+	dumpJSON := `{"id":"4c94WwxWm78","title":"Max Korzh - Official audio","channel":"Max Korzh","duration":228,"timestamp":1714079251,"thumbnails":[{"url":"https://img.example/max-korzh.jpg"}]}`
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + argsPath + "'\necho 'WARNING: redirected'\ncat <<'EOF'\n" + dumpJSON + "\nEOF\n"
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", binaryPath, err)
+	}
+
+	gateway := newLiveYouTubeImportGateway(youtubeImportConfig{
+		RequestTimeout: time.Second,
+		YTDLPBinary:    binaryPath,
+	}, newYouTubeCookieStore(cookiesPath))
+
+	item, err := gateway.scanTrackWithYTDLP(
+		context.Background(),
+		"https://www.youtube.com/watch?v=4c94WwxWm78",
+		"https://www.youtube.com/watch?v=4c94WwxWm78",
+	)
+	if err != nil {
+		t.Fatalf("scanTrackWithYTDLP() error = %v", err)
+	}
+	if item.VideoID != "4c94WwxWm78" {
+		t.Fatalf("scanTrackWithYTDLP() video id = %q", item.VideoID)
+	}
+	if item.SourceURL != "https://www.youtube.com/watch?v=4c94WwxWm78" {
+		t.Fatalf("scanTrackWithYTDLP() source url = %q", item.SourceURL)
+	}
+	if item.ParsedTitle != "Max Korzh - Official audio" {
+		t.Fatalf("scanTrackWithYTDLP() title = %q", item.ParsedTitle)
+	}
+	if len(item.ParsedAuthorNames) != 1 || item.ParsedAuthorNames[0] != "Max Korzh" {
+		t.Fatalf("scanTrackWithYTDLP() author names = %#v", item.ParsedAuthorNames)
+	}
+	if item.DurationSeconds != 228 {
+		t.Fatalf("scanTrackWithYTDLP() duration = %d", item.DurationSeconds)
+	}
+	if item.CoverImageURL != "https://img.example/max-korzh.jpg" {
+		t.Fatalf("scanTrackWithYTDLP() cover image = %q", item.CoverImageURL)
+	}
+	if item.ParsedReleaseDate == nil || item.ParsedReleaseDate.Format("2006-01-02") != "2024-04-25" {
+		t.Fatalf("scanTrackWithYTDLP() release date = %#v", item.ParsedReleaseDate)
+	}
+
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", argsPath, err)
+	}
+	args := strings.Split(strings.TrimSpace(string(argsData)), "\n")
+	if !containsString(args, "--cookies") || !containsString(args, cookiesPath) {
+		t.Fatalf("yt-dlp args = %#v, want cookies path %q", args, cookiesPath)
+	}
+	if !containsString(args, "--no-playlist") || !containsString(args, "--dump-single-json") {
+		t.Fatalf("yt-dlp args = %#v, want single video dump flags", args)
+	}
+}
+
 func TestTrimJSONOutputStripsWarningPrelude(t *testing.T) {
 	output := []byte("WARNING: redirected\n{\"title\":\"DVRST\"}\n")
 	trimmed := trimJSONOutput(output)
@@ -532,4 +595,13 @@ func newYouTubeImportTestService(t *testing.T, gateway youtubeImportGateway) (*y
 	}, gateway, store, songsDir)
 
 	return service, store, songsDir, tempRoot
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

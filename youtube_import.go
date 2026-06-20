@@ -77,6 +77,8 @@ type ytdlpFlatPlaylistEntry struct {
 	Channel    string                   `json:"channel"`
 	Uploader   string                   `json:"uploader"`
 	Duration   float64                  `json:"duration"`
+	Timestamp  int64                    `json:"timestamp"`
+	UploadDate string                   `json:"upload_date"`
 	Entries    []ytdlpFlatPlaylistEntry `json:"entries"`
 	Thumbnails []struct {
 		URL string `json:"url"`
@@ -678,7 +680,15 @@ func (g *liveYouTubeImportGateway) Scan(ctx context.Context, rawURL string, cuto
 	case youtubeImportSourceTrack:
 		video, err := g.client.GetVideoContext(ctx, canonicalURL)
 		if err != nil {
-			return nil, youtubeImportScanSource{}, err
+			item, fallbackErr := g.scanTrackWithYTDLP(ctx, canonicalURL, rawURL)
+			if fallbackErr != nil {
+				log.Printf("youtube track scan yt-dlp fallback failed source_url=%q err=%v fallback_err=%v", rawURL, err, fallbackErr)
+				return nil, youtubeImportScanSource{}, err
+			}
+			if !isImportableYouTubeVideo(item) || !passesYouTubeCutoff(item, cutoff) {
+				return nil, youtubeImportScanSource{}, errYouTubeNoTracks
+			}
+			return []youtubeImportItem{item}, youtubeImportScanSource{SourceType: youtubeImportSourceTrack, CanonicalURL: canonicalURL}, nil
 		}
 		item := buildYouTubeImportItem(video, canonicalURL, rawURL, linkProviderFromURL(rawURL), "")
 		if !isImportableYouTubeVideo(item) || !passesYouTubeCutoff(item, cutoff) {
@@ -891,6 +901,34 @@ func (g *liveYouTubeImportGateway) scanArtistWithYTDLP(ctx context.Context, arti
 	return items, nil
 }
 
+func (g *liveYouTubeImportGateway) scanTrackWithYTDLP(ctx context.Context, canonicalURL, originalURL string) (youtubeImportItem, error) {
+	data, err := g.dumpTrackJSON(ctx, canonicalURL)
+	if err != nil {
+		return youtubeImportItem{}, err
+	}
+	var dump ytdlpFlatPlaylistEntry
+	if err := json.Unmarshal(data, &dump); err != nil {
+		return youtubeImportItem{}, err
+	}
+	linkProvider := linkProviderFromURL(originalURL)
+	item := buildYouTubeImportItemFromYTDLPEntry(dump, originalURL, linkProvider, firstNonEmpty(dump.Channel, dump.Uploader))
+	if strings.TrimSpace(item.VideoID) == "" {
+		_, parsedCanonicalURL, err := classifyYouTubeImportURL(canonicalURL)
+		if err == nil {
+			if parsed, parseErr := url.Parse(parsedCanonicalURL); parseErr == nil {
+				item.VideoID = strings.TrimSpace(parsed.Query().Get("v"))
+			}
+		}
+	}
+	if strings.TrimSpace(item.SourceURL) == "" && strings.TrimSpace(item.VideoID) != "" {
+		item.SourceURL = buildYouTubeWatchURL(item.VideoID, linkProvider)
+	}
+	if item.ParsedReleaseDate == nil {
+		item.ParsedReleaseDate = ytdlpReleaseDate(dump)
+	}
+	return item, nil
+}
+
 func (g *liveYouTubeImportGateway) scanArtistByHTML(ctx context.Context, artistURL string, cutoff *time.Time) ([]youtubeImportItem, error) {
 	body, err := g.fetchHTML(ctx, artistURL)
 	if err != nil {
@@ -946,6 +984,14 @@ func (g *liveYouTubeImportGateway) scanArtistByHTML(ctx context.Context, artistU
 }
 
 func (g *liveYouTubeImportGateway) dumpFlatPlaylistJSON(ctx context.Context, rawURL string) ([]byte, error) {
+	return g.dumpYTDLPJSON(ctx, rawURL, []string{"--no-warnings", "--flat-playlist", "--dump-single-json"}, "artist scan")
+}
+
+func (g *liveYouTubeImportGateway) dumpTrackJSON(ctx context.Context, rawURL string) ([]byte, error) {
+	return g.dumpYTDLPJSON(ctx, rawURL, []string{"--no-warnings", "--no-playlist", "--dump-single-json"}, "track scan")
+}
+
+func (g *liveYouTubeImportGateway) dumpYTDLPJSON(ctx context.Context, rawURL string, args []string, label string) ([]byte, error) {
 	binaryName := strings.TrimSpace(g.cfg.YTDLPBinary)
 	if binaryName == "" {
 		binaryName = "yt-dlp"
@@ -953,7 +999,7 @@ func (g *liveYouTubeImportGateway) dumpFlatPlaylistJSON(ctx context.Context, raw
 	if _, err := exec.LookPath(binaryName); err != nil {
 		return nil, err
 	}
-	args := []string{"--no-warnings", "--flat-playlist", "--dump-single-json"}
+	args = append([]string{}, args...)
 	if cookiesPath, ok := g.cookieStore.pathIfPresent(); ok {
 		args = append(args, "--cookies", cookiesPath)
 	}
@@ -961,7 +1007,7 @@ func (g *liveYouTubeImportGateway) dumpFlatPlaylistJSON(ctx context.Context, raw
 	cmd := exec.CommandContext(ctx, binaryName, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("yt-dlp artist scan failed source_url=%q err=%v output=%s", rawURL, err, strings.TrimSpace(string(output)))
+		log.Printf("yt-dlp %s failed source_url=%q err=%v output=%s", label, rawURL, err, strings.TrimSpace(string(output)))
 		return nil, err
 	}
 	jsonPayload := trimJSONOutput(output)
@@ -1077,18 +1123,22 @@ func mergePlaylistEntryFallback(item youtubeImportItem, entry *youtube.PlaylistE
 
 func buildYouTubeImportItemFromYTDLPEntry(entry ytdlpFlatPlaylistEntry, originalURL, linkProvider, defaultAuthor string) youtubeImportItem {
 	author := strings.TrimSpace(firstNonEmpty(entry.Channel, entry.Uploader, defaultAuthor))
+	videoID := strings.TrimSpace(entry.ID)
 	item := youtubeImportItem{
-		VideoID:           strings.TrimSpace(entry.ID),
-		SourceURL:         buildYouTubeWatchURL(strings.TrimSpace(entry.ID), linkProvider),
+		VideoID:           videoID,
 		OriginalSourceURL: originalURL,
 		LinkProvider:      linkProvider,
 		ParsedTitle:       strings.TrimSpace(entry.Title),
 		ParsedAuthorNames: normalizeNames([]string{author}),
 		DurationSeconds:   int(entry.Duration),
 	}
+	if videoID != "" {
+		item.SourceURL = buildYouTubeWatchURL(videoID, linkProvider)
+	}
 	if len(entry.Thumbnails) > 0 {
 		item.CoverImageURL = strings.TrimSpace(entry.Thumbnails[len(entry.Thumbnails)-1].URL)
 	}
+	item.ParsedReleaseDate = ytdlpReleaseDate(entry)
 	return item
 }
 
@@ -1187,6 +1237,23 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func ytdlpReleaseDate(entry ytdlpFlatPlaylistEntry) *time.Time {
+	if entry.Timestamp > 0 {
+		releaseDate := time.Unix(entry.Timestamp, 0).UTC()
+		return &releaseDate
+	}
+	uploadDate := strings.TrimSpace(entry.UploadDate)
+	if uploadDate == "" {
+		return nil
+	}
+	releaseDate, err := time.Parse("20060102", uploadDate)
+	if err != nil {
+		return nil
+	}
+	releaseDate = releaseDate.UTC()
+	return &releaseDate
 }
 
 func buildYouTubeWatchURL(videoID, provider string) string {
