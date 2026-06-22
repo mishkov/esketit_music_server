@@ -147,6 +147,7 @@ type youtubeStartImportRequest struct {
 	URL               string     `json:"url"`
 	ReleaseDateCutoff *time.Time `json:"releaseDateCutoff,omitempty"`
 	ReplaceExisting   bool       `json:"replaceExisting"`
+	YouTubeCookies    string     `json:"youtubeCookies,omitempty"`
 }
 
 type youtubeAddCurrentRequest struct {
@@ -171,6 +172,7 @@ type youtubeImportSession struct {
 	SourceType        string
 	SourceURL         string
 	ReleaseDateCutoff *time.Time
+	CookiesPath       string
 	Items             []youtubeImportItem
 	CurrentIndex      int
 	SkippedItems      []youtubeSkippedItem
@@ -180,8 +182,8 @@ type youtubeImportSession struct {
 }
 
 type youtubeImportGateway interface {
-	Scan(ctx context.Context, rawURL string, cutoff *time.Time) ([]youtubeImportItem, youtubeImportScanSource, error)
-	DownloadAudio(ctx context.Context, item youtubeImportItem, destinationPath string) error
+	Scan(ctx context.Context, rawURL string, cutoff *time.Time, cookiesPath string) ([]youtubeImportItem, youtubeImportScanSource, error)
+	DownloadAudio(ctx context.Context, item youtubeImportItem, destinationPath string, cookiesPath string) error
 }
 
 type youtubeImportService struct {
@@ -302,11 +304,22 @@ func newYouTubeImportService(cfg youtubeImportConfig, gateway youtubeImportGatew
 	}
 }
 
-func (s *youtubeImportService) StartSession(ctx context.Context, userID int64, rawURL string, cutoff *time.Time, replaceExisting bool) (youtubeImportSessionDTO, error) {
+func (s *youtubeImportService) StartSession(ctx context.Context, userID int64, rawURL string, cutoff *time.Time, replaceExisting bool, youtubeCookies string) (youtubeImportSessionDTO, error) {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
 		return youtubeImportSessionDTO{}, errors.New("url is required")
 	}
+
+	cookiesPath, cleanupCookies, err := s.writeSessionCookies(userID, youtubeCookies)
+	if err != nil {
+		return youtubeImportSessionDTO{}, err
+	}
+	committedCookies := false
+	defer func() {
+		if !committedCookies {
+			cleanupCookies()
+		}
+	}()
 
 	s.mu.Lock()
 	if existing, ok := s.sessions[userID]; ok && existing.Status == youtubeImportStatusActive && !replaceExisting {
@@ -315,7 +328,7 @@ func (s *youtubeImportService) StartSession(ctx context.Context, userID int64, r
 	}
 	s.mu.Unlock()
 
-	items, source, err := s.gateway.Scan(ctx, rawURL, cutoff)
+	items, source, err := s.gateway.Scan(ctx, rawURL, cutoff, cookiesPath)
 	if err != nil {
 		return youtubeImportSessionDTO{}, err
 	}
@@ -336,6 +349,7 @@ func (s *youtubeImportService) StartSession(ctx context.Context, userID int64, r
 		SourceType:        source.SourceType,
 		SourceURL:         source.CanonicalURL,
 		ReleaseDateCutoff: cutoff,
+		CookiesPath:       cookiesPath,
 		Items:             items,
 		SkippedItems:      []youtubeSkippedItem{},
 		CreatedAt:         now,
@@ -343,10 +357,33 @@ func (s *youtubeImportService) StartSession(ctx context.Context, userID int64, r
 	}
 
 	s.mu.Lock()
+	if existing, ok := s.sessions[userID]; ok {
+		s.cleanupSessionFilesLocked(existing)
+	}
 	s.sessions[userID] = session
 	s.mu.Unlock()
+	committedCookies = true
 
 	return s.CurrentSession(userID)
+}
+
+func (s *youtubeImportService) writeSessionCookies(userID int64, rawCookies string) (string, func(), error) {
+	rawCookies = strings.TrimSpace(rawCookies)
+	if rawCookies == "" {
+		return "", func() {}, nil
+	}
+	if err := os.MkdirAll(s.cfg.ImportTempDir, 0o700); err != nil {
+		return "", func() {}, err
+	}
+	token, err := randomToken(12)
+	if err != nil {
+		return "", func() {}, err
+	}
+	path := filepath.Join(s.cfg.ImportTempDir, fmt.Sprintf("youtube-cookies-%d-%s.txt", userID, token))
+	if err := os.WriteFile(path, []byte(rawCookies+"\n"), 0o600); err != nil {
+		return "", func() {}, err
+	}
+	return path, func() { _ = os.Remove(path) }, nil
 }
 
 func (s *youtubeImportService) CurrentSession(userID int64) (youtubeImportSessionDTO, error) {
@@ -381,6 +418,7 @@ func (s *youtubeImportService) SkipCurrent(userID int64) (youtubeImportSessionDT
 	session.UpdatedAt = time.Now().UTC()
 	if session.CurrentIndex >= len(session.Items) {
 		session.Status = youtubeImportStatusCompleted
+		s.cleanupSessionFilesLocked(session)
 	}
 	return s.buildSessionDTOLocked(session), nil
 }
@@ -394,6 +432,7 @@ func (s *youtubeImportService) AddCurrent(ctx context.Context, userID int64, req
 	}
 	itemIndex := session.CurrentIndex
 	item, ok := session.currentItem()
+	cookiesPath := session.CookiesPath
 	s.mu.Unlock()
 	if !ok {
 		current, currentErr := s.CurrentSession(userID)
@@ -411,7 +450,7 @@ func (s *youtubeImportService) AddCurrent(ctx context.Context, userID int64, req
 			return youtubeImportSessionDTO{}, track{}, errYouTubeCurrentConflict
 		}
 
-		audioPath, cleanup, err := s.downloadCurrentToSongs(ctx, itemIndex, item)
+		audioPath, cleanup, err := s.downloadCurrentToSongs(ctx, itemIndex, item, cookiesPath)
 		if err != nil {
 			return youtubeImportSessionDTO{}, track{}, err
 		}
@@ -461,6 +500,7 @@ func (s *youtubeImportService) advanceSaved(userID int64, savedTrack track) (you
 	session.UpdatedAt = time.Now().UTC()
 	if session.CurrentIndex >= len(session.Items) {
 		session.Status = youtubeImportStatusCompleted
+		s.cleanupSessionFilesLocked(session)
 	}
 	return s.buildSessionDTOLocked(session), savedTrack, nil
 }
@@ -472,8 +512,16 @@ func (s *youtubeImportService) CancelSession(userID int64) error {
 	if _, ok := s.sessions[userID]; !ok {
 		return errYouTubeSessionNotFound
 	}
+	s.cleanupSessionFilesLocked(s.sessions[userID])
 	delete(s.sessions, userID)
 	return nil
+}
+
+func (s *youtubeImportService) cleanupSessionFilesLocked(session *youtubeImportSession) {
+	if strings.TrimSpace(session.CookiesPath) != "" {
+		_ = os.Remove(session.CookiesPath)
+		session.CookiesPath = ""
+	}
 }
 
 func (s *youtubeImportService) buildSessionDTOLocked(session *youtubeImportSession) youtubeImportSessionDTO {
@@ -513,7 +561,7 @@ func (s *youtubeImportService) buildSessionDTOLocked(session *youtubeImportSessi
 	return dto
 }
 
-func (s *youtubeImportService) downloadCurrentToSongs(ctx context.Context, index int, item youtubeImportItem) (string, func(bool), error) {
+func (s *youtubeImportService) downloadCurrentToSongs(ctx context.Context, index int, item youtubeImportItem, cookiesPath string) (string, func(bool), error) {
 	if err := os.MkdirAll(s.cfg.ImportTempDir, 0o755); err != nil {
 		return "", func(bool) {}, err
 	}
@@ -526,7 +574,7 @@ func (s *youtubeImportService) downloadCurrentToSongs(ctx context.Context, index
 		return "", func(bool) {}, err
 	}
 	tempSourcePath := filepath.Join(s.cfg.ImportTempDir, fmt.Sprintf("%03d-%s", index+1, tempSourceName))
-	if err := s.gateway.DownloadAudio(ctx, item, tempSourcePath); err != nil {
+	if err := s.gateway.DownloadAudio(ctx, item, tempSourcePath, cookiesPath); err != nil {
 		_ = os.Remove(tempSourcePath)
 		return "", func(bool) {}, err
 	}
@@ -670,7 +718,7 @@ func newLiveYouTubeImportGateway(cfg youtubeImportConfig, cookieStore *youtubeCo
 	}
 }
 
-func (g *liveYouTubeImportGateway) Scan(ctx context.Context, rawURL string, cutoff *time.Time) ([]youtubeImportItem, youtubeImportScanSource, error) {
+func (g *liveYouTubeImportGateway) Scan(ctx context.Context, rawURL string, cutoff *time.Time, cookiesPath string) ([]youtubeImportItem, youtubeImportScanSource, error) {
 	sourceType, canonicalURL, err := classifyYouTubeImportURL(rawURL)
 	if err != nil {
 		return nil, youtubeImportScanSource{}, err
@@ -680,7 +728,7 @@ func (g *liveYouTubeImportGateway) Scan(ctx context.Context, rawURL string, cuto
 	case youtubeImportSourceTrack:
 		video, err := g.client.GetVideoContext(ctx, canonicalURL)
 		if err != nil {
-			item, fallbackErr := g.scanTrackWithYTDLP(ctx, canonicalURL, rawURL)
+			item, fallbackErr := g.scanTrackWithYTDLP(ctx, canonicalURL, rawURL, cookiesPath)
 			if fallbackErr != nil {
 				log.Printf("youtube track scan yt-dlp fallback failed source_url=%q err=%v fallback_err=%v", rawURL, err, fallbackErr)
 				return nil, youtubeImportScanSource{}, err
@@ -699,16 +747,16 @@ func (g *liveYouTubeImportGateway) Scan(ctx context.Context, rawURL string, cuto
 		items, err := g.scanPlaylist(ctx, canonicalURL, rawURL, linkProviderFromURL(rawURL), cutoff)
 		return items, youtubeImportScanSource{SourceType: youtubeImportSourcePlaylist, CanonicalURL: canonicalURL}, err
 	case youtubeImportSourceArtist:
-		items, err := g.scanArtist(ctx, canonicalURL, cutoff)
+		items, err := g.scanArtist(ctx, canonicalURL, cutoff, cookiesPath)
 		return items, youtubeImportScanSource{SourceType: youtubeImportSourceArtist, CanonicalURL: canonicalURL}, err
 	default:
 		return nil, youtubeImportScanSource{}, errYouTubeInvalidURL
 	}
 }
 
-func (g *liveYouTubeImportGateway) DownloadAudio(ctx context.Context, item youtubeImportItem, destinationPath string) error {
-	if cookiesPath, ok := g.cookieStore.pathIfPresent(); ok {
-		return g.downloadAudioWithYTDLP(ctx, item, destinationPath, cookiesPath)
+func (g *liveYouTubeImportGateway) DownloadAudio(ctx context.Context, item youtubeImportItem, destinationPath string, cookiesPath string) error {
+	if resolvedCookiesPath, ok := g.resolveCookiesPath(cookiesPath); ok {
+		return g.downloadAudioWithYTDLP(ctx, item, destinationPath, resolvedCookiesPath)
 	}
 
 	video, err := g.client.GetVideoContext(ctx, item.SourceURL)
@@ -742,6 +790,17 @@ func (g *liveYouTubeImportGateway) DownloadAudio(ctx context.Context, item youtu
 		return youtubeDownloadError(item, "close_output", format, err)
 	}
 	return nil
+}
+
+func (g *liveYouTubeImportGateway) resolveCookiesPath(cookiesPath string) (string, bool) {
+	cookiesPath = strings.TrimSpace(cookiesPath)
+	if cookiesPath != "" {
+		info, err := os.Stat(cookiesPath)
+		if err == nil && !info.IsDir() && info.Size() > 0 {
+			return cookiesPath, true
+		}
+	}
+	return g.cookieStore.pathIfPresent()
 }
 
 func (g *liveYouTubeImportGateway) downloadAudioWithYTDLP(ctx context.Context, item youtubeImportItem, destinationPath, cookiesPath string) error {
@@ -841,8 +900,8 @@ func (g *liveYouTubeImportGateway) scanPlaylist(ctx context.Context, playlistURL
 	return items, nil
 }
 
-func (g *liveYouTubeImportGateway) scanArtist(ctx context.Context, artistURL string, cutoff *time.Time) ([]youtubeImportItem, error) {
-	items, err := g.scanArtistWithYTDLP(ctx, artistURL, cutoff)
+func (g *liveYouTubeImportGateway) scanArtist(ctx context.Context, artistURL string, cutoff *time.Time, cookiesPath string) ([]youtubeImportItem, error) {
+	items, err := g.scanArtistWithYTDLP(ctx, artistURL, cutoff, cookiesPath)
 	if err == nil && len(items) > 0 {
 		return items, nil
 	}
@@ -852,8 +911,8 @@ func (g *liveYouTubeImportGateway) scanArtist(ctx context.Context, artistURL str
 	return g.scanArtistByHTML(ctx, artistURL, cutoff)
 }
 
-func (g *liveYouTubeImportGateway) scanArtistWithYTDLP(ctx context.Context, artistURL string, cutoff *time.Time) ([]youtubeImportItem, error) {
-	data, err := g.dumpFlatPlaylistJSON(ctx, artistURL)
+func (g *liveYouTubeImportGateway) scanArtistWithYTDLP(ctx context.Context, artistURL string, cutoff *time.Time, cookiesPath string) ([]youtubeImportItem, error) {
+	data, err := g.dumpFlatPlaylistJSON(ctx, artistURL, cookiesPath)
 	if err != nil {
 		return nil, err
 	}
@@ -901,8 +960,8 @@ func (g *liveYouTubeImportGateway) scanArtistWithYTDLP(ctx context.Context, arti
 	return items, nil
 }
 
-func (g *liveYouTubeImportGateway) scanTrackWithYTDLP(ctx context.Context, canonicalURL, originalURL string) (youtubeImportItem, error) {
-	data, err := g.dumpTrackJSON(ctx, canonicalURL)
+func (g *liveYouTubeImportGateway) scanTrackWithYTDLP(ctx context.Context, canonicalURL, originalURL string, cookiesPath string) (youtubeImportItem, error) {
+	data, err := g.dumpTrackJSON(ctx, canonicalURL, cookiesPath)
 	if err != nil {
 		return youtubeImportItem{}, err
 	}
@@ -983,15 +1042,15 @@ func (g *liveYouTubeImportGateway) scanArtistByHTML(ctx context.Context, artistU
 	return items, nil
 }
 
-func (g *liveYouTubeImportGateway) dumpFlatPlaylistJSON(ctx context.Context, rawURL string) ([]byte, error) {
-	return g.dumpYTDLPJSON(ctx, rawURL, []string{"--no-warnings", "--flat-playlist", "--dump-single-json"}, "artist scan")
+func (g *liveYouTubeImportGateway) dumpFlatPlaylistJSON(ctx context.Context, rawURL string, cookiesPath string) ([]byte, error) {
+	return g.dumpYTDLPJSON(ctx, rawURL, []string{"--no-warnings", "--flat-playlist", "--dump-single-json"}, "artist scan", cookiesPath)
 }
 
-func (g *liveYouTubeImportGateway) dumpTrackJSON(ctx context.Context, rawURL string) ([]byte, error) {
-	return g.dumpYTDLPJSON(ctx, rawURL, []string{"--no-warnings", "--no-playlist", "--dump-single-json"}, "track scan")
+func (g *liveYouTubeImportGateway) dumpTrackJSON(ctx context.Context, rawURL string, cookiesPath string) ([]byte, error) {
+	return g.dumpYTDLPJSON(ctx, rawURL, []string{"--no-warnings", "--no-playlist", "--dump-single-json"}, "track scan", cookiesPath)
 }
 
-func (g *liveYouTubeImportGateway) dumpYTDLPJSON(ctx context.Context, rawURL string, args []string, label string) ([]byte, error) {
+func (g *liveYouTubeImportGateway) dumpYTDLPJSON(ctx context.Context, rawURL string, args []string, label string, cookiesPath string) ([]byte, error) {
 	binaryName := strings.TrimSpace(g.cfg.YTDLPBinary)
 	if binaryName == "" {
 		binaryName = "yt-dlp"
@@ -1000,8 +1059,8 @@ func (g *liveYouTubeImportGateway) dumpYTDLPJSON(ctx context.Context, rawURL str
 		return nil, err
 	}
 	args = append([]string{}, args...)
-	if cookiesPath, ok := g.cookieStore.pathIfPresent(); ok {
-		args = append(args, "--cookies", cookiesPath)
+	if resolvedCookiesPath, ok := g.resolveCookiesPath(cookiesPath); ok {
+		args = append(args, "--cookies", resolvedCookiesPath)
 	}
 	args = append(args, rawURL)
 	cmd := exec.CommandContext(ctx, binaryName, args...)
@@ -1649,7 +1708,14 @@ func youtubeStartImportHandler(service *youtubeImportService) http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		session, err := service.StartSession(r.Context(), userID, req.URL, req.ReleaseDateCutoff, req.ReplaceExisting)
+		session, err := service.StartSession(
+			r.Context(),
+			userID,
+			req.URL,
+			req.ReleaseDateCutoff,
+			req.ReplaceExisting,
+			req.YouTubeCookies,
+		)
 		if err != nil {
 			writeYouTubeImportError(w, err)
 			return

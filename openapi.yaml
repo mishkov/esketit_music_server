@@ -2295,6 +2295,9 @@ components:
           nullable: true
         replaceExisting:
           type: boolean
+        youtubeCookies:
+          type: string
+          description: Optional Netscape-format YouTube cookies to use for this import session.
       required: [url]
 
     YouTubeImportSuggestion:

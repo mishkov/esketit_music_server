@@ -17,12 +17,15 @@ import (
 )
 
 type fakeYouTubeGateway struct {
-	scanItems    []youtubeImportItem
-	scanSource   youtubeImportScanSource
-	downloadData []byte
+	scanItems           []youtubeImportItem
+	scanSource          youtubeImportScanSource
+	downloadData        []byte
+	scanCookiesPath     string
+	downloadCookiesPath string
 }
 
-func (f *fakeYouTubeGateway) Scan(_ context.Context, _ string, cutoff *time.Time) ([]youtubeImportItem, youtubeImportScanSource, error) {
+func (f *fakeYouTubeGateway) Scan(_ context.Context, _ string, cutoff *time.Time, cookiesPath string) ([]youtubeImportItem, youtubeImportScanSource, error) {
+	f.scanCookiesPath = cookiesPath
 	if len(f.scanItems) == 0 {
 		return nil, youtubeImportScanSource{}, errYouTubeNoTracks
 	}
@@ -39,7 +42,8 @@ func (f *fakeYouTubeGateway) Scan(_ context.Context, _ string, cutoff *time.Time
 	return items, f.scanSource, nil
 }
 
-func (f *fakeYouTubeGateway) DownloadAudio(_ context.Context, _ youtubeImportItem, destinationPath string) error {
+func (f *fakeYouTubeGateway) DownloadAudio(_ context.Context, _ youtubeImportItem, destinationPath string, cookiesPath string) error {
+	f.downloadCookiesPath = cookiesPath
 	if err := os.MkdirAll(filepath.Dir(destinationPath), 0o755); err != nil {
 		return err
 	}
@@ -77,10 +81,10 @@ func TestYouTubeImportSessionConflictAndSkip(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	if _, err := service.StartSession(ctx, 1, "https://music.youtube.com/playlist?list=PL1", nil, false); err != nil {
+	if _, err := service.StartSession(ctx, 1, "https://music.youtube.com/playlist?list=PL1", nil, false, ""); err != nil {
 		t.Fatalf("StartSession() error = %v", err)
 	}
-	if _, err := service.StartSession(ctx, 1, "https://music.youtube.com/playlist?list=PL1", nil, false); !errors.Is(err, errYouTubeSessionActive) {
+	if _, err := service.StartSession(ctx, 1, "https://music.youtube.com/playlist?list=PL1", nil, false, ""); !errors.Is(err, errYouTubeSessionActive) {
 		t.Fatalf("StartSession() conflict error = %v, want %v", err, errYouTubeSessionActive)
 	}
 
@@ -139,7 +143,7 @@ func TestYouTubeImportAddCurrentCreateDownloadsAndCreatesTrack(t *testing.T) {
 
 	artist, album := seedTrackDependencies(t, store)
 	ctx := context.Background()
-	if _, err := service.StartSession(ctx, 1, "https://music.youtube.com/watch?v=abc123", nil, false); err != nil {
+	if _, err := service.StartSession(ctx, 1, "https://music.youtube.com/watch?v=abc123", nil, false, ""); err != nil {
 		t.Fatalf("StartSession() error = %v", err)
 	}
 
@@ -182,6 +186,58 @@ func TestYouTubeImportAddCurrentCreateDownloadsAndCreatesTrack(t *testing.T) {
 	}
 }
 
+func TestYouTubeImportSessionUsesRequestCookiesAndCleansThemUp(t *testing.T) {
+	gateway := &fakeYouTubeGateway{
+		scanSource: youtubeImportScanSource{
+			SourceType:   youtubeImportSourceTrack,
+			CanonicalURL: "https://music.youtube.com/watch?v=with-cookies",
+		},
+		scanItems: []youtubeImportItem{
+			{
+				VideoID:           "with-cookies",
+				SourceURL:         "https://music.youtube.com/watch?v=with-cookies",
+				OriginalSourceURL: "https://music.youtube.com/watch?v=with-cookies",
+				LinkProvider:      "youtube_music",
+				ParsedTitle:       "Cookie Track",
+				ParsedAuthorNames: []string{"Artist"},
+			},
+		},
+		downloadData: []byte("audio-data"),
+	}
+	service, store, _, _ := newYouTubeImportTestService(t, gateway)
+	artist, album := seedTrackDependencies(t, store)
+
+	ctx := context.Background()
+	if _, err := service.StartSession(ctx, 1, "https://music.youtube.com/watch?v=with-cookies", nil, false, "cookie-data"); err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	if gateway.scanCookiesPath == "" {
+		t.Fatal("Scan() did not receive session cookies path")
+	}
+	if data, err := os.ReadFile(gateway.scanCookiesPath); err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", gateway.scanCookiesPath, err)
+	} else if !strings.Contains(string(data), "cookie-data") {
+		t.Fatalf("cookies file = %q, want cookie-data", string(data))
+	}
+
+	_, _, err := service.AddCurrent(ctx, 1, youtubeAddCurrentRequest{
+		Mode:       youtubeAddModeCreate,
+		Name:       "Cookie Track",
+		AuthorIDs:  []int64{artist.ID},
+		AlbumID:    album.ID,
+		AlbumOrder: 0,
+	})
+	if err != nil {
+		t.Fatalf("AddCurrent() error = %v", err)
+	}
+	if gateway.downloadCookiesPath != gateway.scanCookiesPath {
+		t.Fatalf("DownloadAudio() cookies path = %q, want %q", gateway.downloadCookiesPath, gateway.scanCookiesPath)
+	}
+	if _, err := os.Stat(gateway.scanCookiesPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("session cookies still exist or unexpected stat error: %v", err)
+	}
+}
+
 func TestYouTubeImportAddCurrentAttachMergesMetadata(t *testing.T) {
 	releaseDate := time.Date(2024, time.March, 1, 0, 0, 0, 0, time.UTC)
 	service, store, _, _ := newYouTubeImportTestService(t, &fakeYouTubeGateway{
@@ -216,7 +272,7 @@ func TestYouTubeImportAddCurrentAttachMergesMetadata(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if _, err := service.StartSession(ctx, 1, "https://www.youtube.com/watch?v=video-attach", nil, false); err != nil {
+	if _, err := service.StartSession(ctx, 1, "https://www.youtube.com/watch?v=video-attach", nil, false, ""); err != nil {
 		t.Fatalf("StartSession() error = %v", err)
 	}
 
@@ -280,7 +336,7 @@ func TestYouTubeImportSuggestionsIncludeExactSourceMatch(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if _, err := service.StartSession(ctx, 1, "https://music.youtube.com/watch?v=match-me", nil, false); err != nil {
+	if _, err := service.StartSession(ctx, 1, "https://music.youtube.com/watch?v=match-me", nil, false, ""); err != nil {
 		t.Fatalf("StartSession() error = %v", err)
 	}
 	current, err := service.CurrentSession(1)
@@ -406,7 +462,7 @@ func TestLiveYouTubeImportGatewayDownloadAudioUsesYTDLPWhenCookiesPresent(t *tes
 		VideoID:      "video-1",
 		SourceURL:    "https://music.youtube.com/watch?v=video-1",
 		LinkProvider: "youtube_music",
-	}, targetPath)
+	}, targetPath, "")
 	if err != nil {
 		t.Fatalf("DownloadAudio() error = %v", err)
 	}
@@ -470,7 +526,7 @@ func TestLiveYouTubeImportGatewayScanArtistUsesYTDLPDump(t *testing.T) {
 		YTDLPBinary:    binaryPath,
 	}, newYouTubeCookieStore(""))
 
-	items, err := gateway.scanArtist(context.Background(), "https://music.youtube.com/channel/example", nil)
+	items, err := gateway.scanArtist(context.Background(), "https://music.youtube.com/channel/example", nil, "")
 	if err != nil {
 		t.Fatalf("scanArtist() error = %v", err)
 	}
@@ -515,6 +571,7 @@ func TestLiveYouTubeImportGatewayScanTrackUsesYTDLPCookies(t *testing.T) {
 		context.Background(),
 		"https://www.youtube.com/watch?v=4c94WwxWm78",
 		"https://www.youtube.com/watch?v=4c94WwxWm78",
+		"",
 	)
 	if err != nil {
 		t.Fatalf("scanTrackWithYTDLP() error = %v", err)
