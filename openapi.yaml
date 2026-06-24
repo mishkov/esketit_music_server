@@ -1830,10 +1830,22 @@ components:
             type: integer
             format: int64
             minimum: 1
+        authors:
+          type: array
+          description: |
+            Full author objects when a track response is enriched for display, such
+            as track results returned from `/api/search`.
+          items:
+            $ref: '#/components/schemas/Author'
         albumId:
           type: integer
           format: int64
           minimum: 1
+        coverImagePath:
+          type: string
+          description: |
+            Album cover path when a track response is enriched for display, such
+            as track results returned from `/api/search`.
         audioFilePath:
           type: string
         additionalInfo:

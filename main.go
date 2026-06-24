@@ -250,7 +250,9 @@ type trackResponse struct {
 	ID             int64            `json:"id"`
 	Name           string           `json:"name"`
 	AuthorIDs      []int64          `json:"authorIds"`
+	Authors        []author         `json:"authors,omitempty"`
 	AlbumID        int64            `json:"albumId"`
+	CoverImagePath string           `json:"coverImagePath,omitempty"`
 	AudioFilePath  string           `json:"audioFilePath"`
 	AdditionalInfo []additionalInfo `json:"additionalInfo"`
 	SourceMetadata []sourceMetadata `json:"sourceMetadata"`
@@ -1837,7 +1839,7 @@ func (s *trackStore) search(userID int64, filter searchListFilter) paginatedSear
 		if query != "" && !strings.Contains(strings.ToLower(a.CurrentName), query) {
 			continue
 		}
-		authorCopy := a
+		authorCopy := cloneAuthor(a)
 		items = append(items, searchResultItem{
 			Type:   "author",
 			Author: &authorCopy,
@@ -1866,7 +1868,7 @@ func (s *trackStore) search(userID int64, filter searchListFilter) paginatedSear
 			continue
 		}
 		_, isFavorite := favoriteIDs[t.ID]
-		trackCopy := toTrackResponse(t, isFavorite, true)
+		trackCopy := s.toSearchTrackResponseLocked(t, isFavorite)
 		items = append(items, searchResultItem{
 			Type:  "track",
 			Track: &trackCopy,
@@ -4735,6 +4737,11 @@ func cloneTrackPointer(t *track) *track {
 	return &cloned
 }
 
+func cloneAuthor(a author) author {
+	a.Photos = append([]string(nil), a.Photos...)
+	return a
+}
+
 func cloneAlbumsMap(src map[int64]album) map[int64]album {
 	cloned := make(map[int64]album, len(src))
 	for id, item := range src {
@@ -4813,6 +4820,22 @@ func toTrackResponse(t track, isFavorite, isAvailable bool) trackResponse {
 		IsFavorite:     isFavorite,
 		IsAvailable:    isAvailable,
 	}
+}
+
+func (s *trackStore) toSearchTrackResponseLocked(t track, isFavorite bool) trackResponse {
+	response := toTrackResponse(t, isFavorite, true)
+	response.Authors = make([]author, 0, len(t.AuthorIDs))
+	for _, authorID := range t.AuthorIDs {
+		a, ok := s.authors[authorID]
+		if !ok {
+			continue
+		}
+		response.Authors = append(response.Authors, cloneAuthor(a))
+	}
+	if albumItem, ok := s.albums[t.AlbumID]; ok {
+		response.CoverImagePath = albumItem.CoverImagePath
+	}
+	return response
 }
 
 func searchResultSortKey(item searchResultItem) (string, string, int64) {

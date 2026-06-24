@@ -330,6 +330,101 @@ func TestSearchHandlerReturnsCombinedPaginatedResults(t *testing.T) {
 	}
 }
 
+func TestSearchHandlerReturnsDisplayReadyTrackResults(t *testing.T) {
+	store := newTestTrackStore(t)
+	handler := searchHandler(store, nil)
+
+	artistOne, err := store.createAuthor(upsertAuthorRequest{
+		CurrentName: "Artist One",
+		Photos:      []string{"/api/author-photos/artist-one.jpg"},
+	})
+	if err != nil {
+		t.Fatalf("createAuthor() artist one error = %v", err)
+	}
+	artistTwo, err := store.createAuthor(upsertAuthorRequest{
+		CurrentName: "Artist Two",
+		Photos:      []string{"/api/author-photos/artist-two.jpg"},
+	})
+	if err != nil {
+		t.Fatalf("createAuthor() artist two error = %v", err)
+	}
+	albumItem, err := store.createAlbum(upsertAlbumRequest{
+		Title:          "Display Album",
+		CoverImagePath: "/api/album-covers/display-album.jpg",
+		ReleaseDate:    time.Date(2024, time.March, 1, 0, 0, 0, 0, time.UTC),
+		IsPublished:    true,
+	})
+	if err != nil {
+		t.Fatalf("createAlbum() error = %v", err)
+	}
+	_, err = store.create(upsertTrackRequest{
+		Name:           "Display Ready Track",
+		AuthorIDs:      []int64{artistOne.ID, artistTwo.ID},
+		AlbumID:        albumItem.ID,
+		AlbumOrder:     0,
+		AudioFilePath:  "/api/songs/display-ready-track.mp3",
+		AdditionalInfo: []additionalInfo{{"type": "external_link", "provider": "site", "url": "https://example.com/track"}},
+	})
+	if err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/search?query=ready", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var got paginatedSearchResults
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if got.TotalItems != 1 {
+		t.Fatalf("got.TotalItems = %d, want 1", got.TotalItems)
+	}
+	if len(got.Items) != 1 {
+		t.Fatalf("len(got.Items) = %d, want 1", len(got.Items))
+	}
+	item := got.Items[0]
+	if item.Type != "track" {
+		t.Fatalf("item.Type = %q, want track", item.Type)
+	}
+	if item.Track == nil {
+		t.Fatal("item.Track = nil, want track response")
+	}
+	track := item.Track
+	if track.ID == 0 || track.Name != "Display Ready Track" || track.AudioFilePath != "/api/songs/display-ready-track.mp3" {
+		t.Fatalf("track core fields = %#v, want existing track fields preserved", track)
+	}
+	if len(track.AuthorIDs) != 2 || track.AuthorIDs[0] != artistOne.ID || track.AuthorIDs[1] != artistTwo.ID {
+		t.Fatalf("track.AuthorIDs = %#v, want both author IDs", track.AuthorIDs)
+	}
+	if len(track.Authors) != 2 {
+		t.Fatalf("len(track.Authors) = %d, want 2", len(track.Authors))
+	}
+	if track.Authors[0].ID != artistOne.ID || track.Authors[0].CurrentName != "Artist One" || len(track.Authors[0].Photos) != 1 || track.Authors[0].Photos[0] != "/api/author-photos/artist-one.jpg" {
+		t.Fatalf("track.Authors[0] = %#v, want first full author", track.Authors[0])
+	}
+	if track.Authors[1].ID != artistTwo.ID || track.Authors[1].CurrentName != "Artist Two" || len(track.Authors[1].Photos) != 1 || track.Authors[1].Photos[0] != "/api/author-photos/artist-two.jpg" {
+		t.Fatalf("track.Authors[1] = %#v, want second full author", track.Authors[1])
+	}
+	if track.CoverImagePath != "/api/album-covers/display-album.jpg" {
+		t.Fatalf("track.CoverImagePath = %q, want album cover", track.CoverImagePath)
+	}
+	if len(track.AdditionalInfo) != 1 {
+		t.Fatalf("len(track.AdditionalInfo) = %d, want existing additional info", len(track.AdditionalInfo))
+	}
+	if track.IsFavorite {
+		t.Fatal("track.IsFavorite = true, want false")
+	}
+	if !track.IsAvailable {
+		t.Fatal("track.IsAvailable = false, want true")
+	}
+}
+
 func TestSearchHandlerUsesOptionalAuthForFavoritesAndAdminAlbumVisibility(t *testing.T) {
 	store := newTestTrackStore(t)
 	auth := newAuthManager([]byte("test-secret"), time.Hour, 24*time.Hour)
