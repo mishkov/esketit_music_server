@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -83,6 +84,178 @@ func TestDeleteTrackKeepsUnavailablePlaylistEntry(t *testing.T) {
 	}
 	if tracksPage.Items[0].Name != "Track" {
 		t.Fatalf("playlist track name = %q, want Track", tracksPage.Items[0].Name)
+	}
+}
+
+func TestSharedPlaylistTokenLifecycle(t *testing.T) {
+	store := newTestTrackStore(t)
+
+	user, err := store.createUser("owner@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+
+	shared, err := store.createPlaylist(user.ID, upsertPlaylistRequest{
+		Name:        "Shared Mix",
+		Description: "Generated link mix",
+		Visibility:  playlistVisibilityShared,
+	})
+	if err != nil {
+		t.Fatalf("createPlaylist() error = %v", err)
+	}
+	if shared.ShareToken == "" {
+		t.Fatal("shared.ShareToken = empty, want generated token")
+	}
+	if _, ok := store.getSharedPlaylist(shared.ShareToken); !ok {
+		t.Fatal("getSharedPlaylist() ok = false, want true")
+	}
+
+	public, exists, err := store.updatePlaylist(user.ID, shared.ID, upsertPlaylistRequest{
+		Name:        "Public Mix",
+		Description: "Direct link mix",
+		Visibility:  playlistVisibilityPublic,
+	})
+	if err != nil || !exists {
+		t.Fatalf("updatePlaylist() public exists=%v err=%v, want exists true and nil err", exists, err)
+	}
+	if public.ShareToken != "" {
+		t.Fatalf("public.ShareToken = %q, want empty", public.ShareToken)
+	}
+	if _, ok := store.getSharedPlaylist(shared.ShareToken); ok {
+		t.Fatal("old shared token still resolves after playlist became public")
+	}
+	if _, ok := store.getPublicPlaylist(shared.ID); !ok {
+		t.Fatal("getPublicPlaylist() ok = false, want true")
+	}
+
+	sharedAgain, exists, err := store.updatePlaylist(user.ID, shared.ID, upsertPlaylistRequest{
+		Name:        "Shared Again",
+		Description: "Generated link mix",
+		Visibility:  playlistVisibilityShared,
+	})
+	if err != nil || !exists {
+		t.Fatalf("updatePlaylist() shared exists=%v err=%v, want exists true and nil err", exists, err)
+	}
+	if sharedAgain.ShareToken == "" {
+		t.Fatal("sharedAgain.ShareToken = empty, want generated token")
+	}
+	if _, ok := store.getSharedPlaylist(sharedAgain.ShareToken); !ok {
+		t.Fatal("new shared token does not resolve")
+	}
+}
+
+func TestPublicAndSharedPlaylistHandlersAllowAnonymousReads(t *testing.T) {
+	store := newTestTrackStore(t)
+
+	user, err := store.createUser("owner@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	artist, albumItem := seedPlaylistTrackDependencies(t, store)
+	trackItem, err := store.create(upsertTrackRequest{
+		Name:          "Open Track",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       albumItem.ID,
+		AudioFilePath: "/api/songs/open-track.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+
+	publicPlaylist, err := store.createPlaylist(user.ID, upsertPlaylistRequest{
+		Name:        "Public Mix",
+		Description: "Direct link mix",
+		Visibility:  playlistVisibilityPublic,
+	})
+	if err != nil {
+		t.Fatalf("createPlaylist() public error = %v", err)
+	}
+	sharedPlaylist, err := store.createPlaylist(user.ID, upsertPlaylistRequest{
+		Name:        "Shared Mix",
+		Description: "Generated link mix",
+		Visibility:  playlistVisibilityShared,
+	})
+	if err != nil {
+		t.Fatalf("createPlaylist() shared error = %v", err)
+	}
+	privatePlaylist, err := store.createPlaylist(user.ID, upsertPlaylistRequest{
+		Name:        "Private Mix",
+		Description: "Owner only mix",
+		Visibility:  playlistVisibilityPrivate,
+	})
+	if err != nil {
+		t.Fatalf("createPlaylist() private error = %v", err)
+	}
+	if err := store.addTrackToPlaylists(user.ID, trackItem.ID, []int64{publicPlaylist.ID, sharedPlaylist.ID}); err != nil {
+		t.Fatalf("addTrackToPlaylists() error = %v", err)
+	}
+	if err := store.setFavoriteTrack(user.ID, trackItem.ID, true); err != nil {
+		t.Fatalf("setFavoriteTrack() error = %v", err)
+	}
+
+	publicHandler := getPublicPlaylistByRouteHandler(store)
+	req := httptest.NewRequest(http.MethodGet, "/api/public/playlists/"+strconv.FormatInt(publicPlaylist.ID, 10), nil)
+	rec := httptest.NewRecorder()
+	publicHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("public playlist status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var publicGot playlistResponse
+	if err := json.NewDecoder(rec.Body).Decode(&publicGot); err != nil {
+		t.Fatalf("Decode() public playlist error = %v", err)
+	}
+	if publicGot.ID != publicPlaylist.ID || publicGot.ShareToken != "" {
+		t.Fatalf("public playlist response = %#v, want id %d and no share token", publicGot, publicPlaylist.ID)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/public/playlists/"+strconv.FormatInt(privatePlaylist.ID, 10), nil)
+	rec = httptest.NewRecorder()
+	publicHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("private via public status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/public/playlists/"+strconv.FormatInt(sharedPlaylist.ID, 10), nil)
+	rec = httptest.NewRecorder()
+	publicHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("shared via public status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/public/playlists/"+strconv.FormatInt(publicPlaylist.ID, 10)+"/tracks", nil)
+	rec = httptest.NewRecorder()
+	publicHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("public tracks status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var tracksGot paginatedTracks
+	if err := json.NewDecoder(rec.Body).Decode(&tracksGot); err != nil {
+		t.Fatalf("Decode() public tracks error = %v", err)
+	}
+	if len(tracksGot.Items) != 1 || tracksGot.Items[0].ID != trackItem.ID || tracksGot.Items[0].IsFavorite {
+		t.Fatalf("public tracks = %#v, want anonymous non-favorite track", tracksGot.Items)
+	}
+
+	sharedHandler := getSharedPlaylistByRouteHandler(store)
+	req = httptest.NewRequest(http.MethodGet, "/api/shared/playlists/"+sharedPlaylist.ShareToken, nil)
+	rec = httptest.NewRecorder()
+	sharedHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("shared playlist status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var sharedGot playlistResponse
+	if err := json.NewDecoder(rec.Body).Decode(&sharedGot); err != nil {
+		t.Fatalf("Decode() shared playlist error = %v", err)
+	}
+	if sharedGot.ID != sharedPlaylist.ID || sharedGot.ShareToken != "" {
+		t.Fatalf("shared playlist response = %#v, want id %d and no share token", sharedGot, sharedPlaylist.ID)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/shared/playlists/not-a-real-token", nil)
+	rec = httptest.NewRecorder()
+	sharedHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("wrong shared token status = %d, want %d", rec.Code, http.StatusNotFound)
 	}
 }
 
@@ -327,6 +500,81 @@ func TestSearchHandlerReturnsCombinedPaginatedResults(t *testing.T) {
 	}
 	if got.Items[0].Album == nil || got.Items[0].Album.Title != "Dreamscape" {
 		t.Fatalf("got.Items[0].Album = %#v, want Dreamscape", got.Items[0].Album)
+	}
+}
+
+func TestSearchHandlerIncludesDiscoverablePlaylists(t *testing.T) {
+	store := newTestTrackStore(t)
+	auth := newAuthManager([]byte("test-secret"), time.Hour, 24*time.Hour)
+	handler := searchHandler(store, auth)
+
+	owner, err := store.createUser("owner@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() owner error = %v", err)
+	}
+	other, err := store.createUser("other@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() other error = %v", err)
+	}
+
+	ownerPublic, err := store.createPlaylist(owner.ID, upsertPlaylistRequest{
+		Name:        "Roadtrip Owner Public",
+		Description: "Searchable",
+		Visibility:  playlistVisibilityPublic,
+	})
+	if err != nil {
+		t.Fatalf("createPlaylist() owner public error = %v", err)
+	}
+	ownerPrivate, err := store.createPlaylist(owner.ID, upsertPlaylistRequest{
+		Name:        "Roadtrip Owner Private",
+		Description: "Owner searchable",
+		Visibility:  playlistVisibilityPrivate,
+	})
+	if err != nil {
+		t.Fatalf("createPlaylist() owner private error = %v", err)
+	}
+	ownerShared, err := store.createPlaylist(owner.ID, upsertPlaylistRequest{
+		Name:        "Roadtrip Owner Shared",
+		Description: "Owner searchable",
+		Visibility:  playlistVisibilityShared,
+	})
+	if err != nil {
+		t.Fatalf("createPlaylist() owner shared error = %v", err)
+	}
+	otherPublic, err := store.createPlaylist(other.ID, upsertPlaylistRequest{
+		Name:        "Roadtrip Other Public",
+		Description: "Searchable",
+		Visibility:  playlistVisibilityPublic,
+	})
+	if err != nil {
+		t.Fatalf("createPlaylist() other public error = %v", err)
+	}
+	otherShared, err := store.createPlaylist(other.ID, upsertPlaylistRequest{
+		Name:        "Roadtrip Other Shared",
+		Description: "Link only",
+		Visibility:  playlistVisibilityShared,
+	})
+	if err != nil {
+		t.Fatalf("createPlaylist() other shared error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/search?query=roadtrip&pageSize=100", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	assertSearchPlaylistIDs(t, rec, []int64{ownerPublic.ID, otherPublic.ID})
+
+	token, _, err := auth.createAccessToken(owner.ID)
+	if err != nil {
+		t.Fatalf("createAccessToken() error = %v", err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/search?query=roadtrip&pageSize=100", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	assertSearchPlaylistIDs(t, rec, []int64{ownerPrivate.ID, ownerPublic.ID, ownerShared.ID, otherPublic.ID})
+
+	if otherShared.ShareToken == "" {
+		t.Fatal("otherShared.ShareToken = empty, want generated token")
 	}
 }
 
@@ -1096,6 +1344,35 @@ func assertSearchResponse(t *testing.T, rec *httptest.ResponseRecorder, wantTota
 	}
 	if foundEmptyAlbum != wantEmptyAlbum {
 		t.Fatalf("foundEmptyAlbum = %v, want %v", foundEmptyAlbum, wantEmptyAlbum)
+	}
+}
+
+func assertSearchPlaylistIDs(t *testing.T, rec *httptest.ResponseRecorder, wantIDs []int64) {
+	t.Helper()
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var got paginatedSearchResults
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+
+	gotIDs := make(map[int64]struct{})
+	for _, item := range got.Items {
+		if item.Type != "playlist" || item.Playlist == nil {
+			continue
+		}
+		gotIDs[item.Playlist.ID] = struct{}{}
+	}
+	if len(gotIDs) != len(wantIDs) {
+		t.Fatalf("playlist result count = %d, want %d; results=%#v", len(gotIDs), len(wantIDs), got.Items)
+	}
+	for _, wantID := range wantIDs {
+		if _, ok := gotIDs[wantID]; !ok {
+			t.Fatalf("missing playlist id %d in results %#v", wantID, got.Items)
+		}
 	}
 }
 

@@ -38,6 +38,7 @@ const (
 	maxSongUploadSize         = 512 << 20
 	maxPlaylistNameLength     = 200
 	maxPlaylistDescLength     = 1000
+	playlistShareTokenBytes   = 32
 	defaultAutoplayCount      = 1
 	maxAutoplayCount          = 50
 	roleAdmin                 = "admin"
@@ -143,6 +144,7 @@ type playlist struct {
 	Description    string          `json:"description"`
 	CoverImagePath string          `json:"coverImagePath"`
 	Visibility     string          `json:"visibility"`
+	ShareToken     string          `json:"shareToken,omitempty"`
 	TrackItems     []playlistTrack `json:"trackItems"`
 	System         bool            `json:"system"`
 	Kind           string          `json:"kind"`
@@ -270,6 +272,7 @@ type playlistResponse struct {
 	TrackCount     int    `json:"trackCount"`
 	System         bool   `json:"system"`
 	IsFavorites    bool   `json:"isFavorites"`
+	ShareToken     string `json:"shareToken,omitempty"`
 }
 
 type dbFile struct {
@@ -391,10 +394,11 @@ type searchListFilter struct {
 }
 
 type searchResultItem struct {
-	Type   string         `json:"type"`
-	Author *author        `json:"author,omitempty"`
-	Album  *album         `json:"album,omitempty"`
-	Track  *trackResponse `json:"track,omitempty"`
+	Type     string            `json:"type"`
+	Author   *author           `json:"author,omitempty"`
+	Album    *album            `json:"album,omitempty"`
+	Track    *trackResponse    `json:"track,omitempty"`
+	Playlist *playlistResponse `json:"playlist,omitempty"`
 }
 
 type paginatedSearchResults struct {
@@ -586,6 +590,8 @@ func main() {
 	mux.Handle("GET /api/playlists/", requireAuth(auth, store, getPlaylistByRouteHandler(store)))
 	mux.Handle("PUT /api/playlists/", requireAuth(auth, store, updatePlaylistByRouteHandler(store)))
 	mux.Handle("DELETE /api/playlists/", requireAuth(auth, store, deletePlaylistByRouteHandler(store)))
+	mux.HandleFunc("GET /api/public/playlists/", getPublicPlaylistByRouteHandler(store))
+	mux.HandleFunc("GET /api/shared/playlists/", getSharedPlaylistByRouteHandler(store))
 	mux.Handle("POST /api/autoplay/next", requireAuth(auth, store, autoplayNextHandler(store)))
 	mux.HandleFunc("GET /api/tracks", listTracksHandler(store, auth))
 	mux.Handle("POST /api/tracks", requireRole(auth, store, roleAdmin, createTrackHandler(store)))
@@ -1011,10 +1017,14 @@ func newTrackStore(path string) (*trackStore, error) {
 		playlistItem.Description = strings.TrimSpace(playlistItem.Description)
 		playlistItem.CoverImagePath = strings.TrimSpace(playlistItem.CoverImagePath)
 		playlistItem.Visibility = normalizePlaylistVisibility(playlistItem.Visibility)
+		playlistItem.ShareToken = strings.TrimSpace(playlistItem.ShareToken)
 		playlistItem.Kind = normalizePlaylistKind(playlistItem.Kind, playlistItem.System)
 		playlistItem.TrackItems = normalizePlaylistTrackItems(playlistItem.TrackItems)
 		if playlistItem.ID <= 0 || playlistItem.UserID <= 0 || playlistItem.Name == "" || playlistItem.Visibility == "" || playlistItem.Kind == "" {
 			continue
+		}
+		if err := s.normalizePlaylistSharingLocked(&playlistItem); err != nil {
+			return nil, err
 		}
 		s.playlists[playlistItem.ID] = playlistItem
 		if playlistItem.ID >= s.nextPlaylistID {
@@ -1559,6 +1569,9 @@ func (s *trackStore) createPlaylist(userID int64, req upsertPlaylistRequest) (pl
 		System:         false,
 		Kind:           playlistKindCustom,
 	}
+	if err := s.normalizePlaylistSharingLocked(&p); err != nil {
+		return playlistResponse{}, err
+	}
 	if err := validatePlaylist(p); err != nil {
 		return playlistResponse{}, err
 	}
@@ -1590,6 +1603,9 @@ func (s *trackStore) updatePlaylist(userID, playlistID int64, req upsertPlaylist
 	updated.Description = strings.TrimSpace(req.Description)
 	updated.CoverImagePath = strings.TrimSpace(req.CoverImagePath)
 	updated.Visibility = normalizePlaylistVisibility(req.Visibility)
+	if err := s.normalizePlaylistSharingLocked(&updated); err != nil {
+		return playlistResponse{}, true, err
+	}
 	if err := validatePlaylist(updated); err != nil {
 		return playlistResponse{}, true, err
 	}
@@ -1659,6 +1675,82 @@ func (s *trackStore) getPlaylistTracks(userID, playlistID int64, page, pageSize 
 		TotalItems: totalItems,
 		TotalPages: totalPages,
 	}, true
+}
+
+func (s *trackStore) getPublicPlaylist(playlistID int64) (playlistResponse, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	p, ok := s.playlists[playlistID]
+	if !ok || p.Visibility != playlistVisibilityPublic {
+		return playlistResponse{}, false
+	}
+	return publicPlaylistResponse(s.buildPlaylistResponseLocked(p)), true
+}
+
+func (s *trackStore) getPublicPlaylistTracks(playlistID int64, page, pageSize int64) (paginatedTracks, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	p, ok := s.playlists[playlistID]
+	if !ok || p.Visibility != playlistVisibilityPublic {
+		return paginatedTracks{}, false
+	}
+	return s.buildPublicPlaylistTracksPageLocked(p, page, pageSize), true
+}
+
+func (s *trackStore) getSharedPlaylist(shareToken string) (playlistResponse, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	p, ok := s.findSharedPlaylistByTokenLocked(shareToken)
+	if !ok {
+		return playlistResponse{}, false
+	}
+	return publicPlaylistResponse(s.buildPlaylistResponseLocked(p)), true
+}
+
+func (s *trackStore) getSharedPlaylistTracks(shareToken string, page, pageSize int64) (paginatedTracks, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	p, ok := s.findSharedPlaylistByTokenLocked(shareToken)
+	if !ok {
+		return paginatedTracks{}, false
+	}
+	return s.buildPublicPlaylistTracksPageLocked(p, page, pageSize), true
+}
+
+func (s *trackStore) buildPublicPlaylistTracksPageLocked(p playlist, page, pageSize int64) paginatedTracks {
+	items := make([]trackResponse, 0, len(p.TrackItems))
+	favoriteIDs := map[int64]struct{}{}
+	for _, item := range p.TrackItems {
+		items = append(items, s.buildPlaylistTrackResponseLocked(item, favoriteIDs))
+	}
+
+	normalizedPage := normalizePage(int(page))
+	normalizedPageSize := normalizePageSize(int(pageSize))
+	totalItems := len(items)
+	totalPages := 0
+	if totalItems > 0 {
+		totalPages = (totalItems + normalizedPageSize - 1) / normalizedPageSize
+	}
+	start := (normalizedPage - 1) * normalizedPageSize
+	if start > totalItems {
+		start = totalItems
+	}
+	end := start + normalizedPageSize
+	if end > totalItems {
+		end = totalItems
+	}
+
+	return paginatedTracks{
+		Items:      items[start:end],
+		Page:       normalizedPage,
+		PageSize:   normalizedPageSize,
+		TotalItems: totalItems,
+		TotalPages: totalPages,
+	}
 }
 
 func (s *trackStore) addTrackToPlaylists(userID, trackID int64, playlistIDs []int64) error {
@@ -1831,7 +1923,7 @@ func (s *trackStore) search(userID int64, filter searchListFilter) paginatedSear
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	items := make([]searchResultItem, 0, len(s.authors)+len(s.albums)+len(s.tracks))
+	items := make([]searchResultItem, 0, len(s.authors)+len(s.albums)+len(s.tracks)+len(s.playlists))
 	query := strings.ToLower(strings.TrimSpace(filter.Query))
 	favoriteIDs := s.favoriteTrackSetLocked(userID)
 
@@ -1872,6 +1964,23 @@ func (s *trackStore) search(userID int64, filter searchListFilter) paginatedSear
 		items = append(items, searchResultItem{
 			Type:  "track",
 			Track: &trackCopy,
+		})
+	}
+
+	for _, p := range s.playlists {
+		if !playlistVisibleInSearch(p, userID) {
+			continue
+		}
+		if query != "" && !strings.Contains(strings.ToLower(p.Name), query) && !strings.Contains(strings.ToLower(p.Description), query) {
+			continue
+		}
+		playlistCopy := s.buildPlaylistResponseLocked(p)
+		if p.UserID != userID {
+			playlistCopy = publicPlaylistResponse(playlistCopy)
+		}
+		items = append(items, searchResultItem{
+			Type:     "playlist",
+			Playlist: &playlistCopy,
 		})
 	}
 
@@ -2822,6 +2931,94 @@ func getPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
 		page := int64(parseIntWithDefault(r.URL.Query().Get("page"), 1))
 		pageSize := int64(parseIntWithDefault(r.URL.Query().Get("pageSize"), 20))
 		items, exists := store.getPlaylistTracks(userID, id, page, pageSize)
+		if !exists {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
+	}
+}
+
+func getPublicPlaylistByRouteHandler(store *trackStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/tracks") {
+			getPublicPlaylistTracksHandler(store).ServeHTTP(w, r)
+			return
+		}
+		getPublicPlaylistByIDHandler(store).ServeHTTP(w, r)
+	}
+}
+
+func getPublicPlaylistByIDHandler(store *trackStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := parsePublicPlaylistID(r.URL.Path)
+		if err != nil {
+			http.Error(w, "invalid playlist id", http.StatusBadRequest)
+			return
+		}
+		p, ok := store.getPublicPlaylist(id)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, p)
+	}
+}
+
+func getPublicPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := parsePublicPlaylistTracksID(r.URL.Path)
+		if err != nil {
+			http.Error(w, "invalid playlist id", http.StatusBadRequest)
+			return
+		}
+		page := int64(parseIntWithDefault(r.URL.Query().Get("page"), 1))
+		pageSize := int64(parseIntWithDefault(r.URL.Query().Get("pageSize"), 20))
+		items, exists := store.getPublicPlaylistTracks(id, page, pageSize)
+		if !exists {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
+	}
+}
+
+func getSharedPlaylistByRouteHandler(store *trackStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/tracks") {
+			getSharedPlaylistTracksHandler(store).ServeHTTP(w, r)
+			return
+		}
+		getSharedPlaylistByTokenHandler(store).ServeHTTP(w, r)
+	}
+}
+
+func getSharedPlaylistByTokenHandler(store *trackStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		shareToken, err := parseSharedPlaylistToken(r.URL.Path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		p, ok := store.getSharedPlaylist(shareToken)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, p)
+	}
+}
+
+func getSharedPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		shareToken, err := parseSharedPlaylistTracksToken(r.URL.Path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		page := int64(parseIntWithDefault(r.URL.Query().Get("page"), 1))
+		pageSize := int64(parseIntWithDefault(r.URL.Query().Get("pageSize"), 20))
+		items, exists := store.getSharedPlaylistTracks(shareToken, page, pageSize)
 		if !exists {
 			http.NotFound(w, r)
 			return
@@ -3925,6 +4122,22 @@ func parsePlaylistTracksID(path string) (int64, error) {
 	return parseResourceID(strings.TrimSuffix(path, "/tracks"), "/api/playlists/")
 }
 
+func parsePublicPlaylistID(path string) (int64, error) {
+	return parseResourceID(path, "/api/public/playlists/")
+}
+
+func parsePublicPlaylistTracksID(path string) (int64, error) {
+	return parseResourceID(strings.TrimSuffix(path, "/tracks"), "/api/public/playlists/")
+}
+
+func parseSharedPlaylistToken(path string) (string, error) {
+	return parseTokenResource(path, "/api/shared/playlists/")
+}
+
+func parseSharedPlaylistTracksToken(path string) (string, error) {
+	return parseTokenResource(strings.TrimSuffix(path, "/tracks"), "/api/shared/playlists/")
+}
+
 func parsePlaylistTrackOrderID(path string) (int64, error) {
 	return parseResourceID(strings.TrimSuffix(path, "/tracks/order"), "/api/playlists/")
 }
@@ -3939,6 +4152,14 @@ func parseResourceID(path, prefix string) (int64, error) {
 		return 0, errors.New("invalid id")
 	}
 	return id, nil
+}
+
+func parseTokenResource(path, prefix string) (string, error) {
+	token := strings.TrimSpace(strings.TrimPrefix(path, prefix))
+	if token == "" || strings.Contains(token, "/") {
+		return "", errors.New("invalid token")
+	}
+	return token, nil
 }
 
 func normalizeNames(names []string) []string {
@@ -4073,6 +4294,74 @@ func normalizePlaylistVisibility(value string) string {
 	default:
 		return ""
 	}
+}
+
+func (s *trackStore) normalizePlaylistSharingLocked(p *playlist) error {
+	if p.Visibility != playlistVisibilityShared {
+		p.ShareToken = ""
+		return nil
+	}
+	p.ShareToken = strings.TrimSpace(p.ShareToken)
+	if p.ShareToken != "" && !s.playlistShareTokenInUseLocked(p.ShareToken, p.ID) {
+		return nil
+	}
+	token, err := s.newPlaylistShareTokenLocked(p.ID)
+	if err != nil {
+		return err
+	}
+	p.ShareToken = token
+	return nil
+}
+
+func (s *trackStore) newPlaylistShareTokenLocked(excludePlaylistID int64) (string, error) {
+	for attempts := 0; attempts < 10; attempts++ {
+		token, err := randomURLToken(playlistShareTokenBytes)
+		if err != nil {
+			return "", err
+		}
+		if !s.playlistShareTokenInUseLocked(token, excludePlaylistID) {
+			return token, nil
+		}
+	}
+	return "", errors.New("failed to generate unique playlist share token")
+}
+
+func (s *trackStore) playlistShareTokenInUseLocked(token string, excludePlaylistID int64) bool {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return false
+	}
+	for _, p := range s.playlists {
+		if p.ID != excludePlaylistID && p.ShareToken == token {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *trackStore) findSharedPlaylistByTokenLocked(shareToken string) (playlist, bool) {
+	shareToken = strings.TrimSpace(shareToken)
+	if shareToken == "" {
+		return playlist{}, false
+	}
+	for _, p := range s.playlists {
+		if p.Visibility == playlistVisibilityShared && p.ShareToken == shareToken {
+			return p, true
+		}
+	}
+	return playlist{}, false
+}
+
+func playlistVisibleInSearch(p playlist, userID int64) bool {
+	return p.Visibility == playlistVisibilityPublic || (userID > 0 && p.UserID == userID)
+}
+
+func randomURLToken(byteCount int) (string, error) {
+	tokenBytes := make([]byte, byteCount)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(tokenBytes), nil
 }
 
 func normalizePlaylistKind(value string, system bool) string {
@@ -4387,7 +4676,13 @@ func (s *trackStore) buildPlaylistResponseLocked(p playlist) playlistResponse {
 		TrackCount:     len(p.TrackItems),
 		System:         p.System,
 		IsFavorites:    p.Kind == playlistKindFavorites,
+		ShareToken:     p.ShareToken,
 	}
+}
+
+func publicPlaylistResponse(p playlistResponse) playlistResponse {
+	p.ShareToken = ""
+	return p
 }
 
 func (s *trackStore) buildPlaylistTrackResponseLocked(item playlistTrack, favoriteIDs map[int64]struct{}) trackResponse {
@@ -4851,6 +5146,10 @@ func searchResultSortKey(item searchResultItem) (string, string, int64) {
 	case "track":
 		if item.Track != nil {
 			return strings.ToLower(item.Track.Name), item.Type, item.Track.ID
+		}
+	case "playlist":
+		if item.Playlist != nil {
+			return strings.ToLower(item.Playlist.Name), item.Type, item.Playlist.ID
 		}
 	}
 	return "", item.Type, 0

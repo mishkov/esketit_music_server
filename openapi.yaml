@@ -848,6 +848,117 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /api/public/playlists/{id}:
+    get:
+      tags: [Playlists]
+      summary: Get a public playlist by ID
+      description: |
+        Anonymous-safe playlist read endpoint. Only playlists with `visibility`
+        set to `public` are returned; private and shared playlists return 404.
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '200':
+          description: Public playlist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Playlist'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/public/playlists/{id}/tracks:
+    get:
+      tags: [Playlists]
+      summary: List tracks for a public playlist
+      description: |
+        Anonymous-safe playlist tracks endpoint. Only playlists with
+        `visibility` set to `public` are returned.
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Public playlist track page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedTracks'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/shared/playlists/{shareToken}:
+    get:
+      tags: [Playlists]
+      summary: Get a shared playlist by generated link token
+      description: |
+        Anonymous-safe generated-link endpoint. Only playlists with
+        `visibility` set to `shared` and a matching share token are returned.
+      parameters:
+        - name: shareToken
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Shared playlist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Playlist'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/shared/playlists/{shareToken}/tracks:
+    get:
+      tags: [Playlists]
+      summary: List tracks for a shared playlist by generated link token
+      parameters:
+        - name: shareToken
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Shared playlist track page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedTracks'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /api/playlists/{id}/tracks/order:
     put:
       tags: [Playlists]
@@ -997,13 +1108,16 @@ paths:
   /api/search:
     get:
       tags: [Search]
-      summary: Search authors, albums, and tracks
+      summary: Search authors, albums, tracks, and playlists
       description: |
-        Public substring search across author names, album titles, and track names.
-        Results are returned as a single combined paginated list.
+        Public substring search across author names, album titles, track names,
+        and discoverable playlist names/descriptions. Results are returned as a
+        single combined paginated list.
 
         Anonymous and listener requests omit albums whose `trackIds` array is empty.
         Admin requests may include empty albums when authenticated.
+        Anonymous users can discover public playlists; authenticated users can
+        also discover their own private, public, and shared playlists.
       parameters:
         - in: query
           name: page
@@ -1995,6 +2109,9 @@ components:
           type: boolean
         isFavorites:
           type: boolean
+        shareToken:
+          type: string
+          description: Present for owner-facing responses when visibility is `shared`.
       required: [id, userId, name, description, coverImagePath, visibility, trackCount, system, isFavorites]
 
     UpsertPlaylistRequest:
@@ -2155,13 +2272,15 @@ components:
       properties:
         type:
           type: string
-          enum: [author, album, track]
+          enum: [author, album, track, playlist]
         author:
           $ref: '#/components/schemas/Author'
         album:
           $ref: '#/components/schemas/Album'
         track:
           $ref: '#/components/schemas/Track'
+        playlist:
+          $ref: '#/components/schemas/Playlist'
       required: [type]
 
     PaginatedSearchResults:
