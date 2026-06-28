@@ -1071,6 +1071,116 @@ func TestUploadAlbumCoverHandlerAllowsSameOriginalFileNameTwice(t *testing.T) {
 	}
 }
 
+func TestUploadPlaylistCoverHandlerUpdatesPlaylistCover(t *testing.T) {
+	store := newTestTrackStore(t)
+	auth := newAuthManager([]byte("test-secret"), time.Hour, 24*time.Hour)
+	albumCoversDir := t.TempDir()
+	handler := requireAuth(auth, store, uploadPlaylistCoverByRouteHandler(store, albumCoversDir))
+
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	playlistItem, err := store.createPlaylist(user.ID, upsertPlaylistRequest{
+		Name:        "Mix",
+		Description: "Playlist with cover",
+		Visibility:  playlistVisibilityPrivate,
+	})
+	if err != nil {
+		t.Fatalf("createPlaylist() error = %v", err)
+	}
+	token, _, err := auth.createAccessToken(user.ID)
+	if err != nil {
+		t.Fatalf("createAccessToken() error = %v", err)
+	}
+
+	target := "/api/playlists/" + strconv.FormatInt(playlistItem.ID, 10) + "/cover"
+	req := newMultipartUploadRequest(t, http.MethodPost, target, "cover.jpg", []byte("cover-data"))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var got playlistResponse
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if got.ID != playlistItem.ID {
+		t.Fatalf("got.ID = %d, want %d", got.ID, playlistItem.ID)
+	}
+	if !strings.HasPrefix(got.CoverImagePath, "/api/album-covers/cover-") {
+		t.Fatalf("got.CoverImagePath = %q, want uploaded album cover path", got.CoverImagePath)
+	}
+	if !strings.HasSuffix(got.CoverImagePath, ".jpg") {
+		t.Fatalf("got.CoverImagePath = %q, want .jpg suffix", got.CoverImagePath)
+	}
+
+	storedName, err := url.PathUnescape(strings.TrimPrefix(got.CoverImagePath, "/api/album-covers/"))
+	if err != nil {
+		t.Fatalf("PathUnescape() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(albumCoversDir, storedName)); err != nil {
+		t.Fatalf("stored playlist cover Stat() error = %v", err)
+	}
+	storedPlaylist, ok := store.getPlaylist(user.ID, playlistItem.ID)
+	if !ok {
+		t.Fatalf("getPlaylist() ok = false, want true")
+	}
+	if storedPlaylist.CoverImagePath != got.CoverImagePath {
+		t.Fatalf("storedPlaylist.CoverImagePath = %q, want %q", storedPlaylist.CoverImagePath, got.CoverImagePath)
+	}
+}
+
+func TestUploadPlaylistCoverHandlerRejectsNonOwnerBeforeWritingFile(t *testing.T) {
+	store := newTestTrackStore(t)
+	auth := newAuthManager([]byte("test-secret"), time.Hour, 24*time.Hour)
+	albumCoversDir := t.TempDir()
+	handler := requireAuth(auth, store, uploadPlaylistCoverByRouteHandler(store, albumCoversDir))
+
+	owner, err := store.createUser("owner@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() owner error = %v", err)
+	}
+	other, err := store.createUser("other@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() other error = %v", err)
+	}
+	playlistItem, err := store.createPlaylist(owner.ID, upsertPlaylistRequest{
+		Name:        "Owner Mix",
+		Description: "Owned playlist",
+		Visibility:  playlistVisibilityPrivate,
+	})
+	if err != nil {
+		t.Fatalf("createPlaylist() error = %v", err)
+	}
+	token, _, err := auth.createAccessToken(other.ID)
+	if err != nil {
+		t.Fatalf("createAccessToken() error = %v", err)
+	}
+
+	target := "/api/playlists/" + strconv.FormatInt(playlistItem.ID, 10) + "/cover"
+	req := newMultipartUploadRequest(t, http.MethodPost, target, "cover.jpg", []byte("cover-data"))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+	entries, err := os.ReadDir(albumCoversDir)
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("album covers dir entries = %d, want 0", len(entries))
+	}
+}
+
 func TestAutoplayNextHandlerSupportsAllSourceTypes(t *testing.T) {
 	store := newTestTrackStore(t)
 	auth := newAuthManager([]byte("test-secret"), time.Hour, 24*time.Hour)

@@ -587,6 +587,7 @@ func main() {
 	mux.Handle("POST /api/album-covers/import", requireRole(auth, store, roleAdmin, importAlbumCoverHandler(albumCoverService)))
 	mux.Handle("GET /api/playlists", requireAuth(auth, store, listPlaylistsHandler(store)))
 	mux.Handle("POST /api/playlists", requireAuth(auth, store, createPlaylistHandler(store)))
+	mux.Handle("POST /api/playlists/", requireAuth(auth, store, uploadPlaylistCoverByRouteHandler(store, albumCoversDir)))
 	mux.Handle("GET /api/playlists/", requireAuth(auth, store, getPlaylistByRouteHandler(store)))
 	mux.Handle("PUT /api/playlists/", requireAuth(auth, store, updatePlaylistByRouteHandler(store)))
 	mux.Handle("DELETE /api/playlists/", requireAuth(auth, store, deletePlaylistByRouteHandler(store)))
@@ -1610,6 +1611,42 @@ func (s *trackStore) updatePlaylist(userID, playlistID int64, req upsertPlaylist
 		return playlistResponse{}, true, err
 	}
 
+	s.playlists[playlistID] = updated
+	if err := s.persistLocked(); err != nil {
+		s.playlists[playlistID] = current
+		return playlistResponse{}, true, err
+	}
+	return s.buildPlaylistResponseLocked(updated), true, nil
+}
+
+func (s *trackStore) validatePlaylistCoverUploadTarget(userID, playlistID int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current, ok := s.playlists[playlistID]
+	if !ok || current.UserID != userID {
+		return false, nil
+	}
+	if current.Kind == playlistKindFavorites {
+		return true, errFavoritePlaylistImmutable
+	}
+	return true, nil
+}
+
+func (s *trackStore) updatePlaylistCoverImage(userID, playlistID int64, coverImagePath string) (playlistResponse, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current, ok := s.playlists[playlistID]
+	if !ok || current.UserID != userID {
+		return playlistResponse{}, false, nil
+	}
+	if current.Kind == playlistKindFavorites {
+		return playlistResponse{}, true, errFavoritePlaylistImmutable
+	}
+
+	updated := current
+	updated.CoverImagePath = strings.TrimSpace(coverImagePath)
 	s.playlists[playlistID] = updated
 	if err := s.persistLocked(); err != nil {
 		s.playlists[playlistID] = current
@@ -2661,6 +2698,13 @@ func uploadMediaFile(w http.ResponseWriter, r *http.Request, dir, createFailureM
 	}, nil
 }
 
+func removeUploadedMediaFile(dir, name string) {
+	if strings.TrimSpace(name) == "" {
+		return
+	}
+	_ = os.Remove(filepath.Join(dir, name))
+}
+
 func randomizedStoredFileName(name string) (string, error) {
 	ext := filepath.Ext(name)
 	base := strings.TrimSuffix(name, ext)
@@ -3024,6 +3068,59 @@ func getSharedPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, items)
+	}
+}
+
+func uploadPlaylistCoverByRouteHandler(store *trackStore, albumCoversDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, ok := userIDFromContext(r.Context())
+		if !ok {
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return
+		}
+		id, err := parsePlaylistCoverID(r.URL.Path)
+		if err != nil {
+			http.Error(w, "invalid playlist id", http.StatusBadRequest)
+			return
+		}
+
+		exists, err := store.validatePlaylistCoverUploadTarget(userID, id)
+		if !exists {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			if errors.Is(err, errFavoritePlaylistImmutable) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			http.Error(w, "failed to update playlist cover", http.StatusInternalServerError)
+			return
+		}
+
+		info, err := uploadMediaFile(w, r, albumCoversDir, "failed to create album cover file", "/api/album-covers/")
+		if err != nil {
+			writeUploadError(w, err)
+			return
+		}
+
+		p, exists, err := store.updatePlaylistCoverImage(userID, id, info.URL)
+		if !exists {
+			removeUploadedMediaFile(albumCoversDir, info.Name)
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			removeUploadedMediaFile(albumCoversDir, info.Name)
+			if errors.Is(err, errFavoritePlaylistImmutable) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			http.Error(w, "failed to update playlist cover", http.StatusInternalServerError)
+			return
+		}
+
+		writeJSON(w, http.StatusOK, p)
 	}
 }
 
@@ -4120,6 +4217,14 @@ func parsePlaylistID(path string) (int64, error) {
 
 func parsePlaylistTracksID(path string) (int64, error) {
 	return parseResourceID(strings.TrimSuffix(path, "/tracks"), "/api/playlists/")
+}
+
+func parsePlaylistCoverID(path string) (int64, error) {
+	const suffix = "/cover"
+	if !strings.HasSuffix(path, suffix) {
+		return 0, errors.New("invalid playlist cover route")
+	}
+	return parseResourceID(strings.TrimSuffix(path, suffix), "/api/playlists/")
 }
 
 func parsePublicPlaylistID(path string) (int64, error) {

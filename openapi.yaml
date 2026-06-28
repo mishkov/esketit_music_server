@@ -267,7 +267,7 @@ paths:
       summary: Upload album cover
       description: |
         Upload an album cover file. The returned file can later be referenced from album
-        `coverImagePath`. Preferred write format is `/api/album-covers/{name}`.
+        or playlist `coverImagePath`. Preferred write format is `/api/album-covers/{name}`.
 
         The server preserves the original extension but rewrites the stored filename
         by appending a random suffix before the extension.
@@ -806,6 +806,41 @@ paths:
       responses:
         '204':
           description: Deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/playlists/{id}/cover:
+    post:
+      tags: [Playlists]
+      summary: Upload playlist cover image
+      description: |
+        Upload a cover image for one of the current user's custom playlists.
+        The file is stored under `/api/album-covers/{name}` and the playlist's
+        `coverImagePath` is updated to that path. Favorites playlists cannot be
+        modified through this endpoint.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/FileUploadRequest'
+      responses:
+        '200':
+          description: Updated playlist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Playlist'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
