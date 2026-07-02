@@ -1,4 +1,7 @@
 tracks_db.json
+tracks_db.sqlite
+tracks_db.sqlite-shm
+tracks_db.sqlite-wal
 esketit_music_server
 
 .env

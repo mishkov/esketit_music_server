@@ -1389,6 +1389,93 @@ func TestNewTrackStoreNormalizesLegacyBareAudioFilePath(t *testing.T) {
 	}
 }
 
+func TestNewTrackStorePersistsAndReloadsSQLiteData(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "tracks.db")
+	store, err := newTrackStore(dbPath)
+	if err != nil {
+		t.Fatalf("newTrackStore() error = %v", err)
+	}
+
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	artist, albumItem := seedPlaylistTrackDependencies(t, store)
+	trackItem, err := store.create(upsertTrackRequest{
+		Name:          "Reloaded Track",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       albumItem.ID,
+		AudioFilePath: "/api/songs/reloaded-track.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+	playlistItem, err := store.createPlaylist(user.ID, upsertPlaylistRequest{
+		Name:        "Reloaded Playlist",
+		Description: "Reloaded playlist description",
+		Visibility:  playlistVisibilityPrivate,
+	})
+	if err != nil {
+		t.Fatalf("createPlaylist() error = %v", err)
+	}
+	if err := store.addTrackToPlaylists(user.ID, trackItem.ID, []int64{playlistItem.ID}); err != nil {
+		t.Fatalf("addTrackToPlaylists() error = %v", err)
+	}
+	if err := store.setFavoriteTrack(user.ID, trackItem.ID, true); err != nil {
+		t.Fatalf("setFavoriteTrack() error = %v", err)
+	}
+	plainText := "Reloaded lyrics"
+	if _, _, err := store.upsertLyrics(trackItem.ID, upsertLyricsRequest{
+		Type:      lyricsTypePlain,
+		PlainText: &plainText,
+	}); err != nil {
+		t.Fatalf("upsertLyrics() error = %v", err)
+	}
+	_, rawRefreshToken, err := store.createRefreshSession(user.ID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("createRefreshSession() error = %v", err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	reloaded, err := newTrackStore(dbPath)
+	if err != nil {
+		t.Fatalf("newTrackStore() reload error = %v", err)
+	}
+	defer reloaded.db.Close()
+
+	reloadedTrack, ok := reloaded.getTrackResponse(trackItem.ID, user.ID)
+	if !ok {
+		t.Fatalf("getTrackResponse() ok = false, want true")
+	}
+	if reloadedTrack.Name != "Reloaded Track" || !reloadedTrack.IsFavorite {
+		t.Fatalf("reloaded track = %#v", reloadedTrack)
+	}
+	reloadedUser, ok := reloaded.getUserByEmail("listener@example.com")
+	if !ok || reloadedUser.ID != user.ID {
+		t.Fatalf("reloaded user = %#v, ok=%v", reloadedUser, ok)
+	}
+	tracksPage, ok := reloaded.getPlaylistTracks(user.ID, playlistItem.ID, 1, 20)
+	if !ok || len(tracksPage.Items) != 1 || tracksPage.Items[0].ID != trackItem.ID {
+		t.Fatalf("reloaded playlist tracks = %#v, ok=%v", tracksPage, ok)
+	}
+	reloadedLyrics, err := reloaded.getLyrics(trackItem.ID)
+	if err != nil {
+		t.Fatalf("getLyrics() error = %v", err)
+	}
+	if reloadedLyrics.PlainText == nil || *reloadedLyrics.PlainText != plainText {
+		t.Fatalf("reloaded lyrics = %#v", reloadedLyrics)
+	}
+	deleted, err := reloaded.deleteRefreshSession(rawRefreshToken)
+	if err != nil {
+		t.Fatalf("deleteRefreshSession() error = %v", err)
+	}
+	if !deleted {
+		t.Fatal("deleteRefreshSession() deleted = false, want true")
+	}
+}
+
 func newTestTrackStore(t *testing.T) *trackStore {
 	t.Helper()
 

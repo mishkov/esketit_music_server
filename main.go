@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -27,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 const (
@@ -321,6 +324,7 @@ type legacyTrack struct {
 type trackStore struct {
 	mu               sync.RWMutex
 	path             string
+	db               *sql.DB
 	nextTrackID      int64
 	nextAlbumID      int64
 	nextAuthorID     int64
@@ -536,7 +540,7 @@ func main() {
 
 	tracksDBPath := os.Getenv("TRACKS_DB_PATH")
 	if tracksDBPath == "" {
-		tracksDBPath = "tracks_db.json"
+		tracksDBPath = "tracks.db"
 	}
 
 	authSecret := os.Getenv("AUTH_SECRET")
@@ -637,7 +641,7 @@ func main() {
 	log.Printf("server listening on %s", addr)
 	log.Printf("serving songs from %s", songsDir)
 	log.Printf("serving album covers from %s", albumCoversDir)
-	log.Printf("using tracks database %s", tracksDBPath)
+	log.Printf("using tracks database %s", store.path)
 	log.Printf("telegram state directory %s", telegramStateDir)
 	log.Printf("telegram import temp directory %s", telegramImportTempDir)
 	log.Printf("youtube import temp directory %s", youtubeImportTempDir)
@@ -878,8 +882,9 @@ func newAuthManager(secret []byte, accessTokenTTL, refreshTokenTTL time.Duration
 }
 
 func newTrackStore(path string) (*trackStore, error) {
+	sqlitePath := sqliteStorePath(path)
 	s := &trackStore{
-		path:             path,
+		path:             sqlitePath,
 		nextTrackID:      1,
 		nextAlbumID:      1,
 		nextAuthorID:     1,
@@ -897,21 +902,83 @@ func newTrackStore(path string) (*trackStore, error) {
 		lyricsByTrack:    make(map[int64]lyrics),
 	}
 
-	data, err := os.ReadFile(path)
+	db, err := openSQLiteDB(sqlitePath)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	s.db = db
+
+	if err := s.initSQLiteSchema(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	hasData, err := s.loadSQLiteLocked()
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if !hasData {
+		imported, err := s.importLegacyJSONLocked(path, sqlitePath)
+		if err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if !imported {
 			if err := s.persistLocked(); err != nil {
+				_ = db.Close()
 				return nil, err
 			}
-			return s, nil
 		}
+	} else if err := s.persistLocked(); err != nil {
+		_ = db.Close()
 		return nil, err
+	}
+
+	return s, nil
+}
+
+func (s *trackStore) importLegacyJSONLocked(jsonPath, sqlitePath string) (bool, error) {
+	if jsonPath == sqlitePath {
+		return false, nil
+	}
+	data, err := os.ReadFile(jsonPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
 	}
 
 	var file diskDBFile
 	if err := json.Unmarshal(data, &file); err != nil {
-		return nil, fmt.Errorf("invalid tracks db format: %w", err)
+		return false, fmt.Errorf("invalid tracks db format: %w", err)
 	}
+	if err := s.loadDiskDBFileLocked(file); err != nil {
+		return false, err
+	}
+	if err := s.persistLocked(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *trackStore) loadDiskDBFileLocked(file diskDBFile) error {
+	s.nextTrackID = 1
+	s.nextAlbumID = 1
+	s.nextAuthorID = 1
+	s.nextUserID = 1
+	s.nextPlaylistID = 1
+	s.nextLyricsID = 1
+	s.nextLyricsLineID = 1
+	s.tracks = make(map[int64]track)
+	s.albums = make(map[int64]album)
+	s.authors = make(map[int64]author)
+	s.users = make(map[int64]user)
+	s.usersByEmail = make(map[string]int64)
+	s.refreshSession = make(map[string]refreshSession)
+	s.playlists = make(map[int64]playlist)
+	s.lyricsByTrack = make(map[int64]lyrics)
 
 	for _, a := range file.Authors {
 		a.CurrentName = strings.TrimSpace(a.CurrentName)
@@ -1025,7 +1092,7 @@ func newTrackStore(path string) (*trackStore, error) {
 			continue
 		}
 		if err := s.normalizePlaylistSharingLocked(&playlistItem); err != nil {
-			return nil, err
+			return err
 		}
 		s.playlists[playlistItem.ID] = playlistItem
 		if playlistItem.ID >= s.nextPlaylistID {
@@ -1113,22 +1180,412 @@ func newTrackStore(path string) (*trackStore, error) {
 	}
 
 	if err := s.migrateLegacyAlbumsLocked(); err != nil {
-		return nil, err
+		return err
 	}
 	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
-		return nil, err
+		return err
 	}
 	if err := s.ensureFavoritesPlaylistsLocked(); err != nil {
-		return nil, err
+		return err
 	}
 	if err := s.validateLyricsStateLocked(); err != nil {
-		return nil, err
-	}
-	if err := s.persistLocked(); err != nil {
-		return nil, err
+		return err
 	}
 
-	return s, nil
+	return nil
+}
+
+func sqliteStorePath(path string) string {
+	if strings.EqualFold(filepath.Ext(path), ".json") {
+		return strings.TrimSuffix(path, filepath.Ext(path)) + ".sqlite"
+	}
+	return path
+}
+
+func openSQLiteDB(path string) (*sql.DB, error) {
+	dir := filepath.Dir(path)
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func (s *trackStore) initSQLiteSchema() error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS store_metadata (
+			key TEXT PRIMARY KEY,
+			value INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS authors (
+			id INTEGER PRIMARY KEY,
+			current_name TEXT NOT NULL,
+			photos_json TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS albums (
+			id INTEGER PRIMARY KEY,
+			title TEXT NOT NULL,
+			cover_image_path TEXT NOT NULL,
+			author_ids_json TEXT NOT NULL,
+			release_date TEXT NOT NULL,
+			is_published INTEGER NOT NULL,
+			track_ids_json TEXT NOT NULL,
+			additional_info_json TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS tracks (
+			id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			author_ids_json TEXT NOT NULL,
+			album_id INTEGER NOT NULL,
+			audio_file_path TEXT NOT NULL,
+			additional_info_json TEXT NOT NULL,
+			source_metadata_json TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS users (
+			id INTEGER PRIMARY KEY,
+			email TEXT NOT NULL UNIQUE,
+			role TEXT NOT NULL,
+			password_hash TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS refresh_sessions (
+			id TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL,
+			token_hash TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS playlists (
+			id INTEGER PRIMARY KEY,
+			user_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			description TEXT NOT NULL,
+			cover_image_path TEXT NOT NULL,
+			visibility TEXT NOT NULL,
+			share_token TEXT NOT NULL,
+			track_items_json TEXT NOT NULL,
+			system INTEGER NOT NULL,
+			kind TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS lyrics (
+			id INTEGER PRIMARY KEY,
+			track_id INTEGER NOT NULL UNIQUE,
+			type TEXT NOT NULL,
+			plain_text TEXT,
+			language_code TEXT,
+			source TEXT,
+			is_verified INTEGER NOT NULL,
+			updated_at TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			lines_json TEXT NOT NULL
+		)`,
+	}
+
+	for _, statement := range statements {
+		if _, err := s.db.Exec(statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *trackStore) loadSQLiteLocked() (bool, error) {
+	hasData, err := s.sqliteHasData()
+	if err != nil {
+		return false, err
+	}
+	if !hasData {
+		return false, nil
+	}
+
+	file := diskDBFile{}
+	if err := s.loadSQLiteMetadata(&file); err != nil {
+		return false, err
+	}
+	if err := s.loadSQLiteAuthors(&file); err != nil {
+		return false, err
+	}
+	if err := s.loadSQLiteAlbums(&file); err != nil {
+		return false, err
+	}
+	if err := s.loadSQLiteTracks(&file); err != nil {
+		return false, err
+	}
+	if err := s.loadSQLiteUsers(&file); err != nil {
+		return false, err
+	}
+	if err := s.loadSQLiteSessions(&file); err != nil {
+		return false, err
+	}
+	if err := s.loadSQLitePlaylists(&file); err != nil {
+		return false, err
+	}
+	if err := s.loadSQLiteLyrics(&file); err != nil {
+		return false, err
+	}
+	if err := s.loadDiskDBFileLocked(file); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *trackStore) sqliteHasData() (bool, error) {
+	tables := []string{"store_metadata", "authors", "albums", "tracks", "users", "refresh_sessions", "playlists", "lyrics"}
+	for _, table := range tables {
+		var count int
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
+			return false, err
+		}
+		if count > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *trackStore) loadSQLiteMetadata(file *diskDBFile) error {
+	rows, err := s.db.Query(`SELECT key, value FROM store_metadata`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var key string
+		var value int64
+		if err := rows.Scan(&key, &value); err != nil {
+			return err
+		}
+		switch key {
+		case "next_track_id":
+			file.NextTrackID = value
+		case "next_album_id":
+			file.NextAlbumID = value
+		case "next_author_id":
+			file.NextAuthorID = value
+		case "next_user_id":
+			file.NextUserID = value
+		case "next_playlist_id":
+			file.NextPlaylistID = value
+		case "next_lyrics_id":
+			file.NextLyricsID = value
+		case "next_lyrics_line_id":
+			file.NextLyricsLineID = value
+		}
+	}
+	return rows.Err()
+}
+
+func (s *trackStore) loadSQLiteAuthors(file *diskDBFile) error {
+	rows, err := s.db.Query(`SELECT id, current_name, photos_json FROM authors ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item author
+		var photosJSON string
+		if err := rows.Scan(&item.ID, &item.CurrentName, &photosJSON); err != nil {
+			return err
+		}
+		if err := unmarshalJSONColumn(photosJSON, &item.Photos); err != nil {
+			return err
+		}
+		file.Authors = append(file.Authors, item)
+	}
+	return rows.Err()
+}
+
+func (s *trackStore) loadSQLiteAlbums(file *diskDBFile) error {
+	rows, err := s.db.Query(`SELECT id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json FROM albums ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item album
+		var authorIDsJSON, releaseDate, trackIDsJSON, additionalInfoJSON string
+		var isPublished int
+		if err := rows.Scan(&item.ID, &item.Title, &item.CoverImagePath, &authorIDsJSON, &releaseDate, &isPublished, &trackIDsJSON, &additionalInfoJSON); err != nil {
+			return err
+		}
+		if err := unmarshalJSONColumn(authorIDsJSON, &item.AuthorIDs); err != nil {
+			return err
+		}
+		if err := unmarshalJSONColumn(trackIDsJSON, &item.TrackIDs); err != nil {
+			return err
+		}
+		if err := unmarshalJSONColumn(additionalInfoJSON, &item.AdditionalInfo); err != nil {
+			return err
+		}
+		parsed, err := parseSQLiteTime(releaseDate)
+		if err != nil {
+			return err
+		}
+		item.ReleaseDate = parsed
+		item.IsPublished = isPublished != 0
+		file.Albums = append(file.Albums, item)
+	}
+	return rows.Err()
+}
+
+func (s *trackStore) loadSQLiteTracks(file *diskDBFile) error {
+	rows, err := s.db.Query(`SELECT id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json FROM tracks ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item track
+		var authorIDsJSON, additionalInfoJSON, sourceMetadataJSON string
+		if err := rows.Scan(&item.ID, &item.Name, &authorIDsJSON, &item.AlbumID, &item.AudioFilePath, &additionalInfoJSON, &sourceMetadataJSON); err != nil {
+			return err
+		}
+		if err := unmarshalJSONColumn(authorIDsJSON, &item.AuthorIDs); err != nil {
+			return err
+		}
+		if err := unmarshalJSONColumn(additionalInfoJSON, &item.AdditionalInfo); err != nil {
+			return err
+		}
+		if err := unmarshalJSONColumn(sourceMetadataJSON, &item.SourceMetadata); err != nil {
+			return err
+		}
+		raw, err := json.Marshal(item)
+		if err != nil {
+			return err
+		}
+		file.Tracks = append(file.Tracks, raw)
+	}
+	return rows.Err()
+}
+
+func (s *trackStore) loadSQLiteUsers(file *diskDBFile) error {
+	rows, err := s.db.Query(`SELECT id, email, role, password_hash, created_at FROM users ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item user
+		var createdAt string
+		if err := rows.Scan(&item.ID, &item.Email, &item.Role, &item.PasswordHash, &createdAt); err != nil {
+			return err
+		}
+		parsed, err := parseSQLiteTime(createdAt)
+		if err != nil {
+			return err
+		}
+		item.CreatedAt = parsed
+		file.Users = append(file.Users, item)
+	}
+	return rows.Err()
+}
+
+func (s *trackStore) loadSQLiteSessions(file *diskDBFile) error {
+	rows, err := s.db.Query(`SELECT id, user_id, token_hash, created_at, expires_at FROM refresh_sessions ORDER BY user_id, created_at`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item refreshSession
+		var createdAt, expiresAt string
+		if err := rows.Scan(&item.ID, &item.UserID, &item.TokenHash, &createdAt, &expiresAt); err != nil {
+			return err
+		}
+		parsedCreatedAt, err := parseSQLiteTime(createdAt)
+		if err != nil {
+			return err
+		}
+		parsedExpiresAt, err := parseSQLiteTime(expiresAt)
+		if err != nil {
+			return err
+		}
+		item.CreatedAt = parsedCreatedAt
+		item.ExpiresAt = parsedExpiresAt
+		file.Sessions = append(file.Sessions, item)
+	}
+	return rows.Err()
+}
+
+func (s *trackStore) loadSQLitePlaylists(file *diskDBFile) error {
+	rows, err := s.db.Query(`SELECT id, user_id, name, description, cover_image_path, visibility, share_token, track_items_json, system, kind FROM playlists ORDER BY user_id, id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item playlist
+		var trackItemsJSON string
+		var system int
+		if err := rows.Scan(&item.ID, &item.UserID, &item.Name, &item.Description, &item.CoverImagePath, &item.Visibility, &item.ShareToken, &trackItemsJSON, &system, &item.Kind); err != nil {
+			return err
+		}
+		if err := unmarshalJSONColumn(trackItemsJSON, &item.TrackItems); err != nil {
+			return err
+		}
+		item.System = system != 0
+		file.Playlists = append(file.Playlists, item)
+	}
+	return rows.Err()
+}
+
+func (s *trackStore) loadSQLiteLyrics(file *diskDBFile) error {
+	rows, err := s.db.Query(`SELECT id, track_id, type, plain_text, language_code, source, is_verified, updated_at, created_at, lines_json FROM lyrics ORDER BY track_id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item lyrics
+		var plainText, languageCode, source sql.NullString
+		var updatedAt, createdAt, linesJSON string
+		var isVerified int
+		if err := rows.Scan(&item.ID, &item.TrackID, &item.Type, &plainText, &languageCode, &source, &isVerified, &updatedAt, &createdAt, &linesJSON); err != nil {
+			return err
+		}
+		item.PlainText = nullStringPointer(plainText)
+		item.LanguageCode = nullStringPointer(languageCode)
+		item.Source = nullStringPointer(source)
+		item.IsVerified = isVerified != 0
+		parsedUpdatedAt, err := parseSQLiteTime(updatedAt)
+		if err != nil {
+			return err
+		}
+		parsedCreatedAt, err := parseSQLiteTime(createdAt)
+		if err != nil {
+			return err
+		}
+		item.UpdatedAt = parsedUpdatedAt
+		item.CreatedAt = parsedCreatedAt
+		if err := unmarshalJSONColumn(linesJSON, &item.Lines); err != nil {
+			return err
+		}
+		file.Lyrics = append(file.Lyrics, item)
+	}
+	return rows.Err()
 }
 
 func (s *trackStore) list() []track {
@@ -2332,6 +2789,10 @@ func (s *trackStore) getOrCreateAuthorIDLocked(name string) int64 {
 }
 
 func (s *trackStore) persistLocked() error {
+	if s.db == nil {
+		return errors.New("sqlite database is not initialized")
+	}
+
 	trackItems := make([]track, 0, len(s.tracks))
 	for _, t := range s.tracks {
 		trackItems = append(trackItems, t)
@@ -2394,38 +2855,232 @@ func (s *trackStore) persistLocked() error {
 		return lyricsItems[i].TrackID < lyricsItems[j].TrackID
 	})
 
-	payload, err := json.MarshalIndent(dbFile{
-		NextTrackID:      s.nextTrackID,
-		NextAlbumID:      s.nextAlbumID,
-		NextAuthorID:     s.nextAuthorID,
-		NextUserID:       s.nextUserID,
-		NextPlaylistID:   s.nextPlaylistID,
-		NextLyricsID:     s.nextLyricsID,
-		NextLyricsLineID: s.nextLyricsLineID,
-		Tracks:           trackItems,
-		Albums:           albumItems,
-		Authors:          authorItems,
-		Users:            userItems,
-		Sessions:         sessionItems,
-		Playlists:        playlistItems,
-		Lyrics:           lyricsItems,
-	}, "", "  ")
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
 
-	dir := filepath.Dir(s.path)
-	if dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+	for _, table := range []string{"store_metadata", "authors", "albums", "tracks", "users", "refresh_sessions", "playlists", "lyrics"} {
+		if _, err := tx.Exec("DELETE FROM " + table); err != nil {
 			return err
 		}
 	}
 
-	tempPath := s.path + ".tmp"
-	if err := os.WriteFile(tempPath, payload, 0o644); err != nil {
+	metadata := map[string]int64{
+		"next_track_id":       s.nextTrackID,
+		"next_album_id":       s.nextAlbumID,
+		"next_author_id":      s.nextAuthorID,
+		"next_user_id":        s.nextUserID,
+		"next_playlist_id":    s.nextPlaylistID,
+		"next_lyrics_id":      s.nextLyricsID,
+		"next_lyrics_line_id": s.nextLyricsLineID,
+	}
+	for key, value := range metadata {
+		if _, err := tx.Exec(`INSERT INTO store_metadata (key, value) VALUES (?, ?)`, key, value); err != nil {
+			return err
+		}
+	}
+
+	for _, a := range authorItems {
+		photosJSON, err := marshalJSONColumn(a.Photos)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO authors (id, current_name, photos_json) VALUES (?, ?, ?)`, a.ID, a.CurrentName, photosJSON); err != nil {
+			return err
+		}
+	}
+
+	for _, a := range albumItems {
+		authorIDsJSON, err := marshalJSONColumn(a.AuthorIDs)
+		if err != nil {
+			return err
+		}
+		trackIDsJSON, err := marshalJSONColumn(a.TrackIDs)
+		if err != nil {
+			return err
+		}
+		additionalInfoJSON, err := marshalJSONColumn(a.AdditionalInfo)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO albums (id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			a.ID,
+			a.Title,
+			a.CoverImagePath,
+			authorIDsJSON,
+			formatSQLiteTime(a.ReleaseDate),
+			boolToSQLiteInt(a.IsPublished),
+			trackIDsJSON,
+			additionalInfoJSON,
+		); err != nil {
+			return err
+		}
+	}
+
+	for _, t := range trackItems {
+		authorIDsJSON, err := marshalJSONColumn(t.AuthorIDs)
+		if err != nil {
+			return err
+		}
+		additionalInfoJSON, err := marshalJSONColumn(t.AdditionalInfo)
+		if err != nil {
+			return err
+		}
+		sourceMetadataJSON, err := marshalJSONColumn(t.SourceMetadata)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO tracks (id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			t.ID,
+			t.Name,
+			authorIDsJSON,
+			t.AlbumID,
+			t.AudioFilePath,
+			additionalInfoJSON,
+			sourceMetadataJSON,
+		); err != nil {
+			return err
+		}
+	}
+
+	for _, u := range userItems {
+		if _, err := tx.Exec(
+			`INSERT INTO users (id, email, role, password_hash, created_at) VALUES (?, ?, ?, ?, ?)`,
+			u.ID,
+			u.Email,
+			u.Role,
+			u.PasswordHash,
+			formatSQLiteTime(u.CreatedAt),
+		); err != nil {
+			return err
+		}
+	}
+
+	for _, session := range sessionItems {
+		if _, err := tx.Exec(
+			`INSERT INTO refresh_sessions (id, user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)`,
+			session.ID,
+			session.UserID,
+			session.TokenHash,
+			formatSQLiteTime(session.CreatedAt),
+			formatSQLiteTime(session.ExpiresAt),
+		); err != nil {
+			return err
+		}
+	}
+
+	for _, p := range playlistItems {
+		trackItemsJSON, err := marshalJSONColumn(p.TrackItems)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO playlists (id, user_id, name, description, cover_image_path, visibility, share_token, track_items_json, system, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			p.ID,
+			p.UserID,
+			p.Name,
+			p.Description,
+			p.CoverImagePath,
+			p.Visibility,
+			p.ShareToken,
+			trackItemsJSON,
+			boolToSQLiteInt(p.System),
+			p.Kind,
+		); err != nil {
+			return err
+		}
+	}
+
+	for _, item := range lyricsItems {
+		linesJSON, err := marshalJSONColumn(item.Lines)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO lyrics (id, track_id, type, plain_text, language_code, source, is_verified, updated_at, created_at, lines_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			item.ID,
+			item.TrackID,
+			item.Type,
+			sqlNullString(item.PlainText),
+			sqlNullString(item.LanguageCode),
+			sqlNullString(item.Source),
+			boolToSQLiteInt(item.IsVerified),
+			formatSQLiteTime(item.UpdatedAt),
+			formatSQLiteTime(item.CreatedAt),
+			linesJSON,
+		); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return os.Rename(tempPath, s.path)
+	committed = true
+	return nil
+}
+
+func marshalJSONColumn(v any) (string, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func unmarshalJSONColumn(value string, target any) error {
+	if strings.TrimSpace(value) == "" {
+		value = "null"
+	}
+	return json.Unmarshal([]byte(value), target)
+}
+
+func formatSQLiteTime(value time.Time) string {
+	if value.IsZero() {
+		return time.Time{}.UTC().Format(time.RFC3339Nano)
+	}
+	return value.UTC().Format(time.RFC3339Nano)
+}
+
+func parseSQLiteTime(value string) (time.Time, error) {
+	if strings.TrimSpace(value) == "" {
+		return time.Time{}, nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return parsed.UTC(), nil
+}
+
+func boolToSQLiteInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func sqlNullString(value *string) sql.NullString {
+	if value == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: *value, Valid: true}
+}
+
+func nullStringPointer(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+	return &value.String
 }
 
 func listSongsHandler(songsDir string) http.HandlerFunc {
