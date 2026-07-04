@@ -33,31 +33,47 @@ import (
 )
 
 const (
-	defaultAccessTokenTTL     = 15 * time.Minute
-	defaultRefreshTokenTTL    = 30 * 24 * time.Hour
-	passwordHashIterations    = 310000
-	passwordHashKeyLength     = 32
-	minPasswordLength         = 8
-	maxSongUploadSize         = 512 << 20
-	maxPlaylistNameLength     = 200
-	maxPlaylistDescLength     = 1000
-	playlistShareTokenBytes   = 32
-	defaultAutoplayCount      = 1
-	maxAutoplayCount          = 50
-	roleAdmin                 = "admin"
-	roleListener              = "listener"
-	logModeVerbose            = "verbose"
-	logModeErrorOnly          = "error-only"
-	playlistVisibilityPrivate = "private"
-	playlistVisibilityPublic  = "public"
-	playlistVisibilityShared  = "shared"
-	playlistKindCustom        = "custom"
-	playlistKindFavorites     = "favorites"
-	autoplaySourceMyVibe      = "my_vibe"
-	autoplaySourcePlaylist    = "playlist"
-	autoplaySourceAlbum       = "album"
-	autoplaySourceTrack       = "track"
-	defaultAutoplayProfile    = "default"
+	defaultAccessTokenTTL           = 15 * time.Minute
+	defaultRefreshTokenTTL          = 30 * 24 * time.Hour
+	passwordHashIterations          = 310000
+	passwordHashKeyLength           = 32
+	minPasswordLength               = 8
+	maxSongUploadSize               = 512 << 20
+	maxPlaylistNameLength           = 200
+	maxPlaylistDescLength           = 1000
+	playlistShareTokenBytes         = 32
+	defaultAutoplayCount            = 1
+	maxAutoplayCount                = 50
+	maxAnalyticsBatchSize           = 100
+	maxAnalyticsIDLength            = 200
+	maxAnalyticsEventTypeLen        = 64
+	maxAnalyticsPlatformLen         = 64
+	maxAnalyticsAppVersionLen       = 64
+	maxAnalyticsSearchQueryLen      = 1000
+	roleAdmin                       = "admin"
+	roleListener                    = "listener"
+	logModeVerbose                  = "verbose"
+	logModeErrorOnly                = "error-only"
+	playlistVisibilityPrivate       = "private"
+	playlistVisibilityPublic        = "public"
+	playlistVisibilityShared        = "shared"
+	playlistKindCustom              = "custom"
+	playlistKindFavorites           = "favorites"
+	autoplaySourceMyVibe            = "my_vibe"
+	autoplaySourcePlaylist          = "playlist"
+	autoplaySourceAlbum             = "album"
+	autoplaySourceTrack             = "track"
+	defaultAutoplayProfile          = "default"
+	analyticsEventPlay              = "play"
+	analyticsEventPause             = "pause"
+	analyticsEventResume            = "resume"
+	analyticsEventSeek              = "seek"
+	analyticsEventTrackChange       = "track_change"
+	analyticsEventTrackComplete     = "track_complete"
+	analyticsEventTrackSkip         = "track_skip"
+	analyticsEventSearch            = "search"
+	analyticsEventSearchResultClick = "search_result_click"
+	analyticsEventPlaybackError     = "playback_error"
 )
 
 type contextKey string
@@ -193,6 +209,51 @@ type autoplayNextResponse struct {
 	Profile    string          `json:"profile"`
 	Strategy   string          `json:"strategy"`
 	Tracks     []trackResponse `json:"tracks"`
+}
+
+type analyticsEventsRequest struct {
+	ClientID   string                  `json:"clientId"`
+	SessionID  string                  `json:"sessionId"`
+	Platform   string                  `json:"platform"`
+	AppVersion string                  `json:"appVersion"`
+	Events     []analyticsEventRequest `json:"events"`
+}
+
+type analyticsEventRequest struct {
+	EventID     string         `json:"eventId"`
+	Type        string         `json:"type"`
+	TrackID     *int64         `json:"trackId,omitempty"`
+	PlaylistID  *int64         `json:"playlistId,omitempty"`
+	AlbumID     *int64         `json:"albumId,omitempty"`
+	PositionMs  *int           `json:"positionMs,omitempty"`
+	DurationMs  *int           `json:"durationMs,omitempty"`
+	SearchQuery *string        `json:"searchQuery,omitempty"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
+	ClientTime  time.Time      `json:"clientTime"`
+}
+
+type analyticsEventRecord struct {
+	EventID     string
+	UserID      *int64
+	ClientID    string
+	SessionID   string
+	EventType   string
+	TrackID     *int64
+	PlaylistID  *int64
+	AlbumID     *int64
+	PositionMs  *int
+	DurationMs  *int
+	SearchQuery *string
+	Metadata    map[string]any
+	ClientTime  time.Time
+	ReceivedAt  time.Time
+	Platform    string
+	AppVersion  string
+}
+
+type analyticsEventsResponse struct {
+	Accepted   int `json:"accepted"`
+	Duplicates int `json:"duplicates"`
 }
 
 type author struct {
@@ -598,6 +659,7 @@ func main() {
 	mux.HandleFunc("GET /api/public/playlists/", getPublicPlaylistByRouteHandler(store))
 	mux.HandleFunc("GET /api/shared/playlists/", getSharedPlaylistByRouteHandler(store))
 	mux.Handle("POST /api/autoplay/next", requireAuth(auth, store, autoplayNextHandler(store)))
+	mux.HandleFunc("POST /api/analytics/events", analyticsEventsHandler(store, auth))
 	mux.HandleFunc("GET /api/tracks", listTracksHandler(store, auth))
 	mux.Handle("POST /api/tracks", requireRole(auth, store, roleAdmin, createTrackHandler(store)))
 	mux.Handle("GET /api/tracks/", getTrackByRouteHandler(store, auth))
@@ -721,14 +783,19 @@ func withRecovery(next http.Handler) http.Handler {
 func withRequestLogging(next http.Handler, mode string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		requestBody, restoreBody, err := captureRequestBody(r)
-		if err != nil {
-			log.Printf("failed to capture request body method=%s path=%s err=%v", r.Method, r.URL.RequestURI(), err)
-			http.Error(w, "failed to read request body", http.StatusInternalServerError)
-			return
-		}
-		if restoreBody != nil {
-			defer restoreBody()
+		requestBody := "[body omitted for privacy]"
+		if !shouldOmitRequestBodyFromLog(r) {
+			var restoreBody func()
+			var err error
+			requestBody, restoreBody, err = captureRequestBody(r)
+			if err != nil {
+				log.Printf("failed to capture request body method=%s path=%s err=%v", r.Method, r.URL.RequestURI(), err)
+				http.Error(w, "failed to read request body", http.StatusInternalServerError)
+				return
+			}
+			if restoreBody != nil {
+				defer restoreBody()
+			}
 		}
 
 		lw := &loggingResponseWriter{
@@ -756,6 +823,10 @@ func withRequestLogging(next http.Handler, mode string) http.Handler {
 			r.UserAgent(),
 		)
 	})
+}
+
+func shouldOmitRequestBodyFromLog(r *http.Request) bool {
+	return r.URL.Path == "/api/analytics/events"
 }
 
 func captureRequestBody(r *http.Request) (string, func(), error) {
@@ -1294,6 +1365,29 @@ func (s *trackStore) initSQLiteSchema() error {
 			created_at TEXT NOT NULL,
 			lines_json TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS analytics_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			event_id TEXT NOT NULL UNIQUE,
+			user_id INTEGER,
+			client_id TEXT NOT NULL,
+			session_id TEXT NOT NULL,
+			event_type TEXT NOT NULL,
+			track_id INTEGER,
+			playlist_id INTEGER,
+			album_id INTEGER,
+			position_ms INTEGER,
+			duration_ms INTEGER,
+			search_query TEXT,
+			metadata_json TEXT NOT NULL,
+			client_time TEXT NOT NULL,
+			received_at TEXT NOT NULL,
+			platform TEXT NOT NULL,
+			app_version TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_analytics_events_user_received ON analytics_events (user_id, received_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_analytics_events_client_received ON analytics_events (client_id, received_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_analytics_events_type_received ON analytics_events (event_type, received_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_analytics_events_track_received ON analytics_events (track_id, received_at)`,
 	}
 
 	for _, statement := range statements {
@@ -2545,6 +2639,85 @@ func (s *trackStore) createAuthor(req upsertAuthorRequest) (author, error) {
 	return a, nil
 }
 
+func (s *trackStore) appendAnalyticsEvents(events []analyticsEventRecord) (analyticsEventsResponse, error) {
+	if s.db == nil {
+		return analyticsEventsResponse{}, errors.New("sqlite database is not initialized")
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return analyticsEventsResponse{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	response := analyticsEventsResponse{}
+	for _, event := range events {
+		metadataJSON, err := marshalJSONColumn(event.Metadata)
+		if err != nil {
+			return analyticsEventsResponse{}, err
+		}
+		result, err := tx.Exec(
+			`INSERT OR IGNORE INTO analytics_events (
+				event_id,
+				user_id,
+				client_id,
+				session_id,
+				event_type,
+				track_id,
+				playlist_id,
+				album_id,
+				position_ms,
+				duration_ms,
+				search_query,
+				metadata_json,
+				client_time,
+				received_at,
+				platform,
+				app_version
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			event.EventID,
+			sqlNullInt64(event.UserID),
+			event.ClientID,
+			event.SessionID,
+			event.EventType,
+			sqlNullInt64(event.TrackID),
+			sqlNullInt64(event.PlaylistID),
+			sqlNullInt64(event.AlbumID),
+			sqlNullInt(event.PositionMs),
+			sqlNullInt(event.DurationMs),
+			sqlNullString(event.SearchQuery),
+			metadataJSON,
+			formatSQLiteTime(event.ClientTime),
+			formatSQLiteTime(event.ReceivedAt),
+			event.Platform,
+			event.AppVersion,
+		)
+		if err != nil {
+			return analyticsEventsResponse{}, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return analyticsEventsResponse{}, err
+		}
+		if affected == 0 {
+			response.Duplicates++
+			continue
+		}
+		response.Accepted++
+	}
+
+	if err := tx.Commit(); err != nil {
+		return analyticsEventsResponse{}, err
+	}
+	committed = true
+	return response, nil
+}
+
 func (s *trackStore) updateAuthor(id int64, req upsertAuthorRequest) (author, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -3074,6 +3247,20 @@ func sqlNullString(value *string) sql.NullString {
 		return sql.NullString{}
 	}
 	return sql.NullString{String: *value, Valid: true}
+}
+
+func sqlNullInt64(value *int64) sql.NullInt64 {
+	if value == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: *value, Valid: true}
+}
+
+func sqlNullInt(value *int) sql.NullInt64 {
+	if value == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: int64(*value), Valid: true}
 }
 
 func nullStringPointer(value sql.NullString) *string {
@@ -4142,6 +4329,53 @@ func autoplayNextHandler(store *trackStore) http.HandlerFunc {
 	}
 }
 
+func analyticsEventsHandler(store *trackStore, auth *authManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, err := analyticsUserIDFromRequest(r, auth, store)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+
+		req, err := decodeAnalyticsEventsRequest(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		receivedAt := time.Now().UTC()
+		records := make([]analyticsEventRecord, 0, len(req.Events))
+		for _, event := range req.Events {
+			records = append(records, analyticsEventRecord{
+				EventID:     event.EventID,
+				UserID:      userID,
+				ClientID:    req.ClientID,
+				SessionID:   req.SessionID,
+				EventType:   event.Type,
+				TrackID:     event.TrackID,
+				PlaylistID:  event.PlaylistID,
+				AlbumID:     event.AlbumID,
+				PositionMs:  event.PositionMs,
+				DurationMs:  event.DurationMs,
+				SearchQuery: event.SearchQuery,
+				Metadata:    event.Metadata,
+				ClientTime:  event.ClientTime.UTC(),
+				ReceivedAt:  receivedAt,
+				Platform:    req.Platform,
+				AppVersion:  req.AppVersion,
+			})
+		}
+
+		response, err := store.appendAnalyticsEvents(records)
+		if err != nil {
+			http.Error(w, "failed to store analytics events", http.StatusInternalServerError)
+			return
+		}
+
+		writeJSON(w, http.StatusAccepted, response)
+	}
+}
+
 func listAuthorsHandler(store *trackStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, store.listAuthors())
@@ -4602,6 +4836,108 @@ func decodeAutoplayNextRequest(r *http.Request) (autoplayNextRequest, error) {
 	return req, nil
 }
 
+func decodeAnalyticsEventsRequest(r *http.Request) (analyticsEventsRequest, error) {
+	var req analyticsEventsRequest
+	if err := decodeJSON(r, &req); err != nil {
+		return analyticsEventsRequest{}, err
+	}
+
+	req.ClientID = strings.TrimSpace(req.ClientID)
+	req.SessionID = strings.TrimSpace(req.SessionID)
+	var err error
+	req.Platform, err = normalizeOptionalAnalyticsValue(req.Platform, maxAnalyticsPlatformLen, "unknown", "platform")
+	if err != nil {
+		return analyticsEventsRequest{}, err
+	}
+	req.AppVersion, err = normalizeOptionalAnalyticsValue(req.AppVersion, maxAnalyticsAppVersionLen, "unknown", "appVersion")
+	if err != nil {
+		return analyticsEventsRequest{}, err
+	}
+
+	switch {
+	case req.ClientID == "":
+		return analyticsEventsRequest{}, errors.New("clientId is required")
+	case len(req.ClientID) > maxAnalyticsIDLength:
+		return analyticsEventsRequest{}, fmt.Errorf("clientId must be at most %d characters", maxAnalyticsIDLength)
+	case req.SessionID == "":
+		return analyticsEventsRequest{}, errors.New("sessionId is required")
+	case len(req.SessionID) > maxAnalyticsIDLength:
+		return analyticsEventsRequest{}, fmt.Errorf("sessionId must be at most %d characters", maxAnalyticsIDLength)
+	case len(req.Events) == 0:
+		return analyticsEventsRequest{}, errors.New("events must contain at least one item")
+	case len(req.Events) > maxAnalyticsBatchSize:
+		return analyticsEventsRequest{}, fmt.Errorf("events must contain at most %d items", maxAnalyticsBatchSize)
+	}
+
+	for index := range req.Events {
+		normalized, err := normalizeAnalyticsEventRequest(req.Events[index], index)
+		if err != nil {
+			return analyticsEventsRequest{}, err
+		}
+		req.Events[index] = normalized
+	}
+
+	return req, nil
+}
+
+func normalizeAnalyticsEventRequest(event analyticsEventRequest, index int) (analyticsEventRequest, error) {
+	event.EventID = strings.TrimSpace(event.EventID)
+	event.Type = strings.ToLower(strings.TrimSpace(event.Type))
+	if event.Metadata == nil {
+		event.Metadata = map[string]any{}
+	}
+
+	switch {
+	case event.EventID == "":
+		return analyticsEventRequest{}, fmt.Errorf("events[%d].eventId is required", index)
+	case len(event.EventID) > maxAnalyticsIDLength:
+		return analyticsEventRequest{}, fmt.Errorf("events[%d].eventId must be at most %d characters", index, maxAnalyticsIDLength)
+	case event.Type == "":
+		return analyticsEventRequest{}, fmt.Errorf("events[%d].type is required", index)
+	case len(event.Type) > maxAnalyticsEventTypeLen:
+		return analyticsEventRequest{}, fmt.Errorf("events[%d].type must be at most %d characters", index, maxAnalyticsEventTypeLen)
+	case !isAnalyticsEventType(event.Type):
+		return analyticsEventRequest{}, fmt.Errorf("events[%d].type must be one of play, pause, resume, seek, track_change, track_complete, track_skip, search, search_result_click, playback_error", index)
+	case event.ClientTime.IsZero():
+		return analyticsEventRequest{}, fmt.Errorf("events[%d].clientTime is required", index)
+	}
+
+	if err := validatePositiveOptionalInt64(event.TrackID, fmt.Sprintf("events[%d].trackId", index)); err != nil {
+		return analyticsEventRequest{}, err
+	}
+	if err := validatePositiveOptionalInt64(event.PlaylistID, fmt.Sprintf("events[%d].playlistId", index)); err != nil {
+		return analyticsEventRequest{}, err
+	}
+	if err := validatePositiveOptionalInt64(event.AlbumID, fmt.Sprintf("events[%d].albumId", index)); err != nil {
+		return analyticsEventRequest{}, err
+	}
+	if err := validateNonNegativeOptionalInt(event.PositionMs, fmt.Sprintf("events[%d].positionMs", index)); err != nil {
+		return analyticsEventRequest{}, err
+	}
+	if err := validateNonNegativeOptionalInt(event.DurationMs, fmt.Sprintf("events[%d].durationMs", index)); err != nil {
+		return analyticsEventRequest{}, err
+	}
+
+	if event.SearchQuery != nil {
+		trimmed := strings.TrimSpace(*event.SearchQuery)
+		event.SearchQuery = &trimmed
+		if len(trimmed) > maxAnalyticsSearchQueryLen {
+			return analyticsEventRequest{}, fmt.Errorf("events[%d].searchQuery must be at most %d characters", index, maxAnalyticsSearchQueryLen)
+		}
+	}
+
+	if analyticsEventRequiresTrackID(event.Type) && event.TrackID == nil {
+		return analyticsEventRequest{}, fmt.Errorf("events[%d].trackId is required for type %s", index, event.Type)
+	}
+	if analyticsEventRequiresSearchQuery(event.Type) {
+		if event.SearchQuery == nil || *event.SearchQuery == "" {
+			return analyticsEventRequest{}, fmt.Errorf("events[%d].searchQuery is required for type %s", index, event.Type)
+		}
+	}
+
+	return event, nil
+}
+
 func decodeRegisterRequest(r *http.Request) (registerRequest, error) {
 	var req registerRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -4803,6 +5139,92 @@ func normalizeAutoplayProfile(value string) string {
 		return defaultAutoplayProfile
 	}
 	return value
+}
+
+func normalizeOptionalAnalyticsValue(value string, maxLength int, fallback, field string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback, nil
+	}
+	if len(value) > maxLength {
+		return "", fmt.Errorf("%s must be at most %d characters", field, maxLength)
+	}
+	return value, nil
+}
+
+func isAnalyticsEventType(value string) bool {
+	switch value {
+	case analyticsEventPlay,
+		analyticsEventPause,
+		analyticsEventResume,
+		analyticsEventSeek,
+		analyticsEventTrackChange,
+		analyticsEventTrackComplete,
+		analyticsEventTrackSkip,
+		analyticsEventSearch,
+		analyticsEventSearchResultClick,
+		analyticsEventPlaybackError:
+		return true
+	default:
+		return false
+	}
+}
+
+func analyticsEventRequiresTrackID(value string) bool {
+	switch value {
+	case analyticsEventPlay,
+		analyticsEventPause,
+		analyticsEventResume,
+		analyticsEventSeek,
+		analyticsEventTrackChange,
+		analyticsEventTrackComplete,
+		analyticsEventTrackSkip,
+		analyticsEventPlaybackError:
+		return true
+	default:
+		return false
+	}
+}
+
+func analyticsEventRequiresSearchQuery(value string) bool {
+	return value == analyticsEventSearch || value == analyticsEventSearchResultClick
+}
+
+func validatePositiveOptionalInt64(value *int64, field string) error {
+	if value == nil {
+		return nil
+	}
+	if *value <= 0 {
+		return fmt.Errorf("%s must be a positive integer", field)
+	}
+	return nil
+}
+
+func validateNonNegativeOptionalInt(value *int, field string) error {
+	if value == nil {
+		return nil
+	}
+	if *value < 0 {
+		return fmt.Errorf("%s must be greater than or equal to 0", field)
+	}
+	return nil
+}
+
+func analyticsUserIDFromRequest(r *http.Request, auth *authManager, store *trackStore) (*int64, error) {
+	if auth == nil {
+		return nil, nil
+	}
+	if strings.TrimSpace(r.Header.Get("Authorization")) == "" {
+		return nil, nil
+	}
+	userID, err := auth.authenticateRequest(r)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := store.getUser(userID); !ok {
+		return nil, errors.New("authentication required")
+	}
+	return &userID, nil
 }
 
 func optionalUserIDFromRequest(r *http.Request, auth *authManager) int64 {

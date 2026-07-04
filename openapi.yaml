@@ -20,6 +20,7 @@ tags:
   - name: Search
   - name: Playlists
   - name: Autoplay
+  - name: Analytics
   - name: Telegram
 
 paths:
@@ -1180,6 +1181,278 @@ paths:
               schema:
                 $ref: '#/components/schemas/PaginatedSearchResults'
 
+  /api/analytics/events:
+    post:
+      tags: [Analytics]
+      summary: Collect client analytics events
+      description: |
+        Append a batch of listening, playback-control, search, and playback-error
+        analytics events.
+
+        This endpoint is intentionally append-only: every user action is stored as
+        an immutable event row. Do not send mutable counters such as `playCount` or
+        `skipCount`; those summaries can be derived later from the event stream.
+
+        Authentication is optional. If the request includes a valid bearer token,
+        the server stores the authenticated `userId` with each event. If no token is
+        present, the server still stores the events using `clientId`, which should
+        be a random identifier generated once per Flutter app install and persisted
+        locally. The client must never send `userId`.
+
+        Flutter client guidance:
+        - Generate `clientId` once per app install, for example a UUID stored in
+          secure storage or normal app preferences depending on platform support.
+        - Generate `sessionId` for each foreground app session or playback session.
+          Keep it stable while the user is actively using the app.
+        - Generate a unique `eventId` for every event before enqueueing it locally.
+          Keep the same `eventId` when retrying; the server deduplicates by this ID.
+        - Batch events and flush periodically, on app pause/background, and after
+          important playback transitions. Do not send one HTTP request for every
+          position tick.
+        - Use ISO 8601 UTC timestamps for `clientTime`.
+        - Send at most 100 events per request.
+        - Include `platform` values such as `android`, `ios`, `web`, or `macos`,
+          and include the Flutter app version when available.
+
+        Event-specific rules:
+        - `play`, `pause`, `resume`, `seek`, `track_change`, `track_complete`,
+          `track_skip`, and `playback_error` require `trackId`.
+        - `search` and `search_result_click` require `searchQuery`.
+        - `positionMs` and `durationMs` are optional but should be sent whenever
+          known. They must be greater than or equal to 0.
+        - Use `metadata` for event-specific context that does not deserve a first
+          class column yet, such as source type, previous track ID, seek origin,
+          selected result type, selected result ID, error code, or network state.
+
+        Recommended metadata keys by event type:
+        - `play`: `sourceType`, `sourceId`, `queueIndex`, `autoplay`, `reason`.
+        - `pause`: `reason`, for example `user`, `route_change`, `interruption`.
+        - `resume`: `reason`, for example `user`, `interruption_ended`,
+          `remote_control`.
+        - `seek`: `fromPositionMs`, `toPositionMs`, `method`, for example
+          `scrubber`, `skip_forward`, `skip_backward`.
+        - `track_change`: `previousTrackId`, `reason`, for example `manual_next`,
+          `manual_previous`, `autoplay`, `queue_select`.
+        - `track_complete`: `completionPercent`, `nextTrackId`, `sourceType`.
+        - `track_skip`: `reason`, `skipDirection`, `playedMs`,
+          `playedPercent`, `nextTrackId`.
+        - `search`: `resultCount`, `filters`, `sourceScreen`.
+        - `search_result_click`: `resultType`, `resultId`, `resultRank`,
+          `resultTrackId`, `resultAlbumId`, `resultAuthorId`, `resultPlaylistId`.
+        - `playback_error`: `errorCode`, `errorMessage`, `fatal`, `networkType`,
+          `retryable`.
+      security:
+        - bearerAuth: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnalyticsEventsRequest'
+            examples:
+              playPauseResume:
+                summary: Play, pause, and resume examples
+                value:
+                  clientId: install-550e8400-e29b-41d4-a716-446655440000
+                  sessionId: app-session-20260702-100000
+                  platform: android
+                  appVersion: 1.4.0
+                  events:
+                    - eventId: event-play-from-playlist-001
+                      type: play
+                      trackId: 123
+                      playlistId: 55
+                      positionMs: 0
+                      durationMs: 184000
+                      clientTime: '2026-07-02T10:00:00Z'
+                      metadata:
+                        sourceType: playlist
+                        sourceId: 55
+                        queueIndex: 0
+                        autoplay: false
+                        reason: user_selected_track
+                    - eventId: event-pause-user-001
+                      type: pause
+                      trackId: 123
+                      playlistId: 55
+                      positionMs: 42000
+                      durationMs: 184000
+                      clientTime: '2026-07-02T10:00:42Z'
+                      metadata:
+                        reason: user
+                    - eventId: event-resume-user-001
+                      type: resume
+                      trackId: 123
+                      playlistId: 55
+                      positionMs: 42000
+                      durationMs: 184000
+                      clientTime: '2026-07-02T10:01:10Z'
+                      metadata:
+                        reason: user
+              seek:
+                summary: Seek examples
+                value:
+                  clientId: install-550e8400-e29b-41d4-a716-446655440000
+                  sessionId: app-session-20260702-100000
+                  platform: ios
+                  appVersion: 1.4.0
+                  events:
+                    - eventId: event-seek-scrubber-001
+                      type: seek
+                      trackId: 123
+                      positionMs: 76000
+                      durationMs: 184000
+                      clientTime: '2026-07-02T10:02:00Z'
+                      metadata:
+                        fromPositionMs: 18000
+                        toPositionMs: 76000
+                        method: scrubber
+                    - eventId: event-seek-forward-001
+                      type: seek
+                      trackId: 123
+                      positionMs: 106000
+                      durationMs: 184000
+                      clientTime: '2026-07-02T10:02:30Z'
+                      metadata:
+                        fromPositionMs: 76000
+                        toPositionMs: 106000
+                        method: skip_forward
+              trackTransitions:
+                summary: Track change, complete, and skip examples
+                value:
+                  clientId: install-550e8400-e29b-41d4-a716-446655440000
+                  sessionId: playback-session-queue-77
+                  platform: macos
+                  appVersion: 1.4.0
+                  events:
+                    - eventId: event-track-change-manual-001
+                      type: track_change
+                      trackId: 124
+                      playlistId: 55
+                      positionMs: 0
+                      durationMs: 211000
+                      clientTime: '2026-07-02T10:03:00Z'
+                      metadata:
+                        previousTrackId: 123
+                        reason: manual_next
+                        sourceType: playlist
+                        sourceId: 55
+                    - eventId: event-track-complete-001
+                      type: track_complete
+                      trackId: 124
+                      playlistId: 55
+                      positionMs: 210000
+                      durationMs: 211000
+                      clientTime: '2026-07-02T10:06:31Z'
+                      metadata:
+                        completionPercent: 99.5
+                        nextTrackId: 125
+                        sourceType: playlist
+                    - eventId: event-track-skip-001
+                      type: track_skip
+                      trackId: 125
+                      playlistId: 55
+                      positionMs: 12000
+                      durationMs: 198000
+                      clientTime: '2026-07-02T10:06:45Z'
+                      metadata:
+                        reason: manual_next
+                        skipDirection: forward
+                        playedMs: 12000
+                        playedPercent: 6.1
+                        nextTrackId: 126
+              search:
+                summary: Search and search result click examples
+                value:
+                  clientId: install-550e8400-e29b-41d4-a716-446655440000
+                  sessionId: app-session-20260702-100000
+                  platform: web
+                  appVersion: 1.4.0
+                  events:
+                    - eventId: event-search-ambient-001
+                      type: search
+                      searchQuery: ambient
+                      clientTime: '2026-07-02T10:07:00Z'
+                      metadata:
+                        resultCount: 8
+                        sourceScreen: search
+                        filters:
+                          type: all
+                    - eventId: event-search-empty-001
+                      type: search
+                      searchQuery: zz no result query
+                      clientTime: '2026-07-02T10:07:20Z'
+                      metadata:
+                        resultCount: 0
+                        sourceScreen: search
+                    - eventId: event-search-click-track-001
+                      type: search_result_click
+                      trackId: 321
+                      searchQuery: ambient
+                      clientTime: '2026-07-02T10:07:30Z'
+                      metadata:
+                        resultType: track
+                        resultId: 321
+                        resultRank: 2
+                        resultTrackId: 321
+              playbackError:
+                summary: Playback error examples
+                value:
+                  clientId: install-550e8400-e29b-41d4-a716-446655440000
+                  sessionId: playback-session-error-1
+                  platform: android
+                  appVersion: 1.4.0
+                  events:
+                    - eventId: event-error-network-001
+                      type: playback_error
+                      trackId: 456
+                      positionMs: 0
+                      durationMs: 203000
+                      clientTime: '2026-07-02T10:08:00Z'
+                      metadata:
+                        errorCode: network_timeout
+                        errorMessage: Audio request timed out
+                        fatal: false
+                        networkType: wifi
+                        retryable: true
+                    - eventId: event-error-decode-001
+                      type: playback_error
+                      trackId: 457
+                      positionMs: 0
+                      clientTime: '2026-07-02T10:09:00Z'
+                      metadata:
+                        errorCode: decoder_failed
+                        errorMessage: Unsupported audio format
+                        fatal: true
+                        retryable: false
+      responses:
+        '202':
+          description: Events accepted. Duplicate event IDs are ignored and counted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsEventsResponse'
+              examples:
+                accepted:
+                  value:
+                    accepted: 5
+                    duplicates: 0
+                retryWithDuplicate:
+                  value:
+                    accepted: 0
+                    duplicates: 5
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: The request included an invalid bearer token. Omit the token for anonymous analytics or send a valid access token.
+          content:
+            text/plain:
+              schema:
+                $ref: '#/components/schemas/PlainError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /api/tracks:
     get:
       tags: [Tracks]
@@ -2334,6 +2607,346 @@ components:
         totalPages:
           type: integer
       required: [items, page, pageSize, totalItems, totalPages]
+
+    AnalyticsEventsRequest:
+      type: object
+      description: |
+        Batch request for analytics ingestion.
+
+        `clientId` identifies one app install and is required for both anonymous
+        and authenticated requests. The Flutter app should generate it once,
+        persist it locally, and reuse it for all future analytics events from that
+        installation.
+
+        `sessionId` groups events that happened during one app foreground session
+        or playback session. Generate a new value when the user starts a clearly
+        new app/playback session.
+
+        `platform` and `appVersion` apply to every event in the batch. If omitted
+        or blank, the server stores `unknown`.
+      properties:
+        clientId:
+          type: string
+          maxLength: 200
+          description: Random stable ID generated once per app install. Use a UUID or similarly unique value.
+          example: install-550e8400-e29b-41d4-a716-446655440000
+        sessionId:
+          type: string
+          maxLength: 200
+          description: Random ID for the current app foreground session or playback session.
+          example: app-session-20260702-100000
+        platform:
+          type: string
+          maxLength: 64
+          description: Client platform. Recommended values are `android`, `ios`, `web`, and `macos`.
+          example: android
+        appVersion:
+          type: string
+          maxLength: 64
+          description: Flutter app version/build string.
+          example: 1.4.0+42
+        events:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/AnalyticsEvent'
+      required: [clientId, sessionId, events]
+
+    AnalyticsEvent:
+      type: object
+      description: |
+        One immutable analytics event.
+
+        `eventId` must be generated by the client before the event is queued. If a
+        batch upload fails, retry with the same `eventId` values. The server uses
+        this field to ignore duplicate retries.
+
+        `clientTime` is the time when the event happened on the client, not when
+        it was uploaded. The server separately records receive time.
+
+        Playback examples by event type:
+
+        `play` when a track starts:
+        ```json
+        {
+          "eventId": "event-play-001",
+          "type": "play",
+          "trackId": 123,
+          "playlistId": 55,
+          "positionMs": 0,
+          "durationMs": 184000,
+          "clientTime": "2026-07-02T10:00:00Z",
+          "metadata": {
+            "sourceType": "playlist",
+            "sourceId": 55,
+            "autoplay": false,
+            "reason": "user_selected_track"
+          }
+        }
+        ```
+
+        `pause` when playback pauses:
+        ```json
+        {
+          "eventId": "event-pause-001",
+          "type": "pause",
+          "trackId": 123,
+          "positionMs": 42000,
+          "durationMs": 184000,
+          "clientTime": "2026-07-02T10:00:42Z",
+          "metadata": {
+            "reason": "user"
+          }
+        }
+        ```
+
+        `resume` when playback resumes:
+        ```json
+        {
+          "eventId": "event-resume-001",
+          "type": "resume",
+          "trackId": 123,
+          "positionMs": 42000,
+          "durationMs": 184000,
+          "clientTime": "2026-07-02T10:01:10Z",
+          "metadata": {
+            "reason": "interruption_ended"
+          }
+        }
+        ```
+
+        `seek` when the user changes playback position:
+        ```json
+        {
+          "eventId": "event-seek-001",
+          "type": "seek",
+          "trackId": 123,
+          "positionMs": 76000,
+          "durationMs": 184000,
+          "clientTime": "2026-07-02T10:02:00Z",
+          "metadata": {
+            "fromPositionMs": 18000,
+            "toPositionMs": 76000,
+            "method": "scrubber"
+          }
+        }
+        ```
+
+        `track_change` when the current track changes:
+        ```json
+        {
+          "eventId": "event-track-change-001",
+          "type": "track_change",
+          "trackId": 124,
+          "playlistId": 55,
+          "positionMs": 0,
+          "durationMs": 211000,
+          "clientTime": "2026-07-02T10:03:00Z",
+          "metadata": {
+            "previousTrackId": 123,
+            "reason": "manual_next"
+          }
+        }
+        ```
+
+        `track_complete` when listening reaches the end threshold:
+        ```json
+        {
+          "eventId": "event-complete-001",
+          "type": "track_complete",
+          "trackId": 124,
+          "positionMs": 210000,
+          "durationMs": 211000,
+          "clientTime": "2026-07-02T10:06:31Z",
+          "metadata": {
+            "completionPercent": 99.5,
+            "nextTrackId": 125
+          }
+        }
+        ```
+
+        `track_skip` when the user intentionally leaves a track early:
+        ```json
+        {
+          "eventId": "event-skip-001",
+          "type": "track_skip",
+          "trackId": 125,
+          "positionMs": 12000,
+          "durationMs": 198000,
+          "clientTime": "2026-07-02T10:06:45Z",
+          "metadata": {
+            "reason": "manual_next",
+            "skipDirection": "forward",
+            "playedMs": 12000,
+            "playedPercent": 6.1
+          }
+        }
+        ```
+
+        Search examples:
+
+        `search` with results:
+        ```json
+        {
+          "eventId": "event-search-001",
+          "type": "search",
+          "searchQuery": "ambient",
+          "clientTime": "2026-07-02T10:07:00Z",
+          "metadata": {
+            "resultCount": 8,
+            "sourceScreen": "search"
+          }
+        }
+        ```
+
+        `search` with zero results:
+        ```json
+        {
+          "eventId": "event-search-empty-001",
+          "type": "search",
+          "searchQuery": "zz no result query",
+          "clientTime": "2026-07-02T10:07:20Z",
+          "metadata": {
+            "resultCount": 0,
+            "sourceScreen": "search"
+          }
+        }
+        ```
+
+        `search_result_click` when the user opens a search result:
+        ```json
+        {
+          "eventId": "event-search-click-001",
+          "type": "search_result_click",
+          "trackId": 321,
+          "searchQuery": "ambient",
+          "clientTime": "2026-07-02T10:07:30Z",
+          "metadata": {
+            "resultType": "track",
+            "resultId": 321,
+            "resultRank": 2
+          }
+        }
+        ```
+
+        Error examples:
+
+        `playback_error` for a retryable network problem:
+        ```json
+        {
+          "eventId": "event-error-network-001",
+          "type": "playback_error",
+          "trackId": 456,
+          "positionMs": 0,
+          "durationMs": 203000,
+          "clientTime": "2026-07-02T10:08:00Z",
+          "metadata": {
+            "errorCode": "network_timeout",
+            "errorMessage": "Audio request timed out",
+            "fatal": false,
+            "retryable": true
+          }
+        }
+        ```
+
+        `playback_error` for a fatal decoder problem:
+        ```json
+        {
+          "eventId": "event-error-decode-001",
+          "type": "playback_error",
+          "trackId": 457,
+          "positionMs": 0,
+          "clientTime": "2026-07-02T10:09:00Z",
+          "metadata": {
+            "errorCode": "decoder_failed",
+            "errorMessage": "Unsupported audio format",
+            "fatal": true,
+            "retryable": false
+          }
+        }
+        ```
+      properties:
+        eventId:
+          type: string
+          maxLength: 200
+          description: Client-generated unique event ID. Reuse the same value when retrying the same event.
+          example: event-550e8400-e29b-41d4-a716-446655440000
+        type:
+          type: string
+          enum:
+            - play
+            - pause
+            - resume
+            - seek
+            - track_change
+            - track_complete
+            - track_skip
+            - search
+            - search_result_click
+            - playback_error
+          description: Event type. Values are lowercase snake_case.
+        trackId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+          description: Track ID involved in the event. Required for playback event types.
+        playlistId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+          description: Playlist ID when playback/search happened from a playlist context.
+        albumId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+          description: Album ID when playback/search happened from an album context.
+        positionMs:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: Playback position at event time in milliseconds. For `seek`, this should be the position after the seek.
+        durationMs:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: Track duration in milliseconds when known.
+        searchQuery:
+          type: string
+          maxLength: 1000
+          nullable: true
+          description: Raw search query. Required for `search` and `search_result_click`.
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Flexible event-specific JSON object. Keep values JSON-serializable and avoid sending secrets or access tokens.
+          example:
+            sourceType: playlist
+            sourceId: 55
+            reason: manual_next
+        clientTime:
+          type: string
+          format: date-time
+          description: Time when the event happened on the client.
+          example: '2026-07-02T10:00:00Z'
+      required: [eventId, type, clientTime]
+
+    AnalyticsEventsResponse:
+      type: object
+      description: Result of an analytics batch write.
+      properties:
+        accepted:
+          type: integer
+          minimum: 0
+          description: Number of newly inserted events.
+        duplicates:
+          type: integer
+          minimum: 0
+          description: Number of events ignored because their `eventId` was already stored.
+      required: [accepted, duplicates]
 
     RegisterRequest:
       type: object

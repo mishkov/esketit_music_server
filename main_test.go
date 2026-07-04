@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
@@ -14,6 +15,233 @@ import (
 	"testing"
 	"time"
 )
+
+func TestAnalyticsEventsHandlerStoresAnonymousEvents(t *testing.T) {
+	store := newTestTrackStore(t)
+	handler := analyticsEventsHandler(store, newAuthManager([]byte("test-secret"), time.Hour, time.Hour))
+
+	body := `{
+		"clientId": "install-anonymous-1",
+		"sessionId": "session-1",
+		"platform": "android",
+		"appVersion": "1.4.0",
+		"events": [
+			{
+				"eventId": "event-play-1",
+				"type": "play",
+				"trackId": 123,
+				"positionMs": 0,
+				"durationMs": 180000,
+				"clientTime": "2026-07-02T10:00:00Z",
+				"metadata": {
+					"sourceType": "playlist",
+					"sourceId": 55
+				}
+			},
+			{
+				"eventId": "event-search-1",
+				"type": "search",
+				"searchQuery": "ambient",
+				"clientTime": "2026-07-02T10:00:05Z",
+				"metadata": {
+					"resultCount": 4
+				}
+			}
+		]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/analytics/events", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	var response analyticsEventsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if response.Accepted != 2 || response.Duplicates != 0 {
+		t.Fatalf("response = %#v, want accepted 2 duplicates 0", response)
+	}
+
+	rows, err := store.db.Query(`SELECT event_id, user_id, client_id, session_id, event_type, search_query, metadata_json, platform, app_version FROM analytics_events ORDER BY id`)
+	if err != nil {
+		t.Fatalf("query analytics_events error = %v", err)
+	}
+	defer rows.Close()
+
+	type storedEvent struct {
+		eventID      string
+		userID       sql.NullInt64
+		clientID     string
+		sessionID    string
+		eventType    string
+		searchQuery  sql.NullString
+		metadataJSON string
+		platform     string
+		appVersion   string
+	}
+	var got []storedEvent
+	for rows.Next() {
+		var item storedEvent
+		if err := rows.Scan(&item.eventID, &item.userID, &item.clientID, &item.sessionID, &item.eventType, &item.searchQuery, &item.metadataJSON, &item.platform, &item.appVersion); err != nil {
+			t.Fatalf("Scan() error = %v", err)
+		}
+		got = append(got, item)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("stored events = %d, want 2", len(got))
+	}
+	if got[0].userID.Valid {
+		t.Fatalf("anonymous user_id valid = true, want false")
+	}
+	if got[0].clientID != "install-anonymous-1" || got[0].sessionID != "session-1" || got[0].eventType != "play" {
+		t.Fatalf("first event = %#v", got[0])
+	}
+	if got[1].eventType != "search" || !got[1].searchQuery.Valid || got[1].searchQuery.String != "ambient" {
+		t.Fatalf("second event = %#v", got[1])
+	}
+	if got[0].platform != "android" || got[0].appVersion != "1.4.0" {
+		t.Fatalf("platform/appVersion = %q/%q", got[0].platform, got[0].appVersion)
+	}
+}
+
+func TestAnalyticsEventsHandlerAttachesUserAndDeduplicatesRetries(t *testing.T) {
+	store := newTestTrackStore(t)
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	auth := newAuthManager([]byte("test-secret"), time.Hour, time.Hour)
+	token, _, err := auth.createAccessToken(user.ID)
+	if err != nil {
+		t.Fatalf("createAccessToken() error = %v", err)
+	}
+	handler := analyticsEventsHandler(store, auth)
+
+	body := `{
+		"clientId": "install-user-1",
+		"sessionId": "session-user-1",
+		"events": [
+			{
+				"eventId": "event-skip-1",
+				"type": "track_skip",
+				"trackId": 321,
+				"positionMs": 12000,
+				"durationMs": 200000,
+				"clientTime": "2026-07-02T10:01:00Z"
+			}
+		]
+	}`
+
+	req := httptest.NewRequest(http.MethodPost, "/api/analytics/events", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("first status = %d, want %d; body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/analytics/events", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("retry status = %d, want %d; body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	var retryResponse analyticsEventsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&retryResponse); err != nil {
+		t.Fatalf("Decode() retry error = %v", err)
+	}
+	if retryResponse.Accepted != 0 || retryResponse.Duplicates != 1 {
+		t.Fatalf("retry response = %#v, want accepted 0 duplicates 1", retryResponse)
+	}
+
+	var storedUserID sql.NullInt64
+	if err := store.db.QueryRow(`SELECT user_id FROM analytics_events WHERE event_id = ?`, "event-skip-1").Scan(&storedUserID); err != nil {
+		t.Fatalf("QueryRow() error = %v", err)
+	}
+	if !storedUserID.Valid || storedUserID.Int64 != user.ID {
+		t.Fatalf("stored user_id = %#v, want %d", storedUserID, user.ID)
+	}
+}
+
+func TestAnalyticsEventsHandlerRejectsInvalidRequests(t *testing.T) {
+	store := newTestTrackStore(t)
+	auth := newAuthManager([]byte("test-secret"), time.Hour, time.Hour)
+	handler := analyticsEventsHandler(store, auth)
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "play missing track id",
+			body: `{
+				"clientId": "install-1",
+				"sessionId": "session-1",
+				"events": [
+					{
+						"eventId": "event-invalid-1",
+						"type": "play",
+						"clientTime": "2026-07-02T10:00:00Z"
+					}
+				]
+			}`,
+		},
+		{
+			name: "search missing query",
+			body: `{
+				"clientId": "install-1",
+				"sessionId": "session-1",
+				"events": [
+					{
+						"eventId": "event-invalid-2",
+						"type": "search",
+						"clientTime": "2026-07-02T10:00:00Z"
+					}
+				]
+			}`,
+		},
+		{
+			name: "missing client id",
+			body: `{
+				"sessionId": "session-1",
+				"events": [
+					{
+						"eventId": "event-invalid-3",
+						"type": "search",
+						"searchQuery": "ambient",
+						"clientTime": "2026-07-02T10:00:00Z"
+					}
+				]
+			}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/analytics/events", strings.NewReader(tt.body))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+		})
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/analytics/events", strings.NewReader(tests[0].body))
+	req.Header.Set("Authorization", "Bearer not-a-real-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid token status = %d, want %d; body=%s", rec.Code, http.StatusUnauthorized, rec.Body.String())
+	}
+}
 
 func TestCreateUserCreatesFavoritesPlaylist(t *testing.T) {
 	store := newTestTrackStore(t)
