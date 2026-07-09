@@ -1299,6 +1299,41 @@ func TestUploadAlbumCoverHandlerAllowsSameOriginalFileNameTwice(t *testing.T) {
 	}
 }
 
+func TestUploadAuthorPhotoHandlerStoresUnderAuthorPhotosPath(t *testing.T) {
+	authorPhotosDir := t.TempDir()
+	handler := uploadAuthorPhotoHandler(authorPhotosDir)
+
+	rec := httptest.NewRecorder()
+	req := newMultipartUploadRequest(t, http.MethodPost, "/api/author-photos", "artist portrait.jpg", []byte("photo-data"))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var got albumCoverInfo
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+
+	if !strings.HasPrefix(got.Name, "artist portrait-") {
+		t.Fatalf("got.Name = %q, want prefix %q", got.Name, "artist portrait-")
+	}
+	if !strings.HasSuffix(got.Name, ".jpg") {
+		t.Fatalf("got.Name = %q, want .jpg suffix", got.Name)
+	}
+	if got.URL != "/api/author-photos/"+url.PathEscape(got.Name) {
+		t.Fatalf("got.URL = %q, want %q", got.URL, "/api/author-photos/"+url.PathEscape(got.Name))
+	}
+	if got.Path != got.URL {
+		t.Fatalf("got.Path = %q, want same as URL %q", got.Path, got.URL)
+	}
+	if _, err := os.Stat(filepath.Join(authorPhotosDir, got.Name)); err != nil {
+		t.Fatalf("stored author photo Stat() error = %v", err)
+	}
+}
+
 func TestUploadPlaylistCoverHandlerUpdatesPlaylistCover(t *testing.T) {
 	store := newTestTrackStore(t)
 	auth := newAuthManager([]byte("test-secret"), time.Hour, 24*time.Hour)

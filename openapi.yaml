@@ -17,6 +17,7 @@ tags:
   - name: Albums
   - name: Tracks
   - name: Authors
+  - name: Author Photos
   - name: Search
   - name: Playlists
   - name: Autoplay
@@ -394,6 +395,64 @@ paths:
       responses:
         '200':
           description: Album cover file stream
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/author-photos:
+    post:
+      tags: [Author Photos]
+      summary: Upload author photo
+      description: |
+        Upload an author photo file. The returned `url` can later be stored in an
+        author's `photos` array.
+
+        The server preserves the original extension but rewrites the stored filename
+        by appending a random suffix before the extension.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/FileUploadRequest'
+      responses:
+        '201':
+          description: Uploaded author photo metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/author-photos/{name}:
+    get:
+      tags: [Author Photos]
+      summary: Get author photo file
+      description: |
+        Fetch an author photo file by filename. Author `photos` entries may point
+        to this route using `/api/author-photos/{name}`.
+      parameters:
+        - $ref: '#/components/parameters/FileName'
+      responses:
+        '200':
+          description: Author photo file stream
           content:
             application/octet-stream:
               schema:

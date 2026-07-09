@@ -92,6 +92,7 @@ type albumCoverInfo struct {
 	Name         string    `json:"name"`
 	SizeBytes    int64     `json:"sizeBytes"`
 	LastModified time.Time `json:"lastModified"`
+	Path         string    `json:"path"`
 	URL          string    `json:"url"`
 }
 
@@ -556,6 +557,16 @@ func main() {
 		log.Fatalf("invalid album covers directory %q: %v", albumCoversDir, err)
 	}
 
+	defaultAuthorPhotosDir := filepath.Join(home, "Projects", "esketit_music", "media_storage", "author_photos")
+	authorPhotosDir := os.Getenv("AUTHOR_PHOTOS_DIR")
+	if authorPhotosDir == "" {
+		authorPhotosDir = defaultAuthorPhotosDir
+	}
+
+	if err := ensureDirOrCreate(authorPhotosDir); err != nil {
+		log.Fatalf("invalid author photos directory %q: %v", authorPhotosDir, err)
+	}
+
 	telegramStateDir := os.Getenv("TELEGRAM_STATE_DIR")
 	if telegramStateDir == "" {
 		telegramStateDir = "telegram_state"
@@ -671,6 +682,8 @@ func main() {
 	mux.HandleFunc("GET /api/authors/", getAuthorByIDHandler(store))
 	mux.Handle("PUT /api/authors/", requireRole(auth, store, roleAdmin, updateAuthorHandler(store)))
 	mux.Handle("DELETE /api/authors/", requireRole(auth, store, roleAdmin, deleteAuthorHandler(store)))
+	mux.HandleFunc("GET /api/author-photos/", getAuthorPhotoHandler(authorPhotosDir))
+	mux.Handle("POST /api/author-photos", requireRole(auth, store, roleAdmin, uploadAuthorPhotoHandler(authorPhotosDir)))
 	mux.HandleFunc("POST /api/auth/register", registerHandler(store, auth))
 	mux.HandleFunc("POST /api/auth/login", loginHandler(store, auth))
 	mux.HandleFunc("POST /api/auth/refresh", refreshHandler(store, auth))
@@ -703,6 +716,7 @@ func main() {
 	log.Printf("server listening on %s", addr)
 	log.Printf("serving songs from %s", songsDir)
 	log.Printf("serving album covers from %s", albumCoversDir)
+	log.Printf("serving author photos from %s", authorPhotosDir)
 	log.Printf("using tracks database %s", store.path)
 	log.Printf("telegram state directory %s", telegramStateDir)
 	log.Printf("telegram import temp directory %s", telegramImportTempDir)
@@ -3388,6 +3402,23 @@ func getAlbumCoverHandler(albumCoversDir string) http.HandlerFunc {
 	}
 }
 
+func uploadAuthorPhotoHandler(authorPhotosDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		info, err := uploadMediaFile(w, r, authorPhotosDir, "failed to create author photo file", "/api/author-photos/")
+		if err != nil {
+			writeUploadError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, info)
+	}
+}
+
+func getAuthorPhotoHandler(authorPhotosDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		serveMediaFile(w, r, "/api/author-photos/", authorPhotosDir)
+	}
+}
+
 func buildSongInfo(name string, info os.FileInfo) songInfo {
 	path := "/api/songs/" + url.PathEscape(name)
 	return songInfo{
@@ -3532,11 +3563,13 @@ func uploadMediaFile(w http.ResponseWriter, r *http.Request, dir, createFailureM
 		return albumCoverInfo{}, errors.New("uploaded file is empty")
 	}
 
+	path := urlPrefix + url.PathEscape(name)
 	return albumCoverInfo{
 		Name:         name,
 		SizeBytes:    info.Size(),
 		LastModified: info.ModTime(),
-		URL:          urlPrefix + url.PathEscape(name),
+		Path:         path,
+		URL:          path,
 	}, nil
 }
 
@@ -3576,7 +3609,7 @@ func writeUploadError(w http.ResponseWriter, err error) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case "song already exists", "album cover already exists":
 		http.Error(w, err.Error(), http.StatusConflict)
-	case "failed to create song file", "failed to create album cover file", "failed to save uploaded file", "failed to read saved file":
+	case "failed to create song file", "failed to create album cover file", "failed to create author photo file", "failed to save uploaded file", "failed to read saved file":
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	default:
 		http.Error(w, err.Error(), http.StatusBadRequest)
