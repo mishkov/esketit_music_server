@@ -5661,8 +5661,6 @@ func validatePlaylist(p playlist) error {
 		return fmt.Errorf("%w: name is required", errInvalidPlaylistPayload)
 	case len(p.Name) > maxPlaylistNameLength:
 		return fmt.Errorf("%w: name must be at most %d characters", errInvalidPlaylistPayload, maxPlaylistNameLength)
-	case p.Description == "":
-		return fmt.Errorf("%w: description is required", errInvalidPlaylistPayload)
 	case len(p.Description) > maxPlaylistDescLength:
 		return fmt.Errorf("%w: description must be at most %d characters", errInvalidPlaylistPayload, maxPlaylistDescLength)
 	case normalizePlaylistVisibility(p.Visibility) == "":

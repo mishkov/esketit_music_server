@@ -260,6 +260,38 @@ func TestCreateUserCreatesFavoritesPlaylist(t *testing.T) {
 	}
 }
 
+func TestCreateAndUpdatePlaylistAllowsEmptyDescription(t *testing.T) {
+	store := newTestTrackStore(t)
+
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+
+	created, err := store.createPlaylist(user.ID, upsertPlaylistRequest{
+		Name:       "No Description",
+		Visibility: playlistVisibilityPrivate,
+	})
+	if err != nil {
+		t.Fatalf("createPlaylist() error = %v", err)
+	}
+	if created.Description != "" {
+		t.Fatalf("created.Description = %q, want empty", created.Description)
+	}
+
+	updated, exists, err := store.updatePlaylist(user.ID, created.ID, upsertPlaylistRequest{
+		Name:        "Still No Description",
+		Description: "   ",
+		Visibility:  playlistVisibilityPrivate,
+	})
+	if err != nil || !exists {
+		t.Fatalf("updatePlaylist() exists=%v err=%v, want exists true and nil err", exists, err)
+	}
+	if updated.Description != "" {
+		t.Fatalf("updated.Description = %q, want empty", updated.Description)
+	}
+}
+
 func TestDeleteTrackKeepsUnavailablePlaylistEntry(t *testing.T) {
 	store := newTestTrackStore(t)
 

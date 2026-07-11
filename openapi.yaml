@@ -2490,13 +2490,12 @@ components:
           maxLength: 200
         description:
           type: string
-          minLength: 1
           maxLength: 1000
         coverImagePath:
           type: string
         visibility:
           $ref: '#/components/schemas/PlaylistVisibility'
-      required: [name, description, coverImagePath, visibility]
+      required: [name, coverImagePath, visibility]
 
     AddTrackToPlaylistsRequest:
       type: object
