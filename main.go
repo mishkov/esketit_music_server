@@ -59,6 +59,10 @@ const (
 	playlistVisibilityShared        = "shared"
 	playlistKindCustom              = "custom"
 	playlistKindFavorites           = "favorites"
+	trackListSortID                 = "id"
+	trackListSortCreatedAt          = "createdAt"
+	sortOrderAsc                    = "asc"
+	sortOrderDesc                   = "desc"
 	autoplaySourceMyVibe            = "my_vibe"
 	autoplaySourcePlaylist          = "playlist"
 	autoplaySourceAlbum             = "album"
@@ -128,6 +132,7 @@ type track struct {
 	AudioFilePath  string           `json:"audioFilePath"`
 	AdditionalInfo []additionalInfo `json:"additionalInfo"`
 	SourceMetadata []sourceMetadata `json:"sourceMetadata"`
+	CreatedAt      time.Time        `json:"createdAt"`
 }
 
 type lyrics struct {
@@ -323,6 +328,7 @@ type trackResponse struct {
 	AudioFilePath  string           `json:"audioFilePath"`
 	AdditionalInfo []additionalInfo `json:"additionalInfo"`
 	SourceMetadata []sourceMetadata `json:"sourceMetadata"`
+	CreatedAt      time.Time        `json:"createdAt"`
 	IsFavorite     bool             `json:"isFavorite"`
 	IsAvailable    bool             `json:"isAvailable"`
 }
@@ -434,6 +440,8 @@ type trackListFilter struct {
 	AuthorID int64
 	AlbumID  int64
 	Query    string
+	Sort     string
+	Order    string
 }
 
 type paginatedTracks struct {
@@ -1151,6 +1159,7 @@ func (s *trackStore) loadDiskDBFileLocked(file diskDBFile) error {
 			s.nextTrackID = t.ID + 1
 		}
 	}
+	s.backfillMissingTrackCreatedAtLocked(time.Now().UTC().Truncate(time.Second))
 
 	for _, u := range file.Users {
 		u.Email = normalizeEmail(u.Email)
@@ -1339,7 +1348,8 @@ func (s *trackStore) initSQLiteSchema() error {
 			album_id INTEGER NOT NULL,
 			audio_file_path TEXT NOT NULL,
 			additional_info_json TEXT NOT NULL,
-			source_metadata_json TEXT NOT NULL
+			source_metadata_json TEXT NOT NULL,
+			created_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS users (
 			id INTEGER PRIMARY KEY,
@@ -1409,6 +1419,84 @@ func (s *trackStore) initSQLiteSchema() error {
 			return err
 		}
 	}
+	if err := s.ensureTrackCreatedAtColumn(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *trackStore) ensureTrackCreatedAtColumn() error {
+	rows, err := s.db.Query(`PRAGMA table_info(tracks)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	hasCreatedAt := false
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == "created_at" {
+			hasCreatedAt = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if hasCreatedAt {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if _, err := tx.Exec(`ALTER TABLE tracks ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+
+	idRows, err := tx.Query(`SELECT id FROM tracks ORDER BY id DESC`)
+	if err != nil {
+		return err
+	}
+	trackIDs := []int64{}
+	for idRows.Next() {
+		var id int64
+		if err := idRows.Scan(&id); err != nil {
+			_ = idRows.Close()
+			return err
+		}
+		trackIDs = append(trackIDs, id)
+	}
+	if err := idRows.Close(); err != nil {
+		return err
+	}
+
+	migrationTime := time.Now().UTC().Truncate(time.Second)
+	for index, id := range trackIDs {
+		createdAt := migrationTime.Add(-time.Duration(index) * time.Second)
+		if _, err := tx.Exec(`UPDATE tracks SET created_at = ? WHERE id = ?`, formatSQLiteTime(createdAt), id); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
 	return nil
 }
 
@@ -1555,7 +1643,7 @@ func (s *trackStore) loadSQLiteAlbums(file *diskDBFile) error {
 }
 
 func (s *trackStore) loadSQLiteTracks(file *diskDBFile) error {
-	rows, err := s.db.Query(`SELECT id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json FROM tracks ORDER BY id`)
+	rows, err := s.db.Query(`SELECT id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at FROM tracks ORDER BY id`)
 	if err != nil {
 		return err
 	}
@@ -1563,8 +1651,8 @@ func (s *trackStore) loadSQLiteTracks(file *diskDBFile) error {
 
 	for rows.Next() {
 		var item track
-		var authorIDsJSON, additionalInfoJSON, sourceMetadataJSON string
-		if err := rows.Scan(&item.ID, &item.Name, &authorIDsJSON, &item.AlbumID, &item.AudioFilePath, &additionalInfoJSON, &sourceMetadataJSON); err != nil {
+		var authorIDsJSON, additionalInfoJSON, sourceMetadataJSON, createdAt string
+		if err := rows.Scan(&item.ID, &item.Name, &authorIDsJSON, &item.AlbumID, &item.AudioFilePath, &additionalInfoJSON, &sourceMetadataJSON, &createdAt); err != nil {
 			return err
 		}
 		if err := unmarshalJSONColumn(authorIDsJSON, &item.AuthorIDs); err != nil {
@@ -1576,6 +1664,11 @@ func (s *trackStore) loadSQLiteTracks(file *diskDBFile) error {
 		if err := unmarshalJSONColumn(sourceMetadataJSON, &item.SourceMetadata); err != nil {
 			return err
 		}
+		parsedCreatedAt, err := parseSQLiteTime(createdAt)
+		if err != nil {
+			return err
+		}
+		item.CreatedAt = parsedCreatedAt
 		raw, err := json.Marshal(item)
 		if err != nil {
 			return err
@@ -1925,6 +2018,7 @@ func (s *trackStore) create(req upsertTrackRequest) (track, error) {
 		AudioFilePath:  normalizeAudioFilePath(req.AudioFilePath),
 		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
 		SourceMetadata: normalizeSourceMetadata(req.SourceMetadata),
+		CreatedAt:      time.Now().UTC(),
 	}
 	if err := s.validateTrackLocked(t); err != nil {
 		return track{}, err
@@ -1978,6 +2072,7 @@ func (s *trackStore) update(id int64, req upsertTrackRequest) (track, bool, erro
 		AudioFilePath:  normalizeAudioFilePath(req.AudioFilePath),
 		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
 		SourceMetadata: normalizeSourceMetadata(req.SourceMetadata),
+		CreatedAt:      current.CreatedAt,
 	}
 	if err := s.validateTrackLocked(updated); err != nil {
 		return track{}, true, err
@@ -2475,7 +2570,7 @@ func (s *trackStore) nextAutoplayTracks(userID int64, req autoplayNextRequest) (
 		}
 		selected := candidates[index]
 		_, isFavorite := favoriteIDs[selected.ID]
-		chosen = append(chosen, toTrackResponse(selected, isFavorite, true))
+		chosen = append(chosen, s.toTrackResponseLocked(selected, isFavorite, true))
 		candidates = append(candidates[:index], candidates[index+1:]...)
 	}
 
@@ -2975,6 +3070,25 @@ func (s *trackStore) getOrCreateAuthorIDLocked(name string) int64 {
 	return id
 }
 
+func (s *trackStore) backfillMissingTrackCreatedAtLocked(baseTime time.Time) {
+	ids := make([]int64, 0, len(s.tracks))
+	for id, item := range s.tracks {
+		if item.CreatedAt.IsZero() {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return ids[i] > ids[j]
+	})
+
+	baseTime = baseTime.UTC().Truncate(time.Second)
+	for index, id := range ids {
+		item := s.tracks[id]
+		item.CreatedAt = baseTime.Add(-time.Duration(index) * time.Second)
+		s.tracks[id] = item
+	}
+}
+
 func (s *trackStore) persistLocked() error {
 	if s.db == nil {
 		return errors.New("sqlite database is not initialized")
@@ -3126,7 +3240,7 @@ func (s *trackStore) persistLocked() error {
 			return err
 		}
 		if _, err := tx.Exec(
-			`INSERT INTO tracks (id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO tracks (id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			t.ID,
 			t.Name,
 			authorIDsJSON,
@@ -3134,6 +3248,7 @@ func (s *trackStore) persistLocked() error {
 			t.AudioFilePath,
 			additionalInfoJSON,
 			sourceMetadataJSON,
+			formatSQLiteTime(t.CreatedAt),
 		); err != nil {
 			return err
 		}
@@ -4128,7 +4243,7 @@ func createTrackHandler(store *trackStore) http.HandlerFunc {
 			http.Error(w, "failed to create track", http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, http.StatusCreated, toTrackResponse(t, false, true))
+		writeJSON(w, http.StatusCreated, store.toTrackResponse(t, false, true))
 	}
 }
 
@@ -4185,7 +4300,7 @@ func updateTrackHandler(store *trackStore) http.HandlerFunc {
 			http.Error(w, "failed to update track", http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, http.StatusOK, toTrackResponse(t, false, true))
+		writeJSON(w, http.StatusOK, store.toTrackResponse(t, false, true))
 	}
 }
 
@@ -5901,11 +6016,11 @@ func publicPlaylistResponse(p playlistResponse) playlistResponse {
 func (s *trackStore) buildPlaylistTrackResponseLocked(item playlistTrack, favoriteIDs map[int64]struct{}) trackResponse {
 	if current, ok := s.tracks[item.TrackID]; ok {
 		_, isFavorite := favoriteIDs[item.TrackID]
-		return toTrackResponse(current, isFavorite, true)
+		return s.toTrackResponseLocked(current, isFavorite, true)
 	}
 	if item.UnavailableTrack != nil {
 		_, isFavorite := favoriteIDs[item.TrackID]
-		return toTrackResponse(*item.UnavailableTrack, isFavorite, false)
+		return s.toTrackResponseLocked(*item.UnavailableTrack, isFavorite, false)
 	}
 	return trackResponse{
 		ID:          item.TrackID,
@@ -5932,10 +6047,27 @@ func (s *trackStore) listTrackResponses(userID int64, filter trackListFilter) pa
 			continue
 		}
 		_, isFavorite := favoriteIDs[t.ID]
-		items = append(items, toTrackResponse(t, isFavorite, true))
+		items = append(items, s.toTrackResponseLocked(t, isFavorite, true))
 	}
 	sort.Slice(items, func(i, j int) bool {
-		return items[i].ID < items[j].ID
+		switch filter.Sort {
+		case trackListSortCreatedAt:
+			if !items[i].CreatedAt.Equal(items[j].CreatedAt) {
+				if filter.Order == sortOrderDesc {
+					return items[i].CreatedAt.After(items[j].CreatedAt)
+				}
+				return items[i].CreatedAt.Before(items[j].CreatedAt)
+			}
+			if filter.Order == sortOrderDesc {
+				return items[i].ID > items[j].ID
+			}
+			return items[i].ID < items[j].ID
+		default:
+			if filter.Order == sortOrderDesc {
+				return items[i].ID > items[j].ID
+			}
+			return items[i].ID < items[j].ID
+		}
 	})
 
 	page := normalizePage(filter.Page)
@@ -5972,7 +6104,7 @@ func (s *trackStore) getTrackResponse(trackID, userID int64) (trackResponse, boo
 		return trackResponse{}, false
 	}
 	_, isFavorite := s.favoriteTrackSetLocked(userID)[trackID]
-	return toTrackResponse(t, isFavorite, true), true
+	return s.toTrackResponseLocked(t, isFavorite, true), true
 }
 
 func (s *trackStore) markTrackUnavailableLocked(t track) {
@@ -6181,6 +6313,24 @@ func parseTrackListFilter(values url.Values) (trackListFilter, error) {
 		Page:     parseIntWithDefault(values.Get("page"), 1),
 		PageSize: parseIntWithDefault(values.Get("pageSize"), 20),
 		Query:    strings.TrimSpace(values.Get("query")),
+		Sort:     trackListSortID,
+		Order:    sortOrderAsc,
+	}
+	if rawSort := strings.TrimSpace(values.Get("sort")); rawSort != "" {
+		switch rawSort {
+		case trackListSortID, trackListSortCreatedAt:
+			filter.Sort = rawSort
+		default:
+			return trackListFilter{}, errors.New("sort must be one of id, createdAt")
+		}
+	}
+	if rawOrder := strings.ToLower(strings.TrimSpace(values.Get("order"))); rawOrder != "" {
+		switch rawOrder {
+		case sortOrderAsc, sortOrderDesc:
+			filter.Order = rawOrder
+		default:
+			return trackListFilter{}, errors.New("order must be one of asc, desc")
+		}
 	}
 	if rawAuthorID := strings.TrimSpace(values.Get("authorId")); rawAuthorID != "" {
 		authorID, err := strconv.ParseInt(rawAuthorID, 10, 64)
@@ -6325,13 +6475,29 @@ func toTrackResponse(t track, isFavorite, isAvailable bool) trackResponse {
 		AudioFilePath:  normalizeAudioFilePath(t.AudioFilePath),
 		AdditionalInfo: normalizeAdditionalInfo(t.AdditionalInfo),
 		SourceMetadata: normalizeSourceMetadata(t.SourceMetadata),
+		CreatedAt:      t.CreatedAt,
 		IsFavorite:     isFavorite,
 		IsAvailable:    isAvailable,
 	}
 }
 
+func (s *trackStore) toTrackResponse(t track, isFavorite, isAvailable bool) trackResponse {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.toTrackResponseLocked(t, isFavorite, isAvailable)
+}
+
+func (s *trackStore) toTrackResponseLocked(t track, isFavorite, isAvailable bool) trackResponse {
+	response := toTrackResponse(t, isFavorite, isAvailable)
+	if albumItem, ok := s.albums[t.AlbumID]; ok {
+		response.CoverImagePath = albumItem.CoverImagePath
+	}
+	return response
+}
+
 func (s *trackStore) toSearchTrackResponseLocked(t track, isFavorite bool) trackResponse {
-	response := toTrackResponse(t, isFavorite, true)
+	response := s.toTrackResponseLocked(t, isFavorite, true)
 	response.Authors = make([]author, 0, len(t.AuthorIDs))
 	for _, authorID := range t.AuthorIDs {
 		a, ok := s.authors[authorID]
@@ -6339,9 +6505,6 @@ func (s *trackStore) toSearchTrackResponseLocked(t track, isFavorite bool) track
 			continue
 		}
 		response.Authors = append(response.Authors, cloneAuthor(a))
-	}
-	if albumItem, ok := s.albums[t.AlbumID]; ok {
-		response.CoverImagePath = albumItem.CoverImagePath
 	}
 	return response
 }

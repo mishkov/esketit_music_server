@@ -1547,9 +1547,23 @@ paths:
             type: integer
             minimum: 1
           description: Filter tracks by album ID
+        - in: query
+          name: sort
+          schema:
+            type: string
+            enum: [id, createdAt]
+            default: id
+          description: Sort tracks by ID or creation time
+        - in: query
+          name: order
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: asc
+          description: Sort direction
       responses:
         '200':
-          description: Paginated track list sorted by ID asc
+          description: Paginated track list sorted by the requested sort and order, defaulting to ID asc
           content:
             application/json:
               schema:
@@ -2325,8 +2339,7 @@ components:
         coverImagePath:
           type: string
           description: |
-            Album cover path when a track response is enriched for display, such
-            as track results returned from `/api/search`.
+            Album cover path for the track's album when available.
         audioFilePath:
           type: string
         additionalInfo:
@@ -2337,11 +2350,14 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SourceMetadata'
+        createdAt:
+          type: string
+          format: date-time
         isFavorite:
           type: boolean
         isAvailable:
           type: boolean
-      required: [id, name, authorIds, albumId, audioFilePath, additionalInfo, sourceMetadata, isFavorite, isAvailable]
+      required: [id, name, authorIds, albumId, audioFilePath, additionalInfo, sourceMetadata, createdAt, isFavorite, isAvailable]
 
     UpsertTrackRequest:
       type: object

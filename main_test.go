@@ -531,15 +531,17 @@ func TestListTrackResponsesAppliesPaginationFiltersAndSearch(t *testing.T) {
 		t.Fatalf("createAuthor() artist two error = %v", err)
 	}
 	albumOne, err := store.createAlbum(upsertAlbumRequest{
-		Title:       "Album One",
-		ReleaseDate: time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+		Title:          "Album One",
+		CoverImagePath: "/api/album-covers/album-one.jpg",
+		ReleaseDate:    time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
 	})
 	if err != nil {
 		t.Fatalf("createAlbum() album one error = %v", err)
 	}
 	albumTwo, err := store.createAlbum(upsertAlbumRequest{
-		Title:       "Album Two",
-		ReleaseDate: time.Date(2024, time.February, 1, 0, 0, 0, 0, time.UTC),
+		Title:          "Album Two",
+		CoverImagePath: "/api/album-covers/album-two.jpg",
+		ReleaseDate:    time.Date(2024, time.February, 1, 0, 0, 0, 0, time.UTC),
 	})
 	if err != nil {
 		t.Fatalf("createAlbum() album two error = %v", err)
@@ -608,19 +610,89 @@ func TestListTrackResponsesAppliesPaginationFiltersAndSearch(t *testing.T) {
 	if albumPage.Items[0].Name != "Morning Light" {
 		t.Fatalf("albumPage.Items[0].Name = %q, want Morning Light", albumPage.Items[0].Name)
 	}
+	if albumPage.Items[0].CoverImagePath != "/api/album-covers/album-one.jpg" {
+		t.Fatalf("albumPage.Items[0].CoverImagePath = %q, want album cover", albumPage.Items[0].CoverImagePath)
+	}
+}
+
+func TestListTrackResponsesSortsByCreatedAtDesc(t *testing.T) {
+	store := newTestTrackStore(t)
+	artist, album := seedTrackDependencies(t, store)
+
+	first, err := store.create(upsertTrackRequest{
+		Name:          "First",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       album.ID,
+		AudioFilePath: "/api/songs/first.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create() first error = %v", err)
+	}
+	second, err := store.create(upsertTrackRequest{
+		Name:          "Second",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       album.ID,
+		AudioFilePath: "/api/songs/second.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create() second error = %v", err)
+	}
+	third, err := store.create(upsertTrackRequest{
+		Name:          "Third",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       album.ID,
+		AudioFilePath: "/api/songs/third.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create() third error = %v", err)
+	}
+
+	baseTime := time.Date(2026, time.July, 12, 9, 0, 0, 0, time.UTC)
+	store.mu.Lock()
+	first.CreatedAt = baseTime
+	second.CreatedAt = baseTime.Add(time.Second)
+	third.CreatedAt = baseTime.Add(time.Second)
+	store.tracks[first.ID] = first
+	store.tracks[second.ID] = second
+	store.tracks[third.ID] = third
+	store.mu.Unlock()
+
+	page := store.listTrackResponses(0, trackListFilter{
+		Sort:  trackListSortCreatedAt,
+		Order: sortOrderDesc,
+	})
+	wantIDs := []int64{third.ID, second.ID, first.ID}
+	if len(page.Items) != len(wantIDs) {
+		t.Fatalf("len(page.Items) = %d, want %d", len(page.Items), len(wantIDs))
+	}
+	for index, wantID := range wantIDs {
+		if page.Items[index].ID != wantID {
+			t.Fatalf("page.Items[%d].ID = %d, want %d", index, page.Items[index].ID, wantID)
+		}
+	}
 }
 
 func TestListTracksHandlerRejectsInvalidTrackFilters(t *testing.T) {
-	store := newTestTrackStore(t)
-	handler := listTracksHandler(store, nil)
+	tests := []string{
+		"/api/tracks?authorId=0",
+		"/api/tracks?sort=name",
+		"/api/tracks?order=newest",
+	}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/tracks?authorId=0", nil)
-	rec := httptest.NewRecorder()
+	for _, target := range tests {
+		t.Run(target, func(t *testing.T) {
+			store := newTestTrackStore(t)
+			handler := listTracksHandler(store, nil)
 
-	handler.ServeHTTP(rec, req)
+			req := httptest.NewRequest(http.MethodGet, target, nil)
+			rec := httptest.NewRecorder()
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+			}
+		})
 	}
 }
 
@@ -1747,6 +1819,12 @@ func TestNewTrackStorePersistsAndReloadsSQLiteData(t *testing.T) {
 	if reloadedTrack.Name != "Reloaded Track" || !reloadedTrack.IsFavorite {
 		t.Fatalf("reloaded track = %#v", reloadedTrack)
 	}
+	if reloadedTrack.CreatedAt.IsZero() {
+		t.Fatal("reloaded track CreatedAt is zero, want persisted creation time")
+	}
+	if !reloadedTrack.CreatedAt.Equal(trackItem.CreatedAt) {
+		t.Fatalf("reloaded track CreatedAt = %s, want %s", reloadedTrack.CreatedAt, trackItem.CreatedAt)
+	}
 	reloadedUser, ok := reloaded.getUserByEmail("listener@example.com")
 	if !ok || reloadedUser.ID != user.ID {
 		t.Fatalf("reloaded user = %#v, ok=%v", reloadedUser, ok)
@@ -1768,6 +1846,77 @@ func TestNewTrackStorePersistsAndReloadsSQLiteData(t *testing.T) {
 	}
 	if !deleted {
 		t.Fatal("deleteRefreshSession() deleted = false, want true")
+	}
+}
+
+func TestNewTrackStoreMigratesTrackCreatedAtColumn(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "tracks.db")
+	db, err := openSQLiteDB(dbPath)
+	if err != nil {
+		t.Fatalf("openSQLiteDB() error = %v", err)
+	}
+	statements := []string{
+		`CREATE TABLE authors (
+			id INTEGER PRIMARY KEY,
+			current_name TEXT NOT NULL,
+			photos_json TEXT NOT NULL
+		)`,
+		`CREATE TABLE albums (
+			id INTEGER PRIMARY KEY,
+			title TEXT NOT NULL,
+			cover_image_path TEXT NOT NULL,
+			author_ids_json TEXT NOT NULL,
+			release_date TEXT NOT NULL,
+			is_published INTEGER NOT NULL,
+			track_ids_json TEXT NOT NULL,
+			additional_info_json TEXT NOT NULL
+		)`,
+		`CREATE TABLE tracks (
+			id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			author_ids_json TEXT NOT NULL,
+			album_id INTEGER NOT NULL,
+			audio_file_path TEXT NOT NULL,
+			additional_info_json TEXT NOT NULL,
+			source_metadata_json TEXT NOT NULL
+		)`,
+		`INSERT INTO authors (id, current_name, photos_json) VALUES (1, 'Artist', '[]')`,
+		`INSERT INTO albums (id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json) VALUES (1, 'Album', '', '[1]', '` + formatSQLiteTime(time.Date(2026, time.July, 12, 0, 0, 0, 0, time.UTC)) + `', 1, '[5,10]', '[]')`,
+		`INSERT INTO tracks (id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json) VALUES (5, 'Older Track', '[1]', 1, '/api/songs/older.mp3', '[]', '[]')`,
+		`INSERT INTO tracks (id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json) VALUES (10, 'Newer Track', '[1]', 1, '/api/songs/newer.mp3', '[]', '[]')`,
+	}
+	for _, statement := range statements {
+		if _, err := db.Exec(statement); err != nil {
+			_ = db.Close()
+			t.Fatalf("Exec(%q) error = %v", statement, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	store, err := newTrackStore(dbPath)
+	if err != nil {
+		t.Fatalf("newTrackStore() error = %v", err)
+	}
+	defer store.db.Close()
+
+	newer, ok := store.getTrackResponse(10, 0)
+	if !ok {
+		t.Fatal("getTrackResponse(10) ok = false, want true")
+	}
+	older, ok := store.getTrackResponse(5, 0)
+	if !ok {
+		t.Fatal("getTrackResponse(5) ok = false, want true")
+	}
+	if newer.CreatedAt.IsZero() || older.CreatedAt.IsZero() {
+		t.Fatalf("migrated CreatedAt values = %s and %s, want non-zero", newer.CreatedAt, older.CreatedAt)
+	}
+	if !newer.CreatedAt.After(older.CreatedAt) {
+		t.Fatalf("newer.CreatedAt = %s, older.CreatedAt = %s; want newer after older", newer.CreatedAt, older.CreatedAt)
+	}
+	if newer.CreatedAt.Sub(older.CreatedAt) != 1*time.Second {
+		t.Fatalf("createdAt spacing = %s, want 1s", newer.CreatedAt.Sub(older.CreatedAt))
 	}
 }
 
