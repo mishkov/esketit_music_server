@@ -636,6 +636,7 @@ func main() {
 	auth := newAuthManager([]byte(authSecret), defaultAccessTokenTTL, defaultRefreshTokenTTL)
 	logMode := resolveLogMode(os.Getenv("LOG_MODE"))
 	albumCoverService := newAlbumCoverServiceFromEnv(albumCoversDir)
+	lyricsSearchService := newLyricsSearchServiceFromEnv()
 	telegramConfig, err := loadTelegramConfig(telegramStateDir, telegramImportTempDir)
 	if err != nil {
 		log.Fatalf("failed to initialize telegram configuration: %v", err)
@@ -682,7 +683,7 @@ func main() {
 	mux.HandleFunc("GET /api/tracks", listTracksHandler(store, auth))
 	mux.Handle("POST /api/tracks", requireRole(auth, store, roleAdmin, createTrackHandler(store)))
 	mux.Handle("GET /api/tracks/", getTrackByRouteHandler(store, auth))
-	mux.Handle("POST /api/tracks/", postTrackByRouteHandler(store, auth))
+	mux.Handle("POST /api/tracks/", postTrackByRouteHandler(store, auth, lyricsSearchService))
 	mux.Handle("PUT /api/tracks/", putTrackByRouteHandler(store, auth))
 	mux.Handle("DELETE /api/tracks/", deleteTrackByRouteHandler(store, auth))
 	mux.HandleFunc("GET /api/authors", listAuthorsHandler(store))
@@ -4325,8 +4326,12 @@ func deleteTrackHandler(store *trackStore) http.HandlerFunc {
 	}
 }
 
-func postTrackByRouteHandler(store *trackStore, auth *authManager) http.HandlerFunc {
+func postTrackByRouteHandler(store *trackStore, auth *authManager, lyricsSearch *lyricsSearchService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/lyrics/search") {
+			requireRole(auth, store, roleAdmin, lyricsSearchHandler(store, lyricsSearch)).ServeHTTP(w, r)
+			return
+		}
 		if strings.HasSuffix(r.URL.Path, "/playlists") {
 			requireAuth(auth, store, addTrackToPlaylistsHandler(store)).ServeHTTP(w, r)
 			return
