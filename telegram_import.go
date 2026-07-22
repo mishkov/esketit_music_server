@@ -22,6 +22,7 @@ import (
 	tauth "github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 )
 
 const (
@@ -110,8 +111,12 @@ type telegramGateway interface {
 	BeginLogin(ctx context.Context, phoneNumber string) (string, error)
 	ConfirmLogin(ctx context.Context, phoneNumber, code, codeHash string) (telegramAuthStatus, error)
 	PasswordLogin(ctx context.Context, password string) (telegramAuthStatus, error)
-	ScanPublicChannel(ctx context.Context, channelUsername string) ([]telegramScannedTrack, error)
+	ScanPublicChannel(ctx context.Context, channelUsername string, startMessageID int) ([]telegramScannedTrack, error)
 	DownloadTrack(ctx context.Context, item telegramScannedTrack, destinationPath string) error
+}
+
+type telegramHistoryClient interface {
+	MessagesGetHistory(ctx context.Context, request *tg.MessagesGetHistoryRequest) (tg.MessagesMessagesClass, error)
 }
 
 type gotdTelegramGateway struct {
@@ -254,7 +259,7 @@ func (g *gotdTelegramGateway) PasswordLogin(ctx context.Context, password string
 	return result, err
 }
 
-func (g *gotdTelegramGateway) ScanPublicChannel(ctx context.Context, channelUsername string) ([]telegramScannedTrack, error) {
+func (g *gotdTelegramGateway) ScanPublicChannel(ctx context.Context, channelUsername string, startMessageID int) ([]telegramScannedTrack, error) {
 	items := make([]telegramScannedTrack, 0)
 	err := g.runWithTimeout(ctx, g.cfg.ScanTimeout, func(runCtx context.Context, client *telegram.Client) error {
 		authStatus, err := client.Auth().Status(runCtx)
@@ -271,51 +276,75 @@ func (g *gotdTelegramGateway) ScanPublicChannel(ctx context.Context, channelUser
 			return err
 		}
 
-		offsetID := 0
-		seenMessageIDs := make(map[int]struct{})
-		for {
-			previousOffsetID := offsetID
-			history, err := api.MessagesGetHistory(runCtx, &tg.MessagesGetHistoryRequest{
-				Peer:     inputPeer,
-				OffsetID: offsetID,
-				Limit:    telegramScanBatchSize,
-			})
-			if err != nil {
-				return err
-			}
-
-			messages := extractMessages(history)
-			if len(messages) == 0 {
-				break
-			}
-
-			batchProgressed := false
-			for _, message := range messages {
-				if _, seen := seenMessageIDs[message.ID]; seen {
-					continue
-				}
-				seenMessageIDs[message.ID] = struct{}{}
-				offsetID = message.ID
-				batchProgressed = true
-				item, ok := buildScannedTrack(channel.Username, message)
-				if !ok {
-					continue
-				}
-				items = append(items, item)
-			}
-
-			if !batchProgressed || offsetID == previousOffsetID {
-				return errTelegramScanStalled
-			}
-		}
-
-		return nil
+		items, err = scanPublicChannelHistory(runCtx, api, channel.Username, inputPeer, startMessageID)
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
 	if len(items) == 0 {
 		return nil, errTelegramNoAudioTracks
+	}
+
+	return items, nil
+}
+
+func scanPublicChannelHistory(ctx context.Context, api telegramHistoryClient, channelUsername string, inputPeer tg.InputPeerClass, startMessageID int) ([]telegramScannedTrack, error) {
+	items := make([]telegramScannedTrack, 0)
+	offsetID := 0
+	minMessageID := 0
+	if startMessageID > 0 {
+		// Telegram treats MinID as exclusive, so subtract one to include the
+		// requested starting message itself.
+		minMessageID = startMessageID - 1
+	}
+	seenMessageIDs := make(map[int]struct{})
+	for {
+		previousOffsetID := offsetID
+		var history tg.MessagesMessagesClass
+		for {
+			var err error
+			history, err = api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+				Peer:     inputPeer,
+				OffsetID: offsetID,
+				Limit:    telegramScanBatchSize,
+				MinID:    minMessageID,
+			})
+			if flood, waitErr := tgerr.FloodWait(ctx, err); waitErr != nil {
+				if flood {
+					continue
+				}
+				return nil, waitErr
+			}
+			break
+		}
+
+		messages := extractMessages(history)
+		if len(messages) == 0 {
+			break
+		}
+
+		batchProgressed := false
+		for _, message := range messages {
+			if message.ID < startMessageID {
+				continue
+			}
+			if _, seen := seenMessageIDs[message.ID]; seen {
+				continue
+			}
+			seenMessageIDs[message.ID] = struct{}{}
+			offsetID = message.ID
+			batchProgressed = true
+			item, ok := buildScannedTrack(channelUsername, message)
+			if !ok {
+				continue
+			}
+			items = append(items, item)
+		}
+
+		if !batchProgressed || offsetID == previousOffsetID {
+			return nil, errTelegramScanStalled
+		}
 	}
 
 	sort.Slice(items, func(i, j int) bool {
@@ -581,7 +610,7 @@ func (s *telegramImportService) StartSession(ctx context.Context, userID int64, 
 		_ = s.cleanupSessionFiles(existing)
 	}
 
-	items, err := s.gateway.ScanPublicChannel(ctx, channelUsername)
+	items, err := s.gateway.ScanPublicChannel(ctx, channelUsername, startMessageID)
 	if err != nil {
 		return telegramImportSessionDTO{}, err
 	}

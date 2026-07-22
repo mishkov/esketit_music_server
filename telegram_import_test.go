@@ -8,13 +8,16 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gotd/td/tg"
 )
 
 type fakeTelegramGateway struct {
-	status       telegramAuthStatus
-	scannedItems []telegramScannedTrack
-	downloadData []byte
-	passwordAuth bool
+	status             telegramAuthStatus
+	scannedItems       []telegramScannedTrack
+	downloadData       []byte
+	passwordAuth       bool
+	scanStartMessageID int
 }
 
 func (f *fakeTelegramGateway) Status(context.Context) (telegramAuthStatus, error) {
@@ -42,7 +45,8 @@ func (f *fakeTelegramGateway) PasswordLogin(context.Context, string) (telegramAu
 	return result, nil
 }
 
-func (f *fakeTelegramGateway) ScanPublicChannel(context.Context, string) ([]telegramScannedTrack, error) {
+func (f *fakeTelegramGateway) ScanPublicChannel(_ context.Context, _ string, startMessageID int) ([]telegramScannedTrack, error) {
+	f.scanStartMessageID = startMessageID
 	if len(f.scannedItems) == 0 {
 		return nil, errTelegramNoAudioTracks
 	}
@@ -300,7 +304,7 @@ func TestTelegramAuthPasswordFlow(t *testing.T) {
 }
 
 func TestTelegramImportStartSessionFiltersFromMessageIDInclusive(t *testing.T) {
-	service, _, _, _ := newTelegramImportTestService(t, &fakeTelegramGateway{
+	gateway := &fakeTelegramGateway{
 		status: telegramAuthStatus{Configured: true, Authorized: true},
 		scannedItems: []telegramScannedTrack{
 			{
@@ -329,7 +333,8 @@ func TestTelegramImportStartSessionFiltersFromMessageIDInclusive(t *testing.T) {
 			},
 		},
 		downloadData: []byte("mp3-bytes"),
-	})
+	}
+	service, _, _, _ := newTelegramImportTestService(t, gateway)
 
 	ctx := context.Background()
 	current, err := service.StartSession(ctx, 1, "test_channel", 20, false)
@@ -341,6 +346,70 @@ func TestTelegramImportStartSessionFiltersFromMessageIDInclusive(t *testing.T) {
 	}
 	if current.Progress.Total != 2 || current.Progress.Remaining != 2 {
 		t.Fatalf("CurrentSession() progress = %#v", current.Progress)
+	}
+	if gateway.scanStartMessageID != 20 {
+		t.Fatalf("ScanPublicChannel() startMessageID = %d, want 20", gateway.scanStartMessageID)
+	}
+}
+
+type fakeTelegramHistoryClient struct {
+	requests  []*tg.MessagesGetHistoryRequest
+	responses []tg.MessagesMessagesClass
+}
+
+func (f *fakeTelegramHistoryClient) MessagesGetHistory(_ context.Context, request *tg.MessagesGetHistoryRequest) (tg.MessagesMessagesClass, error) {
+	requestCopy := *request
+	f.requests = append(f.requests, &requestCopy)
+	if len(f.responses) == 0 {
+		return &tg.MessagesMessages{}, nil
+	}
+	response := f.responses[0]
+	f.responses = f.responses[1:]
+	return response, nil
+}
+
+func TestScanPublicChannelHistoryStartsAtMessageIDInclusive(t *testing.T) {
+	peer := &tg.InputPeerChannel{ChannelID: 1, AccessHash: 2}
+	api := &fakeTelegramHistoryClient{
+		responses: []tg.MessagesMessagesClass{
+			&tg.MessagesMessages{Messages: []tg.MessageClass{
+				telegramAudioMessage(30),
+				telegramAudioMessage(20),
+			}},
+			&tg.MessagesMessages{},
+		},
+	}
+
+	items, err := scanPublicChannelHistory(context.Background(), api, "test_channel", peer, 20)
+	if err != nil {
+		t.Fatalf("scanPublicChannelHistory() error = %v", err)
+	}
+	if len(items) != 2 || items[0].MessageID != 20 || items[1].MessageID != 30 {
+		t.Fatalf("scanPublicChannelHistory() items = %#v", items)
+	}
+	if len(api.requests) != 2 {
+		t.Fatalf("MessagesGetHistory() request count = %d, want 2", len(api.requests))
+	}
+	if api.requests[0].MinID != 19 || api.requests[0].OffsetID != 0 {
+		t.Fatalf("first MessagesGetHistory() request = %#v", api.requests[0])
+	}
+	if api.requests[1].MinID != 19 || api.requests[1].OffsetID != 20 {
+		t.Fatalf("second MessagesGetHistory() request = %#v", api.requests[1])
+	}
+}
+
+func telegramAudioMessage(messageID int) *tg.Message {
+	return &tg.Message{
+		ID: messageID,
+		Media: &tg.MessageMediaDocument{Document: &tg.Document{
+			ID:         int64(messageID),
+			AccessHash: int64(messageID),
+			MimeType:   "audio/mpeg",
+			Size:       100,
+			Attributes: []tg.DocumentAttributeClass{
+				&tg.DocumentAttributeFilename{FileName: "track.mp3"},
+			},
+		}},
 	}
 }
 
