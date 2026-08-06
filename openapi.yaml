@@ -731,6 +731,13 @@ paths:
     get:
       tags: [Albums]
       summary: List album tracks in album order
+      description: |
+        Returns every album track. When a valid bearer token is supplied, each
+        track includes the current user's favorite and dislike state; disliked
+        tracks are not removed from the response.
+      security:
+        - bearerAuth: []
+        - {}
       parameters:
         - $ref: '#/components/parameters/ResourceId'
       responses:
@@ -882,7 +889,7 @@ paths:
       description: |
         Upload a cover image for one of the current user's custom playlists.
         The file is stored under `/api/album-covers/{name}` and the playlist's
-        `coverImagePath` is updated to that path. Favorites playlists cannot be
+        `coverImagePath` is updated to that path. System playlists cannot be
         modified through this endpoint.
       security:
         - bearerAuth: []
@@ -970,7 +977,11 @@ paths:
       summary: List tracks for a public playlist
       description: |
         Anonymous-safe playlist tracks endpoint. Only playlists with
-        `visibility` set to `public` are returned.
+        `visibility` set to `public` are returned. When a valid bearer token is
+        supplied, tracks include that user's favorite and dislike state.
+      security:
+        - bearerAuth: []
+        - {}
       parameters:
         - $ref: '#/components/parameters/ResourceId'
         - name: page
@@ -1025,6 +1036,12 @@ paths:
     get:
       tags: [Playlists]
       summary: List tracks for a shared playlist by generated link token
+      description: |
+        When a valid bearer token is supplied, tracks include that user's
+        favorite and dislike state.
+      security:
+        - bearerAuth: []
+        - {}
       parameters:
         - name: shareToken
           in: path
@@ -1170,6 +1187,7 @@ paths:
     put:
       tags: [Playlists]
       summary: Add a track to the current user's favorites playlist
+      description: Favoriting a track also removes it from dislikes.
       security:
         - bearerAuth: []
       parameters:
@@ -1200,6 +1218,40 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /api/tracks/{id}/dislike:
+    put:
+      tags: [Playlists]
+      summary: Add a track to the current user's dislikes playlist
+      description: Disliking a track also removes it from favorites.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '204':
+          description: Disliked
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Playlists]
+      summary: Remove a track from the current user's dislikes playlist
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '204':
+          description: Removed from dislikes
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/search:
     get:
       tags: [Search]
@@ -1275,7 +1327,8 @@ paths:
 
         Event-specific rules:
         - `play`, `pause`, `resume`, `seek`, `track_change`, `track_complete`,
-          `track_skip`, and `playback_error` require `trackId`.
+          `track_skip`, `playback_error`, `track_dislike`, and
+          `track_undislike` require `trackId`.
         - `search` and `search_result_click` require `searchQuery`.
         - `positionMs` and `durationMs` are optional but should be sent whenever
           known. They must be greater than or equal to 0.
@@ -1300,6 +1353,8 @@ paths:
           `resultTrackId`, `resultAlbumId`, `resultAuthorId`, `resultPlaylistId`.
         - `playback_error`: `errorCode`, `errorMessage`, `fatal`, `networkType`,
           `retryable`.
+        - `track_dislike`, `track_undislike`: `sourceType`, `sourceId`,
+          `queueIndex`, `wasPlaying`.
       security:
         - bearerAuth: []
         - {}
@@ -2413,9 +2468,14 @@ components:
           format: date-time
         isFavorite:
           type: boolean
+        isDisliked:
+          type: boolean
+          description: |
+            Current authenticated user's dislike state. False for anonymous
+            responses. Disliked tracks remain visible and may be played manually.
         isAvailable:
           type: boolean
-      required: [id, name, authorIds, albumId, audioFilePath, additionalInfo, sourceMetadata, createdAt, isFavorite, isAvailable]
+      required: [id, name, authorIds, albumId, audioFilePath, additionalInfo, sourceMetadata, createdAt, isFavorite, isDisliked, isAvailable]
 
     UpsertTrackRequest:
       type: object
@@ -2619,6 +2679,10 @@ components:
       type: string
       enum: [private, public, shared]
 
+    PlaylistKind:
+      type: string
+      enum: [custom, favorites, dislikes]
+
     Playlist:
       type: object
       properties:
@@ -2640,12 +2704,15 @@ components:
           type: integer
         system:
           type: boolean
+        kind:
+          $ref: '#/components/schemas/PlaylistKind'
         isFavorites:
           type: boolean
+          description: Deprecated compatibility field; use `kind` instead.
         shareToken:
           type: string
           description: Present for owner-facing responses when visibility is `shared`.
-      required: [id, userId, name, description, coverImagePath, visibility, trackCount, system, isFavorites]
+      required: [id, userId, name, description, coverImagePath, visibility, trackCount, system, kind, isFavorites]
 
     UpsertPlaylistRequest:
       type: object
@@ -3109,6 +3176,8 @@ components:
             - search
             - search_result_click
             - playback_error
+            - track_dislike
+            - track_undislike
           description: Event type. Values are lowercase snake_case.
         trackId:
           type: integer

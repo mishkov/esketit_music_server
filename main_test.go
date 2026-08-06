@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -170,6 +171,32 @@ func TestAnalyticsEventsHandlerAttachesUserAndDeduplicatesRetries(t *testing.T) 
 	}
 }
 
+func TestAnalyticsEventsHandlerAcceptsDislikeEvents(t *testing.T) {
+	store := newTestTrackStore(t)
+	handler := analyticsEventsHandler(store, newAuthManager([]byte("test-secret"), time.Hour, time.Hour))
+	body := `{
+		"clientId": "install-1",
+		"sessionId": "session-1",
+		"events": [
+			{"eventId":"event-dislike-1","type":"track_dislike","trackId":123,"clientTime":"2026-07-02T10:00:00Z"},
+			{"eventId":"event-undislike-1","type":"track_undislike","trackId":123,"clientTime":"2026-07-02T10:00:01Z"}
+		]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/analytics/events", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM analytics_events WHERE event_type IN ('track_dislike', 'track_undislike')`).Scan(&count); err != nil {
+		t.Fatalf("QueryRow() error = %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("stored dislike events = %d, want 2", count)
+	}
+}
+
 func TestAnalyticsEventsHandlerRejectsInvalidRequests(t *testing.T) {
 	store := newTestTrackStore(t)
 	auth := newAuthManager([]byte("test-secret"), time.Hour, time.Hour)
@@ -202,6 +229,20 @@ func TestAnalyticsEventsHandlerRejectsInvalidRequests(t *testing.T) {
 					{
 						"eventId": "event-invalid-2",
 						"type": "search",
+						"clientTime": "2026-07-02T10:00:00Z"
+					}
+				]
+			}`,
+		},
+		{
+			name: "dislike missing track id",
+			body: `{
+				"clientId": "install-1",
+				"sessionId": "session-1",
+				"events": [
+					{
+						"eventId": "event-invalid-dislike",
+						"type": "track_dislike",
 						"clientTime": "2026-07-02T10:00:00Z"
 					}
 				]
@@ -243,7 +284,7 @@ func TestAnalyticsEventsHandlerRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
-func TestCreateUserCreatesFavoritesPlaylist(t *testing.T) {
+func TestCreateUserCreatesSystemPlaylists(t *testing.T) {
 	store := newTestTrackStore(t)
 
 	user, err := store.createUser("user@example.com", "hash")
@@ -252,11 +293,230 @@ func TestCreateUserCreatesFavoritesPlaylist(t *testing.T) {
 	}
 
 	playlists := store.listPlaylists(user.ID, playlistListFilter{})
-	if len(playlists.Items) != 1 {
-		t.Fatalf("playlist count = %d, want 1", len(playlists.Items))
+	if len(playlists.Items) != 2 {
+		t.Fatalf("playlist count = %d, want 2", len(playlists.Items))
 	}
-	if !playlists.Items[0].IsFavorites || !playlists.Items[0].System {
+	if !playlists.Items[0].IsFavorites || !playlists.Items[0].System || playlists.Items[0].Kind != playlistKindFavorites {
 		t.Fatalf("favorites playlist = %#v", playlists.Items[0])
+	}
+	if playlists.Items[1].IsFavorites || !playlists.Items[1].System || playlists.Items[1].Kind != playlistKindDislikes {
+		t.Fatalf("dislikes playlist = %#v", playlists.Items[1])
+	}
+}
+
+func TestDislikePreferenceIsIdempotentAndMutuallyExclusive(t *testing.T) {
+	store := newTestTrackStore(t)
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	artist, albumItem := seedPlaylistTrackDependencies(t, store)
+	trackItem, err := store.create(upsertTrackRequest{
+		Name:          "Track",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       albumItem.ID,
+		AlbumOrder:    0,
+		AudioFilePath: "/api/songs/track.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+
+	if err := store.setFavoriteTrack(user.ID, trackItem.ID, true); err != nil {
+		t.Fatalf("setFavoriteTrack(true) error = %v", err)
+	}
+	if err := store.setDislikedTrack(user.ID, trackItem.ID, true); err != nil {
+		t.Fatalf("setDislikedTrack(true) error = %v", err)
+	}
+	if err := store.setDislikedTrack(user.ID, trackItem.ID, true); err != nil {
+		t.Fatalf("second setDislikedTrack(true) error = %v", err)
+	}
+
+	got, ok := store.getTrackResponse(trackItem.ID, user.ID)
+	if !ok || got.IsFavorite || !got.IsDisliked {
+		t.Fatalf("disliked track response = %#v, ok=%v", got, ok)
+	}
+	dislikes, ok := store.findPlaylistByKindLocked(user.ID, playlistKindDislikes)
+	if !ok || len(dislikes.TrackItems) != 1 {
+		t.Fatalf("dislikes playlist = %#v, ok=%v", dislikes, ok)
+	}
+
+	if err := store.setFavoriteTrack(user.ID, trackItem.ID, true); err != nil {
+		t.Fatalf("setFavoriteTrack(true) after dislike error = %v", err)
+	}
+	got, ok = store.getTrackResponse(trackItem.ID, user.ID)
+	if !ok || !got.IsFavorite || got.IsDisliked {
+		t.Fatalf("favorited track response = %#v, ok=%v", got, ok)
+	}
+}
+
+func TestDislikeTrackRoutes(t *testing.T) {
+	store := newTestTrackStore(t)
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	artist, albumItem := seedPlaylistTrackDependencies(t, store)
+	trackItem, err := store.create(upsertTrackRequest{Name: "Track", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AlbumOrder: 0, AudioFilePath: "/api/songs/track.mp3"})
+	if err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+	auth := newAuthManager([]byte("test-secret"), time.Hour, time.Hour)
+	token, _, err := auth.createAccessToken(user.ID)
+	if err != nil {
+		t.Fatalf("createAccessToken() error = %v", err)
+	}
+	target := "/api/tracks/" + strconv.FormatInt(trackItem.ID, 10) + "/dislike"
+
+	for _, method := range []string{http.MethodPut, http.MethodPut, http.MethodDelete} {
+		req := httptest.NewRequest(method, target, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		if method == http.MethodPut {
+			putTrackByRouteHandler(store, auth).ServeHTTP(rec, req)
+		} else {
+			deleteTrackByRouteHandler(store, auth).ServeHTTP(rec, req)
+		}
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("%s status = %d, want %d; body=%s", method, rec.Code, http.StatusNoContent, rec.Body.String())
+		}
+	}
+	got, ok := store.getTrackResponse(trackItem.ID, user.ID)
+	if !ok || got.IsDisliked {
+		t.Fatalf("track after undislike = %#v, ok=%v", got, ok)
+	}
+}
+
+func TestDislikedTracksRemainInAlbumAndPlaylistResponses(t *testing.T) {
+	store := newTestTrackStore(t)
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	artist, albumItem := seedPlaylistTrackDependencies(t, store)
+	trackItem, err := store.create(upsertTrackRequest{
+		Name:          "Track",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       albumItem.ID,
+		AlbumOrder:    0,
+		AudioFilePath: "/api/songs/track.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+	playlistItem, err := store.createPlaylist(user.ID, upsertPlaylistRequest{Name: "Queue", Visibility: playlistVisibilityPrivate})
+	if err != nil {
+		t.Fatalf("createPlaylist() error = %v", err)
+	}
+	if err := store.addTrackToPlaylists(user.ID, trackItem.ID, []int64{playlistItem.ID}); err != nil {
+		t.Fatalf("addTrackToPlaylists() error = %v", err)
+	}
+	if err := store.setDislikedTrack(user.ID, trackItem.ID, true); err != nil {
+		t.Fatalf("setDislikedTrack() error = %v", err)
+	}
+
+	albumTracks, ok := store.getAlbumTracks(albumItem.ID, user.ID)
+	if !ok || len(albumTracks) != 1 || !albumTracks[0].IsDisliked {
+		t.Fatalf("album tracks = %#v, ok=%v", albumTracks, ok)
+	}
+	playlistTracks, ok := store.getPlaylistTracks(user.ID, playlistItem.ID, 1, 20)
+	if !ok || len(playlistTracks.Items) != 1 || !playlistTracks.Items[0].IsDisliked {
+		t.Fatalf("playlist tracks = %#v, ok=%v", playlistTracks.Items, ok)
+	}
+}
+
+func TestAutoplayExcludesDislikedTracks(t *testing.T) {
+	store := newTestTrackStore(t)
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	artist, albumItem := seedPlaylistTrackDependencies(t, store)
+	first, err := store.create(upsertTrackRequest{Name: "First", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AlbumOrder: 0, AudioFilePath: "/api/songs/first.mp3"})
+	if err != nil {
+		t.Fatalf("create(first) error = %v", err)
+	}
+	second, err := store.create(upsertTrackRequest{Name: "Second", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AlbumOrder: 1, AudioFilePath: "/api/songs/second.mp3"})
+	if err != nil {
+		t.Fatalf("create(second) error = %v", err)
+	}
+	if err := store.setDislikedTrack(user.ID, first.ID, true); err != nil {
+		t.Fatalf("setDislikedTrack() error = %v", err)
+	}
+
+	got, err := store.nextAutoplayTracks(user.ID, autoplayNextRequest{SourceType: autoplaySourceMyVibe, Profile: defaultAutoplayProfile, Count: 2})
+	if err != nil {
+		t.Fatalf("nextAutoplayTracks() error = %v", err)
+	}
+	if len(got.Tracks) != 1 || got.Tracks[0].ID != second.ID || got.Tracks[0].IsDisliked {
+		t.Fatalf("autoplay tracks = %#v, want only track %d", got.Tracks, second.ID)
+	}
+}
+
+func TestSystemPlaylistsRejectGenericMutation(t *testing.T) {
+	store := newTestTrackStore(t)
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	artist, albumItem := seedPlaylistTrackDependencies(t, store)
+	trackItem, err := store.create(upsertTrackRequest{Name: "Track", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AlbumOrder: 0, AudioFilePath: "/api/songs/track.mp3"})
+	if err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+
+	for _, kind := range []string{playlistKindFavorites, playlistKindDislikes} {
+		p, ok := store.findPlaylistByKindLocked(user.ID, kind)
+		if !ok {
+			t.Fatalf("missing %s playlist", kind)
+		}
+		if err := store.addTrackToPlaylists(user.ID, trackItem.ID, []int64{p.ID}); !errors.Is(err, errSystemPlaylistImmutable) {
+			t.Fatalf("addTrackToPlaylists(%s) error = %v, want system immutable", kind, err)
+		}
+		if _, _, err := store.updatePlaylist(user.ID, p.ID, upsertPlaylistRequest{Name: "Changed", Visibility: playlistVisibilityPrivate}); !errors.Is(err, errSystemPlaylistImmutable) {
+			t.Fatalf("updatePlaylist(%s) error = %v, want system immutable", kind, err)
+		}
+		if _, err := store.deletePlaylist(user.ID, p.ID); !errors.Is(err, errSystemPlaylistImmutable) {
+			t.Fatalf("deletePlaylist(%s) error = %v, want system immutable", kind, err)
+		}
+	}
+}
+
+func TestNewTrackStoreBackfillsMissingDislikesPlaylist(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "tracks.sqlite")
+	store, err := newTrackStore(dbPath)
+	if err != nil {
+		t.Fatalf("newTrackStore() error = %v", err)
+	}
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+
+	store.mu.Lock()
+	dislikes, ok := store.findPlaylistByKindLocked(user.ID, playlistKindDislikes)
+	if !ok {
+		store.mu.Unlock()
+		t.Fatal("missing initial dislikes playlist")
+	}
+	delete(store.playlists, dislikes.ID)
+	if err := store.persistLocked(); err != nil {
+		store.mu.Unlock()
+		t.Fatalf("persistLocked() error = %v", err)
+	}
+	store.mu.Unlock()
+	if err := store.db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	reloaded, err := newTrackStore(dbPath)
+	if err != nil {
+		t.Fatalf("newTrackStore() reload error = %v", err)
+	}
+	t.Cleanup(func() { _ = reloaded.db.Close() })
+	playlists := reloaded.listPlaylists(user.ID, playlistListFilter{})
+	if len(playlists.Items) != 2 || playlists.Items[0].Kind != playlistKindFavorites || playlists.Items[1].Kind != playlistKindDislikes {
+		t.Fatalf("reloaded system playlists = %#v", playlists.Items)
 	}
 }
 
@@ -453,7 +713,8 @@ func TestPublicAndSharedPlaylistHandlersAllowAnonymousReads(t *testing.T) {
 		t.Fatalf("setFavoriteTrack() error = %v", err)
 	}
 
-	publicHandler := getPublicPlaylistByRouteHandler(store)
+	auth := newAuthManager([]byte("test-secret"), time.Hour, time.Hour)
+	publicHandler := getPublicPlaylistByRouteHandler(store, auth)
 	req := httptest.NewRequest(http.MethodGet, "/api/public/playlists/"+strconv.FormatInt(publicPlaylist.ID, 10), nil)
 	rec := httptest.NewRecorder()
 	publicHandler.ServeHTTP(rec, req)
@@ -495,8 +756,29 @@ func TestPublicAndSharedPlaylistHandlersAllowAnonymousReads(t *testing.T) {
 	if len(tracksGot.Items) != 1 || tracksGot.Items[0].ID != trackItem.ID || tracksGot.Items[0].IsFavorite {
 		t.Fatalf("public tracks = %#v, want anonymous non-favorite track", tracksGot.Items)
 	}
+	if err := store.setDislikedTrack(user.ID, trackItem.ID, true); err != nil {
+		t.Fatalf("setDislikedTrack() error = %v", err)
+	}
+	token, _, err := auth.createAccessToken(user.ID)
+	if err != nil {
+		t.Fatalf("createAccessToken() error = %v", err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/public/playlists/"+strconv.FormatInt(publicPlaylist.ID, 10)+"/tracks", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec = httptest.NewRecorder()
+	publicHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authenticated public tracks status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	tracksGot = paginatedTracks{}
+	if err := json.NewDecoder(rec.Body).Decode(&tracksGot); err != nil {
+		t.Fatalf("Decode() authenticated public tracks error = %v", err)
+	}
+	if len(tracksGot.Items) != 1 || !tracksGot.Items[0].IsDisliked || tracksGot.Items[0].IsFavorite {
+		t.Fatalf("authenticated public tracks = %#v, want personalized disliked track", tracksGot.Items)
+	}
 
-	sharedHandler := getSharedPlaylistByRouteHandler(store)
+	sharedHandler := getSharedPlaylistByRouteHandler(store, nil)
 	req = httptest.NewRequest(http.MethodGet, "/api/shared/playlists/"+sharedPlaylist.ShareToken, nil)
 	rec = httptest.NewRecorder()
 	sharedHandler.ServeHTTP(rec, req)

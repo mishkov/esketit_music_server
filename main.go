@@ -59,6 +59,7 @@ const (
 	playlistVisibilityShared        = "shared"
 	playlistKindCustom              = "custom"
 	playlistKindFavorites           = "favorites"
+	playlistKindDislikes            = "dislikes"
 	trackListSortID                 = "id"
 	trackListSortCreatedAt          = "createdAt"
 	sortOrderAsc                    = "asc"
@@ -78,6 +79,8 @@ const (
 	analyticsEventSearch            = "search"
 	analyticsEventSearchResultClick = "search_result_click"
 	analyticsEventPlaybackError     = "playback_error"
+	analyticsEventTrackDislike      = "track_dislike"
+	analyticsEventTrackUndislike    = "track_undislike"
 )
 
 type contextKey string
@@ -330,6 +333,7 @@ type trackResponse struct {
 	SourceMetadata []sourceMetadata `json:"sourceMetadata"`
 	CreatedAt      time.Time        `json:"createdAt"`
 	IsFavorite     bool             `json:"isFavorite"`
+	IsDisliked     bool             `json:"isDisliked"`
 	IsAvailable    bool             `json:"isAvailable"`
 }
 
@@ -342,6 +346,7 @@ type playlistResponse struct {
 	Visibility     string `json:"visibility"`
 	TrackCount     int    `json:"trackCount"`
 	System         bool   `json:"system"`
+	Kind           string `json:"kind"`
 	IsFavorites    bool   `json:"isFavorites"`
 	ShareToken     string `json:"shareToken,omitempty"`
 }
@@ -664,7 +669,7 @@ func main() {
 	mux.HandleFunc("GET /api/albums", listAlbumsHandler(store, auth))
 	mux.HandleFunc("GET /api/search", searchHandler(store, auth))
 	mux.Handle("POST /api/albums", requireRole(auth, store, roleAdmin, createAlbumHandler(store)))
-	mux.HandleFunc("GET /api/albums/", getAlbumByRouteHandler(store))
+	mux.HandleFunc("GET /api/albums/", getAlbumByRouteHandler(store, auth))
 	mux.Handle("PUT /api/albums/", requireRole(auth, store, roleAdmin, updateAlbumByRouteHandler(store)))
 	mux.Handle("DELETE /api/albums/", requireRole(auth, store, roleAdmin, deleteAlbumByRouteHandler(store)))
 	mux.Handle("POST /api/album-covers", requireRole(auth, store, roleAdmin, uploadAlbumCoverHandler(albumCoversDir)))
@@ -676,8 +681,8 @@ func main() {
 	mux.Handle("GET /api/playlists/", requireAuth(auth, store, getPlaylistByRouteHandler(store)))
 	mux.Handle("PUT /api/playlists/", requireAuth(auth, store, updatePlaylistByRouteHandler(store)))
 	mux.Handle("DELETE /api/playlists/", requireAuth(auth, store, deletePlaylistByRouteHandler(store)))
-	mux.HandleFunc("GET /api/public/playlists/", getPublicPlaylistByRouteHandler(store))
-	mux.HandleFunc("GET /api/shared/playlists/", getSharedPlaylistByRouteHandler(store))
+	mux.HandleFunc("GET /api/public/playlists/", getPublicPlaylistByRouteHandler(store, auth))
+	mux.HandleFunc("GET /api/shared/playlists/", getSharedPlaylistByRouteHandler(store, auth))
 	mux.Handle("POST /api/autoplay/next", requireAuth(auth, store, autoplayNextHandler(store)))
 	mux.HandleFunc("POST /api/analytics/events", analyticsEventsHandler(store, auth))
 	mux.HandleFunc("GET /api/tracks", listTracksHandler(store, auth))
@@ -1028,6 +1033,10 @@ func newTrackStore(path string) (*trackStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := s.ensureSystemPlaylistUniqueIndex(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	return s, nil
 }
@@ -1280,7 +1289,8 @@ func (s *trackStore) loadDiskDBFileLocked(file diskDBFile) error {
 	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
 		return err
 	}
-	if err := s.ensureFavoritesPlaylistsLocked(); err != nil {
+	s.deduplicateSystemPlaylistsLocked()
+	if err := s.ensureSystemPlaylistsLocked(); err != nil {
 		return err
 	}
 	if err := s.validateLyricsStateLocked(); err != nil {
@@ -1499,6 +1509,13 @@ func (s *trackStore) ensureTrackCreatedAtColumn() error {
 	}
 	committed = true
 	return nil
+}
+
+func (s *trackStore) ensureSystemPlaylistUniqueIndex() error {
+	_, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_user_system_kind
+		ON playlists (user_id, kind)
+		WHERE kind IN ('favorites', 'dislikes')`)
+	return err
 }
 
 func (s *trackStore) loadSQLiteLocked() (bool, error) {
@@ -1864,7 +1881,7 @@ func (s *trackStore) getAlbum(id int64) (album, bool) {
 	return a, ok
 }
 
-func (s *trackStore) getAlbumTracks(id int64) ([]track, bool) {
+func (s *trackStore) getAlbumTracks(id, userID int64) ([]trackResponse, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1873,13 +1890,17 @@ func (s *trackStore) getAlbumTracks(id int64) ([]track, bool) {
 		return nil, false
 	}
 
-	tracks := make([]track, 0, len(a.TrackIDs))
+	tracks := make([]trackResponse, 0, len(a.TrackIDs))
+	favoriteIDs := s.favoriteTrackSetLocked(userID)
+	dislikedIDs := s.dislikedTrackSetLocked(userID)
 	for _, trackID := range a.TrackIDs {
 		t, ok := s.tracks[trackID]
 		if !ok {
 			continue
 		}
-		tracks = append(tracks, t)
+		_, isFavorite := favoriteIDs[trackID]
+		_, isDisliked := dislikedIDs[trackID]
+		tracks = append(tracks, s.toTrackResponseLocked(t, isFavorite, isDisliked, true))
 	}
 	return tracks, true
 }
@@ -2167,8 +2188,10 @@ func (s *trackStore) listPlaylists(userID int64, filter playlistListFilter) pagi
 	}
 
 	sort.Slice(items, func(i, j int) bool {
-		if items[i].IsFavorites != items[j].IsFavorites {
-			return items[i].IsFavorites
+		leftRank := playlistKindSortRank(items[i].Kind)
+		rightRank := playlistKindSortRank(items[j].Kind)
+		if leftRank != rightRank {
+			return leftRank < rightRank
 		}
 		if items[i].Name == items[j].Name {
 			return items[i].ID < items[j].ID
@@ -2256,8 +2279,8 @@ func (s *trackStore) updatePlaylist(userID, playlistID int64, req upsertPlaylist
 	if !ok || current.UserID != userID {
 		return playlistResponse{}, false, nil
 	}
-	if current.Kind == playlistKindFavorites {
-		return playlistResponse{}, true, errFavoritePlaylistImmutable
+	if current.System {
+		return playlistResponse{}, true, errSystemPlaylistImmutable
 	}
 
 	updated := current
@@ -2288,8 +2311,8 @@ func (s *trackStore) validatePlaylistCoverUploadTarget(userID, playlistID int64)
 	if !ok || current.UserID != userID {
 		return false, nil
 	}
-	if current.Kind == playlistKindFavorites {
-		return true, errFavoritePlaylistImmutable
+	if current.System {
+		return true, errSystemPlaylistImmutable
 	}
 	return true, nil
 }
@@ -2302,8 +2325,8 @@ func (s *trackStore) updatePlaylistCoverImage(userID, playlistID int64, coverIma
 	if !ok || current.UserID != userID {
 		return playlistResponse{}, false, nil
 	}
-	if current.Kind == playlistKindFavorites {
-		return playlistResponse{}, true, errFavoritePlaylistImmutable
+	if current.System {
+		return playlistResponse{}, true, errSystemPlaylistImmutable
 	}
 
 	updated := current
@@ -2324,8 +2347,8 @@ func (s *trackStore) deletePlaylist(userID, playlistID int64) (bool, error) {
 	if !ok || current.UserID != userID {
 		return false, nil
 	}
-	if current.Kind == playlistKindFavorites {
-		return false, errFavoritePlaylistImmutable
+	if current.System {
+		return false, errSystemPlaylistImmutable
 	}
 	delete(s.playlists, playlistID)
 	if err := s.persistLocked(); err != nil {
@@ -2346,8 +2369,9 @@ func (s *trackStore) getPlaylistTracks(userID, playlistID int64, page, pageSize 
 
 	items := make([]trackResponse, 0, len(p.TrackItems))
 	favoriteIDs := s.favoriteTrackSetLocked(userID)
+	dislikedIDs := s.dislikedTrackSetLocked(userID)
 	for _, item := range p.TrackItems {
-		items = append(items, s.buildPlaylistTrackResponseLocked(item, favoriteIDs))
+		items = append(items, s.buildPlaylistTrackResponseLocked(item, favoriteIDs, dislikedIDs))
 	}
 
 	normalizedPage := normalizePage(int(page))
@@ -2386,7 +2410,7 @@ func (s *trackStore) getPublicPlaylist(playlistID int64) (playlistResponse, bool
 	return publicPlaylistResponse(s.buildPlaylistResponseLocked(p)), true
 }
 
-func (s *trackStore) getPublicPlaylistTracks(playlistID int64, page, pageSize int64) (paginatedTracks, bool) {
+func (s *trackStore) getPublicPlaylistTracks(playlistID, userID, page, pageSize int64) (paginatedTracks, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2394,7 +2418,7 @@ func (s *trackStore) getPublicPlaylistTracks(playlistID int64, page, pageSize in
 	if !ok || p.Visibility != playlistVisibilityPublic {
 		return paginatedTracks{}, false
 	}
-	return s.buildPublicPlaylistTracksPageLocked(p, page, pageSize), true
+	return s.buildPublicPlaylistTracksPageLocked(p, userID, page, pageSize), true
 }
 
 func (s *trackStore) getSharedPlaylist(shareToken string) (playlistResponse, bool) {
@@ -2408,7 +2432,7 @@ func (s *trackStore) getSharedPlaylist(shareToken string) (playlistResponse, boo
 	return publicPlaylistResponse(s.buildPlaylistResponseLocked(p)), true
 }
 
-func (s *trackStore) getSharedPlaylistTracks(shareToken string, page, pageSize int64) (paginatedTracks, bool) {
+func (s *trackStore) getSharedPlaylistTracks(shareToken string, userID, page, pageSize int64) (paginatedTracks, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2416,14 +2440,15 @@ func (s *trackStore) getSharedPlaylistTracks(shareToken string, page, pageSize i
 	if !ok {
 		return paginatedTracks{}, false
 	}
-	return s.buildPublicPlaylistTracksPageLocked(p, page, pageSize), true
+	return s.buildPublicPlaylistTracksPageLocked(p, userID, page, pageSize), true
 }
 
-func (s *trackStore) buildPublicPlaylistTracksPageLocked(p playlist, page, pageSize int64) paginatedTracks {
+func (s *trackStore) buildPublicPlaylistTracksPageLocked(p playlist, userID, page, pageSize int64) paginatedTracks {
 	items := make([]trackResponse, 0, len(p.TrackItems))
-	favoriteIDs := map[int64]struct{}{}
+	favoriteIDs := s.favoriteTrackSetLocked(userID)
+	dislikedIDs := s.dislikedTrackSetLocked(userID)
 	for _, item := range p.TrackItems {
-		items = append(items, s.buildPlaylistTrackResponseLocked(item, favoriteIDs))
+		items = append(items, s.buildPlaylistTrackResponseLocked(item, favoriteIDs, dislikedIDs))
 	}
 
 	normalizedPage := normalizePage(int(page))
@@ -2462,12 +2487,20 @@ func (s *trackStore) addTrackToPlaylists(userID, trackID int64, playlistIDs []in
 		return fmt.Errorf("%w: playlistIds are required", errInvalidPlaylistPayload)
 	}
 
-	playlistsSnapshot := clonePlaylistsMap(s.playlists)
-	for _, playlistID := range normalizeTrackIDs(playlistIDs) {
+	normalizedPlaylistIDs := normalizeTrackIDs(playlistIDs)
+	for _, playlistID := range normalizedPlaylistIDs {
 		p, ok := s.playlists[playlistID]
 		if !ok || p.UserID != userID {
 			return errPlaylistNotFound
 		}
+		if p.System {
+			return errSystemPlaylistImmutable
+		}
+	}
+
+	playlistsSnapshot := clonePlaylistsMap(s.playlists)
+	for _, playlistID := range normalizedPlaylistIDs {
+		p := s.playlists[playlistID]
 		p.TrackItems = appendPlaylistTrack(p.TrackItems, playlistTrack{TrackID: trackID})
 		s.playlists[playlistID] = p
 	}
@@ -2486,6 +2519,10 @@ func (s *trackStore) removeTrackFromPlaylist(userID, playlistID, trackID int64) 
 	if !ok || p.UserID != userID {
 		return false, nil
 	}
+	if p.System {
+		return false, errSystemPlaylistImmutable
+	}
+	original := clonePlaylist(p)
 	updated := removePlaylistTrack(p.TrackItems, trackID)
 	if len(updated) == len(p.TrackItems) {
 		return false, nil
@@ -2493,30 +2530,59 @@ func (s *trackStore) removeTrackFromPlaylist(userID, playlistID, trackID int64) 
 	p.TrackItems = updated
 	s.playlists[playlistID] = p
 	if err := s.persistLocked(); err != nil {
+		s.playlists[playlistID] = original
 		return false, err
 	}
 	return true, nil
 }
 
 func (s *trackStore) setFavoriteTrack(userID, trackID int64, favorite bool) error {
+	return s.setTrackPreference(userID, trackID, playlistKindFavorites, favorite)
+}
+
+func (s *trackStore) setDislikedTrack(userID, trackID int64, disliked bool) error {
+	return s.setTrackPreference(userID, trackID, playlistKindDislikes, disliked)
+}
+
+func (s *trackStore) setTrackPreference(userID, trackID int64, kind string, enabled bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, ok := s.tracks[trackID]; !ok {
 		return errTrackNotFound
 	}
+	if kind != playlistKindFavorites && kind != playlistKindDislikes {
+		return errPlaylistNotFound
+	}
 
-	p, ok := s.findFavoritesPlaylistLocked(userID)
+	p, ok := s.findPlaylistByKindLocked(userID, kind)
 	if !ok {
 		return errPlaylistNotFound
 	}
-	if favorite {
+	playlistsSnapshot := clonePlaylistsMap(s.playlists)
+	if enabled {
 		p.TrackItems = appendPlaylistTrack(p.TrackItems, playlistTrack{TrackID: trackID})
 	} else {
 		p.TrackItems = removePlaylistTrack(p.TrackItems, trackID)
 	}
 	s.playlists[p.ID] = p
-	return s.persistLocked()
+
+	if enabled {
+		oppositeKind := playlistKindFavorites
+		if kind == playlistKindFavorites {
+			oppositeKind = playlistKindDislikes
+		}
+		if opposite, ok := s.findPlaylistByKindLocked(userID, oppositeKind); ok {
+			opposite.TrackItems = removePlaylistTrack(opposite.TrackItems, trackID)
+			s.playlists[opposite.ID] = opposite
+		}
+	}
+
+	if err := s.persistLocked(); err != nil {
+		s.playlists = playlistsSnapshot
+		return err
+	}
+	return nil
 }
 
 func (s *trackStore) nextAutoplayTracks(userID int64, req autoplayNextRequest) (autoplayNextResponse, error) {
@@ -2546,13 +2612,7 @@ func (s *trackStore) nextAutoplayTracks(userID int64, req autoplayNextRequest) (
 		return autoplayNextResponse{}, fmt.Errorf("%w: unsupported sourceType", errInvalidAutoplayRequest)
 	}
 
-	excluded := make(map[int64]struct{}, len(req.RecentTrackIDs)+len(req.ExcludedTrackIDs))
-	for _, trackID := range req.RecentTrackIDs {
-		excluded[trackID] = struct{}{}
-	}
-	for _, trackID := range req.ExcludedTrackIDs {
-		excluded[trackID] = struct{}{}
-	}
+	excluded, dislikedIDs := s.automaticPlaybackExcludedTrackSetLocked(userID, req.RecentTrackIDs, req.ExcludedTrackIDs)
 
 	candidates := make([]track, 0, len(s.tracks))
 	for _, t := range s.tracks {
@@ -2571,7 +2631,8 @@ func (s *trackStore) nextAutoplayTracks(userID int64, req autoplayNextRequest) (
 		}
 		selected := candidates[index]
 		_, isFavorite := favoriteIDs[selected.ID]
-		chosen = append(chosen, s.toTrackResponseLocked(selected, isFavorite, true))
+		_, isDisliked := dislikedIDs[selected.ID]
+		chosen = append(chosen, s.toTrackResponseLocked(selected, isFavorite, isDisliked, true))
 		candidates = append(candidates[:index], candidates[index+1:]...)
 	}
 
@@ -2591,6 +2652,9 @@ func (s *trackStore) reorderPlaylistTracks(userID, playlistID int64, trackIDs []
 	p, ok := s.playlists[playlistID]
 	if !ok || p.UserID != userID {
 		return false, nil
+	}
+	if p.System {
+		return true, errSystemPlaylistImmutable
 	}
 	if err := validatePlaylistTrackOrder(trackIDs, p.TrackItems); err != nil {
 		return true, err
@@ -2624,6 +2688,7 @@ func (s *trackStore) search(userID int64, filter searchListFilter) paginatedSear
 	items := make([]searchResultItem, 0, len(s.authors)+len(s.albums)+len(s.tracks)+len(s.playlists))
 	query := strings.ToLower(strings.TrimSpace(filter.Query))
 	favoriteIDs := s.favoriteTrackSetLocked(userID)
+	dislikedIDs := s.dislikedTrackSetLocked(userID)
 
 	for _, a := range s.authors {
 		if query != "" && !strings.Contains(strings.ToLower(a.CurrentName), query) {
@@ -2658,7 +2723,8 @@ func (s *trackStore) search(userID int64, filter searchListFilter) paginatedSear
 			continue
 		}
 		_, isFavorite := favoriteIDs[t.ID]
-		trackCopy := s.toSearchTrackResponseLocked(t, isFavorite)
+		_, isDisliked := dislikedIDs[t.ID]
+		trackCopy := s.toSearchTrackResponseLocked(t, isFavorite, isDisliked)
 		items = append(items, searchResultItem{
 			Type:  "track",
 			Track: &trackCopy,
@@ -2899,12 +2965,17 @@ func (s *trackStore) createUser(email, passwordHash string) (user, error) {
 	s.nextUserID++
 	s.users[u.ID] = u
 	s.usersByEmail[email] = u.ID
+	nextPlaylistIDSnapshot := s.nextPlaylistID
 	favoritesPlaylist := s.newFavoritesPlaylistLocked(u.ID)
+	dislikesPlaylist := s.newDislikesPlaylistLocked(u.ID)
 	s.playlists[favoritesPlaylist.ID] = favoritesPlaylist
+	s.playlists[dislikesPlaylist.ID] = dislikesPlaylist
 	if err := s.persistLocked(); err != nil {
 		delete(s.users, u.ID)
 		delete(s.usersByEmail, email)
 		delete(s.playlists, favoritesPlaylist.ID)
+		delete(s.playlists, dislikesPlaylist.ID)
+		s.nextPlaylistID = nextPlaylistIDSnapshot
 		s.nextUserID--
 		return user{}, err
 	}
@@ -3773,10 +3844,10 @@ func createAlbumHandler(store *trackStore) http.HandlerFunc {
 	}
 }
 
-func getAlbumByRouteHandler(store *trackStore) http.HandlerFunc {
+func getAlbumByRouteHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/tracks") {
-			getAlbumTracksHandler(store).ServeHTTP(w, r)
+			getAlbumTracksHandler(store, auth).ServeHTTP(w, r)
 			return
 		}
 		getAlbumByIDHandler(store).ServeHTTP(w, r)
@@ -3799,14 +3870,14 @@ func getAlbumByIDHandler(store *trackStore) http.HandlerFunc {
 	}
 }
 
-func getAlbumTracksHandler(store *trackStore) http.HandlerFunc {
+func getAlbumTracksHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := parseAlbumTracksID(r.URL.Path)
 		if err != nil {
 			http.Error(w, "invalid album id", http.StatusBadRequest)
 			return
 		}
-		tracks, ok := store.getAlbumTracks(id)
+		tracks, ok := store.getAlbumTracks(id, optionalUserIDFromRequest(r, auth))
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -3974,10 +4045,10 @@ func getPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
 	}
 }
 
-func getPublicPlaylistByRouteHandler(store *trackStore) http.HandlerFunc {
+func getPublicPlaylistByRouteHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/tracks") {
-			getPublicPlaylistTracksHandler(store).ServeHTTP(w, r)
+			getPublicPlaylistTracksHandler(store, auth).ServeHTTP(w, r)
 			return
 		}
 		getPublicPlaylistByIDHandler(store).ServeHTTP(w, r)
@@ -4000,7 +4071,7 @@ func getPublicPlaylistByIDHandler(store *trackStore) http.HandlerFunc {
 	}
 }
 
-func getPublicPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
+func getPublicPlaylistTracksHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := parsePublicPlaylistTracksID(r.URL.Path)
 		if err != nil {
@@ -4009,7 +4080,7 @@ func getPublicPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
 		}
 		page := int64(parseIntWithDefault(r.URL.Query().Get("page"), 1))
 		pageSize := int64(parseIntWithDefault(r.URL.Query().Get("pageSize"), 20))
-		items, exists := store.getPublicPlaylistTracks(id, page, pageSize)
+		items, exists := store.getPublicPlaylistTracks(id, optionalUserIDFromRequest(r, auth), page, pageSize)
 		if !exists {
 			http.NotFound(w, r)
 			return
@@ -4018,10 +4089,10 @@ func getPublicPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
 	}
 }
 
-func getSharedPlaylistByRouteHandler(store *trackStore) http.HandlerFunc {
+func getSharedPlaylistByRouteHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/tracks") {
-			getSharedPlaylistTracksHandler(store).ServeHTTP(w, r)
+			getSharedPlaylistTracksHandler(store, auth).ServeHTTP(w, r)
 			return
 		}
 		getSharedPlaylistByTokenHandler(store).ServeHTTP(w, r)
@@ -4044,7 +4115,7 @@ func getSharedPlaylistByTokenHandler(store *trackStore) http.HandlerFunc {
 	}
 }
 
-func getSharedPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
+func getSharedPlaylistTracksHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		shareToken, err := parseSharedPlaylistTracksToken(r.URL.Path)
 		if err != nil {
@@ -4053,7 +4124,7 @@ func getSharedPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
 		}
 		page := int64(parseIntWithDefault(r.URL.Query().Get("page"), 1))
 		pageSize := int64(parseIntWithDefault(r.URL.Query().Get("pageSize"), 20))
-		items, exists := store.getSharedPlaylistTracks(shareToken, page, pageSize)
+		items, exists := store.getSharedPlaylistTracks(shareToken, optionalUserIDFromRequest(r, auth), page, pageSize)
 		if !exists {
 			http.NotFound(w, r)
 			return
@@ -4081,7 +4152,7 @@ func uploadPlaylistCoverByRouteHandler(store *trackStore, albumCoversDir string)
 			return
 		}
 		if err != nil {
-			if errors.Is(err, errFavoritePlaylistImmutable) {
+			if errors.Is(err, errSystemPlaylistImmutable) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -4103,7 +4174,7 @@ func uploadPlaylistCoverByRouteHandler(store *trackStore, albumCoversDir string)
 		}
 		if err != nil {
 			removeUploadedMediaFile(albumCoversDir, info.Name)
-			if errors.Is(err, errFavoritePlaylistImmutable) {
+			if errors.Is(err, errSystemPlaylistImmutable) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -4142,7 +4213,7 @@ func updatePlaylistByRouteHandler(store *trackStore) http.HandlerFunc {
 			return
 		}
 		if err != nil {
-			if errors.Is(err, errInvalidPlaylistPayload) || errors.Is(err, errFavoritePlaylistImmutable) {
+			if errors.Is(err, errInvalidPlaylistPayload) || errors.Is(err, errSystemPlaylistImmutable) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -4167,7 +4238,7 @@ func deletePlaylistByRouteHandler(store *trackStore) http.HandlerFunc {
 		}
 		deleted, err := store.deletePlaylist(userID, id)
 		if err != nil {
-			if errors.Is(err, errFavoritePlaylistImmutable) {
+			if errors.Is(err, errSystemPlaylistImmutable) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -4205,7 +4276,7 @@ func reorderPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
 			return
 		}
 		if err != nil {
-			if errors.Is(err, errInvalidPlaylistPayload) {
+			if errors.Is(err, errInvalidPlaylistPayload) || errors.Is(err, errSystemPlaylistImmutable) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -4244,7 +4315,7 @@ func createTrackHandler(store *trackStore) http.HandlerFunc {
 			http.Error(w, "failed to create track", http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, http.StatusCreated, store.toTrackResponse(t, false, true))
+		writeJSON(w, http.StatusCreated, store.toTrackResponse(t, false, false, true))
 	}
 }
 
@@ -4301,7 +4372,7 @@ func updateTrackHandler(store *trackStore) http.HandlerFunc {
 			http.Error(w, "failed to update track", http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, http.StatusOK, store.toTrackResponse(t, false, true))
+		writeJSON(w, http.StatusOK, store.toTrackResponse(t, false, false, true))
 	}
 }
 
@@ -4342,15 +4413,16 @@ func postTrackByRouteHandler(store *trackStore, auth *authManager, lyricsSearch 
 
 func putTrackByRouteHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/lyrics") {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/lyrics"):
 			requireRole(auth, store, roleAdmin, putTrackLyricsHandler(store)).ServeHTTP(w, r)
-			return
-		}
-		if strings.HasSuffix(r.URL.Path, "/favorite") {
+		case strings.HasSuffix(r.URL.Path, "/favorite"):
 			requireAuth(auth, store, favoriteTrackHandler(store, true)).ServeHTTP(w, r)
-			return
+		case strings.HasSuffix(r.URL.Path, "/dislike"):
+			requireAuth(auth, store, dislikeTrackHandler(store, true)).ServeHTTP(w, r)
+		default:
+			requireRole(auth, store, roleAdmin, updateTrackHandler(store)).ServeHTTP(w, r)
 		}
-		requireRole(auth, store, roleAdmin, updateTrackHandler(store)).ServeHTTP(w, r)
 	}
 }
 
@@ -4361,6 +4433,8 @@ func deleteTrackByRouteHandler(store *trackStore, auth *authManager) http.Handle
 			requireRole(auth, store, roleAdmin, deleteTrackLyricsHandler(store)).ServeHTTP(w, r)
 		case strings.HasSuffix(r.URL.Path, "/favorite"):
 			requireAuth(auth, store, favoriteTrackHandler(store, false)).ServeHTTP(w, r)
+		case strings.HasSuffix(r.URL.Path, "/dislike"):
+			requireAuth(auth, store, dislikeTrackHandler(store, false)).ServeHTTP(w, r)
 		case strings.Contains(r.URL.Path, "/playlists/"):
 			requireAuth(auth, store, removeTrackFromPlaylistHandler(store)).ServeHTTP(w, r)
 		default:
@@ -4388,7 +4462,7 @@ func addTrackToPlaylistsHandler(store *trackStore) http.HandlerFunc {
 		}
 		if err := store.addTrackToPlaylists(userID, trackID, req.PlaylistIDs); err != nil {
 			switch {
-			case errors.Is(err, errInvalidPlaylistPayload):
+			case errors.Is(err, errInvalidPlaylistPayload), errors.Is(err, errSystemPlaylistImmutable):
 				http.Error(w, err.Error(), http.StatusBadRequest)
 			case errors.Is(err, errTrackNotFound), errors.Is(err, errPlaylistNotFound):
 				http.NotFound(w, r)
@@ -4415,6 +4489,10 @@ func removeTrackFromPlaylistHandler(store *trackStore) http.HandlerFunc {
 		}
 		deleted, err := store.removeTrackFromPlaylist(userID, playlistID, trackID)
 		if err != nil {
+			if errors.Is(err, errSystemPlaylistImmutable) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 			http.Error(w, "failed to remove track from playlist", http.StatusInternalServerError)
 			return
 		}
@@ -4444,6 +4522,31 @@ func favoriteTrackHandler(store *trackStore, favorite bool) http.HandlerFunc {
 				http.NotFound(w, r)
 			default:
 				http.Error(w, "failed to update favorite track", http.StatusInternalServerError)
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func dislikeTrackHandler(store *trackStore, disliked bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, ok := userIDFromContext(r.Context())
+		if !ok {
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return
+		}
+		trackID, err := parseTrackDislikeID(r.URL.Path)
+		if err != nil {
+			http.Error(w, "invalid track id", http.StatusBadRequest)
+			return
+		}
+		if err := store.setDislikedTrack(userID, trackID, disliked); err != nil {
+			switch {
+			case errors.Is(err, errTrackNotFound), errors.Is(err, errPlaylistNotFound):
+				http.NotFound(w, r)
+			default:
+				http.Error(w, "failed to update disliked track", http.StatusInternalServerError)
 			}
 			return
 		}
@@ -5050,7 +5153,7 @@ func normalizeAnalyticsEventRequest(event analyticsEventRequest, index int) (ana
 	case len(event.Type) > maxAnalyticsEventTypeLen:
 		return analyticsEventRequest{}, fmt.Errorf("events[%d].type must be at most %d characters", index, maxAnalyticsEventTypeLen)
 	case !isAnalyticsEventType(event.Type):
-		return analyticsEventRequest{}, fmt.Errorf("events[%d].type must be one of play, pause, resume, seek, track_change, track_complete, track_skip, search, search_result_click, playback_error", index)
+		return analyticsEventRequest{}, fmt.Errorf("events[%d].type must be one of play, pause, resume, seek, track_change, track_complete, track_skip, search, search_result_click, playback_error, track_dislike, track_undislike", index)
 	case event.ClientTime.IsZero():
 		return analyticsEventRequest{}, fmt.Errorf("events[%d].clientTime is required", index)
 	}
@@ -5316,7 +5419,9 @@ func isAnalyticsEventType(value string) bool {
 		analyticsEventTrackSkip,
 		analyticsEventSearch,
 		analyticsEventSearchResultClick,
-		analyticsEventPlaybackError:
+		analyticsEventPlaybackError,
+		analyticsEventTrackDislike,
+		analyticsEventTrackUndislike:
 		return true
 	default:
 		return false
@@ -5332,7 +5437,9 @@ func analyticsEventRequiresTrackID(value string) bool {
 		analyticsEventTrackChange,
 		analyticsEventTrackComplete,
 		analyticsEventTrackSkip,
-		analyticsEventPlaybackError:
+		analyticsEventPlaybackError,
+		analyticsEventTrackDislike,
+		analyticsEventTrackUndislike:
 		return true
 	default:
 		return false
@@ -5402,6 +5509,10 @@ func parseTrackID(path string) (int64, error) {
 
 func parseTrackFavoriteID(path string) (int64, error) {
 	return parseResourceID(strings.TrimSuffix(path, "/favorite"), "/api/tracks/")
+}
+
+func parseTrackDislikeID(path string) (int64, error) {
+	return parseResourceID(strings.TrimSuffix(path, "/dislike"), "/api/tracks/")
 }
 
 func parseTrackPlaylistsTrackID(path string) (int64, error) {
@@ -5703,6 +5814,8 @@ func normalizePlaylistKind(value string, system bool) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case playlistKindFavorites:
 		return playlistKindFavorites
+	case playlistKindDislikes:
+		return playlistKindDislikes
 	case playlistKindCustom:
 		return playlistKindCustom
 	case "":
@@ -5712,6 +5825,17 @@ func normalizePlaylistKind(value string, system bool) string {
 		return playlistKindCustom
 	default:
 		return ""
+	}
+}
+
+func playlistKindSortRank(kind string) int {
+	switch kind {
+	case playlistKindFavorites:
+		return 0
+	case playlistKindDislikes:
+		return 1
+	default:
+		return 2
 	}
 }
 
@@ -5799,8 +5923,17 @@ func validatePlaylist(p playlist) error {
 	if len(normalizedTrackIDs) != len(normalizeTrackIDs(normalizedTrackIDs)) {
 		return fmt.Errorf("%w: duplicate trackId is not allowed", errInvalidPlaylistPayload)
 	}
-	if p.Kind == playlistKindFavorites && !p.System {
-		return fmt.Errorf("%w: favorites playlist must be system managed", errInvalidPlaylistPayload)
+	if (p.Kind == playlistKindFavorites || p.Kind == playlistKindDislikes) && !p.System {
+		return fmt.Errorf("%w: %s playlist must be system managed", errInvalidPlaylistPayload, p.Kind)
+	}
+	if p.System && p.Kind == playlistKindCustom {
+		return fmt.Errorf("%w: custom playlist cannot be system managed", errInvalidPlaylistPayload)
+	}
+	if p.System && p.Visibility != playlistVisibilityPrivate {
+		return fmt.Errorf("%w: system playlist must be private", errInvalidPlaylistPayload)
+	}
+	if p.System && p.ShareToken != "" {
+		return fmt.Errorf("%w: system playlist cannot have a share token", errInvalidPlaylistPayload)
 	}
 	return nil
 }
@@ -5950,15 +6083,46 @@ func (s *trackStore) migrateLegacyAlbumsLocked() error {
 	return nil
 }
 
-func (s *trackStore) ensureFavoritesPlaylistsLocked() error {
+func (s *trackStore) ensureSystemPlaylistsLocked() error {
 	for userID := range s.users {
-		if _, ok := s.findFavoritesPlaylistLocked(userID); ok {
-			continue
+		if _, ok := s.findPlaylistByKindLocked(userID, playlistKindFavorites); !ok {
+			p := s.newFavoritesPlaylistLocked(userID)
+			s.playlists[p.ID] = p
 		}
-		p := s.newFavoritesPlaylistLocked(userID)
-		s.playlists[p.ID] = p
+		if _, ok := s.findPlaylistByKindLocked(userID, playlistKindDislikes); !ok {
+			p := s.newDislikesPlaylistLocked(userID)
+			s.playlists[p.ID] = p
+		}
 	}
 	return nil
+}
+
+func (s *trackStore) deduplicateSystemPlaylistsLocked() {
+	canonical := make(map[string]int64)
+	playlistIDs := make([]int64, 0, len(s.playlists))
+	for playlistID := range s.playlists {
+		playlistIDs = append(playlistIDs, playlistID)
+	}
+	sort.Slice(playlistIDs, func(i, j int) bool { return playlistIDs[i] < playlistIDs[j] })
+
+	for _, playlistID := range playlistIDs {
+		p := s.playlists[playlistID]
+		if p.Kind != playlistKindFavorites && p.Kind != playlistKindDislikes {
+			continue
+		}
+		key := strconv.FormatInt(p.UserID, 10) + "\x00" + p.Kind
+		canonicalID, exists := canonical[key]
+		if !exists {
+			canonical[key] = p.ID
+			continue
+		}
+		canonicalPlaylist := s.playlists[canonicalID]
+		for _, item := range p.TrackItems {
+			canonicalPlaylist.TrackItems = appendPlaylistTrack(canonicalPlaylist.TrackItems, item)
+		}
+		s.playlists[canonicalID] = canonicalPlaylist
+		delete(s.playlists, p.ID)
+	}
 }
 
 func (s *trackStore) newFavoritesPlaylistLocked(userID int64) playlist {
@@ -5977,13 +6141,33 @@ func (s *trackStore) newFavoritesPlaylistLocked(userID int64) playlist {
 	return p
 }
 
-func (s *trackStore) findFavoritesPlaylistLocked(userID int64) (playlist, bool) {
+func (s *trackStore) newDislikesPlaylistLocked(userID int64) playlist {
+	p := playlist{
+		ID:             s.nextPlaylistID,
+		UserID:         userID,
+		Name:           "Dislikes",
+		Description:    "Tracks disliked by the user.",
+		CoverImagePath: "",
+		Visibility:     playlistVisibilityPrivate,
+		TrackItems:     []playlistTrack{},
+		System:         true,
+		Kind:           playlistKindDislikes,
+	}
+	s.nextPlaylistID++
+	return p
+}
+
+func (s *trackStore) findPlaylistByKindLocked(userID int64, kind string) (playlist, bool) {
 	for _, p := range s.playlists {
-		if p.UserID == userID && p.Kind == playlistKindFavorites {
+		if p.UserID == userID && p.Kind == kind {
 			return p, true
 		}
 	}
 	return playlist{}, false
+}
+
+func (s *trackStore) findFavoritesPlaylistLocked(userID int64) (playlist, bool) {
+	return s.findPlaylistByKindLocked(userID, playlistKindFavorites)
 }
 
 func (s *trackStore) favoriteTrackSetLocked(userID int64) map[int64]struct{} {
@@ -5998,6 +6182,33 @@ func (s *trackStore) favoriteTrackSetLocked(userID int64) map[int64]struct{} {
 	return items
 }
 
+func (s *trackStore) dislikedTrackSetLocked(userID int64) map[int64]struct{} {
+	dislikes, ok := s.findPlaylistByKindLocked(userID, playlistKindDislikes)
+	if !ok {
+		return map[int64]struct{}{}
+	}
+	items := make(map[int64]struct{}, len(dislikes.TrackItems))
+	for _, item := range dislikes.TrackItems {
+		items[item.TrackID] = struct{}{}
+	}
+	return items
+}
+
+func (s *trackStore) automaticPlaybackExcludedTrackSetLocked(userID int64, recentTrackIDs, requestedExcludedTrackIDs []int64) (map[int64]struct{}, map[int64]struct{}) {
+	dislikedIDs := s.dislikedTrackSetLocked(userID)
+	excluded := make(map[int64]struct{}, len(recentTrackIDs)+len(requestedExcludedTrackIDs)+len(dislikedIDs))
+	for _, trackID := range recentTrackIDs {
+		excluded[trackID] = struct{}{}
+	}
+	for _, trackID := range requestedExcludedTrackIDs {
+		excluded[trackID] = struct{}{}
+	}
+	for trackID := range dislikedIDs {
+		excluded[trackID] = struct{}{}
+	}
+	return excluded, dislikedIDs
+}
+
 func (s *trackStore) buildPlaylistResponseLocked(p playlist) playlistResponse {
 	return playlistResponse{
 		ID:             p.ID,
@@ -6008,6 +6219,7 @@ func (s *trackStore) buildPlaylistResponseLocked(p playlist) playlistResponse {
 		Visibility:     p.Visibility,
 		TrackCount:     len(p.TrackItems),
 		System:         p.System,
+		Kind:           p.Kind,
 		IsFavorites:    p.Kind == playlistKindFavorites,
 		ShareToken:     p.ShareToken,
 	}
@@ -6018,14 +6230,16 @@ func publicPlaylistResponse(p playlistResponse) playlistResponse {
 	return p
 }
 
-func (s *trackStore) buildPlaylistTrackResponseLocked(item playlistTrack, favoriteIDs map[int64]struct{}) trackResponse {
+func (s *trackStore) buildPlaylistTrackResponseLocked(item playlistTrack, favoriteIDs, dislikedIDs map[int64]struct{}) trackResponse {
 	if current, ok := s.tracks[item.TrackID]; ok {
 		_, isFavorite := favoriteIDs[item.TrackID]
-		return s.toTrackResponseLocked(current, isFavorite, true)
+		_, isDisliked := dislikedIDs[item.TrackID]
+		return s.toTrackResponseLocked(current, isFavorite, isDisliked, true)
 	}
 	if item.UnavailableTrack != nil {
 		_, isFavorite := favoriteIDs[item.TrackID]
-		return s.toTrackResponseLocked(*item.UnavailableTrack, isFavorite, false)
+		_, isDisliked := dislikedIDs[item.TrackID]
+		return s.toTrackResponseLocked(*item.UnavailableTrack, isFavorite, isDisliked, false)
 	}
 	return trackResponse{
 		ID:          item.TrackID,
@@ -6041,6 +6255,7 @@ func (s *trackStore) listTrackResponses(userID int64, filter trackListFilter) pa
 	items := make([]trackResponse, 0, len(s.tracks))
 	query := strings.ToLower(strings.TrimSpace(filter.Query))
 	favoriteIDs := s.favoriteTrackSetLocked(userID)
+	dislikedIDs := s.dislikedTrackSetLocked(userID)
 	for _, t := range s.tracks {
 		if filter.AuthorID > 0 && !containsInt64(t.AuthorIDs, filter.AuthorID) {
 			continue
@@ -6052,7 +6267,8 @@ func (s *trackStore) listTrackResponses(userID int64, filter trackListFilter) pa
 			continue
 		}
 		_, isFavorite := favoriteIDs[t.ID]
-		items = append(items, s.toTrackResponseLocked(t, isFavorite, true))
+		_, isDisliked := dislikedIDs[t.ID]
+		items = append(items, s.toTrackResponseLocked(t, isFavorite, isDisliked, true))
 	}
 	sort.Slice(items, func(i, j int) bool {
 		switch filter.Sort {
@@ -6109,7 +6325,8 @@ func (s *trackStore) getTrackResponse(trackID, userID int64) (trackResponse, boo
 		return trackResponse{}, false
 	}
 	_, isFavorite := s.favoriteTrackSetLocked(userID)[trackID]
-	return s.toTrackResponseLocked(t, isFavorite, true), true
+	_, isDisliked := s.dislikedTrackSetLocked(userID)[trackID]
+	return s.toTrackResponseLocked(t, isFavorite, isDisliked, true), true
 }
 
 func (s *trackStore) markTrackUnavailableLocked(t track) {
@@ -6482,27 +6699,29 @@ func toTrackResponse(t track, isFavorite, isAvailable bool) trackResponse {
 		SourceMetadata: normalizeSourceMetadata(t.SourceMetadata),
 		CreatedAt:      t.CreatedAt,
 		IsFavorite:     isFavorite,
+		IsDisliked:     false,
 		IsAvailable:    isAvailable,
 	}
 }
 
-func (s *trackStore) toTrackResponse(t track, isFavorite, isAvailable bool) trackResponse {
+func (s *trackStore) toTrackResponse(t track, isFavorite, isDisliked, isAvailable bool) trackResponse {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	return s.toTrackResponseLocked(t, isFavorite, isAvailable)
+	return s.toTrackResponseLocked(t, isFavorite, isDisliked, isAvailable)
 }
 
-func (s *trackStore) toTrackResponseLocked(t track, isFavorite, isAvailable bool) trackResponse {
+func (s *trackStore) toTrackResponseLocked(t track, isFavorite, isDisliked, isAvailable bool) trackResponse {
 	response := toTrackResponse(t, isFavorite, isAvailable)
+	response.IsDisliked = isDisliked
 	if albumItem, ok := s.albums[t.AlbumID]; ok {
 		response.CoverImagePath = albumItem.CoverImagePath
 	}
 	return response
 }
 
-func (s *trackStore) toSearchTrackResponseLocked(t track, isFavorite bool) trackResponse {
-	response := s.toTrackResponseLocked(t, isFavorite, true)
+func (s *trackStore) toSearchTrackResponseLocked(t track, isFavorite, isDisliked bool) trackResponse {
+	response := s.toTrackResponseLocked(t, isFavorite, isDisliked, true)
 	response.Authors = make([]author, 0, len(t.AuthorIDs))
 	for _, authorID := range t.AuthorIDs {
 		a, ok := s.authors[authorID]
@@ -6676,4 +6895,4 @@ var errInvalidRefreshToken = errors.New("invalid refresh token")
 var errTrackNotFound = errors.New("track not found")
 var errLyricsNotFound = errors.New("lyrics not found")
 var errPlaylistNotFound = errors.New("playlist not found")
-var errFavoritePlaylistImmutable = errors.New("favorites playlist cannot be modified directly")
+var errSystemPlaylistImmutable = errors.New("system playlist cannot be modified directly")
