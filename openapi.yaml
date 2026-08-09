@@ -1106,8 +1106,12 @@ paths:
         listening context, desired profile, and track IDs that should be avoided
         because they were recently played or are already queued.
 
-        This first backend version uses a random stub strategy. The request contract
-        is intended to stay stable as smarter ranking is added later.
+        Most source types currently use a random stub strategy. The `author` source
+        returns only tracks that credit the selected author, ordered by album release
+        date descending, album ID descending for equal dates, and album track order
+        ascending. Unpublished, future, unavailable, disliked, recent, and explicitly
+        excluded tracks are omitted. When the author result is empty, clients should
+        continue with a `my_vibe` request.
       security:
         - bearerAuth: []
       requestBody:
@@ -2755,7 +2759,7 @@ components:
 
     AutoplaySourceType:
       type: string
-      enum: [my_vibe, playlist, album, track]
+      enum: [my_vibe, playlist, album, track, author]
 
     AutoplayNextRequest:
       type: object
@@ -2768,8 +2772,8 @@ components:
           minimum: 1
           nullable: true
           description: |
-            Required for `playlist`, `album`, and `track`. Must be omitted for
-            `my_vibe`.
+            Required for `playlist`, `album`, `track`, and `author`. For `author`,
+            this is the selected author ID. Must be omitted for `my_vibe`.
         profile:
           type: string
           default: default

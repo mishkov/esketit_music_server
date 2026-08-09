@@ -68,6 +68,7 @@ const (
 	autoplaySourcePlaylist          = "playlist"
 	autoplaySourceAlbum             = "album"
 	autoplaySourceTrack             = "track"
+	autoplaySourceAuthor            = "author"
 	defaultAutoplayProfile          = "default"
 	analyticsEventPlay              = "play"
 	analyticsEventPause             = "pause"
@@ -397,6 +398,7 @@ type legacyTrack struct {
 type trackStore struct {
 	mu               sync.RWMutex
 	path             string
+	songsDir         string
 	db               *sql.DB
 	nextTrackID      int64
 	nextAlbumID      int64
@@ -637,6 +639,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to initialize tracks database at %q: %v", tracksDBPath, err)
 	}
+	store.songsDir = songsDir
 
 	auth := newAuthManager([]byte(authSecret), defaultAccessTokenTTL, defaultRefreshTokenTTL)
 	logMode := resolveLogMode(os.Getenv("LOG_MODE"))
@@ -2608,11 +2611,18 @@ func (s *trackStore) nextAutoplayTracks(userID int64, req autoplayNextRequest) (
 		if _, ok := s.tracks[*req.SourceID]; !ok {
 			return autoplayNextResponse{}, errTrackNotFound
 		}
+	case autoplaySourceAuthor:
+		if _, ok := s.authors[*req.SourceID]; !ok {
+			return autoplayNextResponse{}, errAuthorNotFound
+		}
 	default:
 		return autoplayNextResponse{}, fmt.Errorf("%w: unsupported sourceType", errInvalidAutoplayRequest)
 	}
 
 	excluded, dislikedIDs := s.automaticPlaybackExcludedTrackSetLocked(userID, req.RecentTrackIDs, req.ExcludedTrackIDs)
+	if req.SourceType == autoplaySourceAuthor {
+		return s.nextAuthorAutoplayTracksLocked(userID, req, excluded, dislikedIDs), nil
+	}
 
 	candidates := make([]track, 0, len(s.tracks))
 	for _, t := range s.tracks {
@@ -2643,6 +2653,75 @@ func (s *trackStore) nextAutoplayTracks(userID int64, req autoplayNextRequest) (
 		Strategy:   "random_stub_v1",
 		Tracks:     chosen,
 	}, nil
+}
+
+func (s *trackStore) nextAuthorAutoplayTracksLocked(
+	userID int64,
+	req autoplayNextRequest,
+	excluded, dislikedIDs map[int64]struct{},
+) autoplayNextResponse {
+	authorID := *req.SourceID
+	albums := make([]album, 0, len(s.albums))
+	now := time.Now().UTC()
+	for _, albumItem := range s.albums {
+		if !albumItem.IsPublished || albumItem.ReleaseDate.After(now) {
+			continue
+		}
+		albums = append(albums, albumItem)
+	}
+	sort.Slice(albums, func(i, j int) bool {
+		if !albums[i].ReleaseDate.Equal(albums[j].ReleaseDate) {
+			return albums[i].ReleaseDate.After(albums[j].ReleaseDate)
+		}
+		return albums[i].ID > albums[j].ID
+	})
+
+	chosen := make([]trackResponse, 0, req.Count)
+	favoriteIDs := s.favoriteTrackSetLocked(userID)
+	for _, albumItem := range albums {
+		for _, trackID := range albumItem.TrackIDs {
+			if len(chosen) >= req.Count {
+				break
+			}
+			if _, skip := excluded[trackID]; skip {
+				continue
+			}
+			trackItem, ok := s.tracks[trackID]
+			if !ok || trackItem.AlbumID != albumItem.ID || !s.isTrackAutomaticallyPlayableLocked(trackItem) || !containsInt64(trackItem.AuthorIDs, authorID) {
+				continue
+			}
+			_, isFavorite := favoriteIDs[trackID]
+			_, isDisliked := dislikedIDs[trackID]
+			chosen = append(chosen, s.toTrackResponseLocked(trackItem, isFavorite, isDisliked, true))
+		}
+		if len(chosen) >= req.Count {
+			break
+		}
+	}
+
+	return autoplayNextResponse{
+		SourceType: req.SourceType,
+		SourceID:   req.SourceID,
+		Profile:    req.Profile,
+		Strategy:   "author_release_desc_v1",
+		Tracks:     chosen,
+	}
+}
+
+func (s *trackStore) isTrackAutomaticallyPlayableLocked(trackItem track) bool {
+	if trackItem.AudioFilePath == "" {
+		return false
+	}
+	fileName, isLocalSong := extractReferencedSongFileName(trackItem.AudioFilePath)
+	if !isLocalSong {
+		parsed, err := url.Parse(trackItem.AudioFilePath)
+		return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != ""
+	}
+	if s.songsDir == "" {
+		return true
+	}
+	info, err := os.Stat(filepath.Join(s.songsDir, fileName))
+	return err == nil && info.Mode().IsRegular() && info.Size() > 0
 }
 
 func (s *trackStore) reorderPlaylistTracks(userID, playlistID int64, trackIDs []int64) (bool, error) {
@@ -4573,7 +4652,7 @@ func autoplayNextHandler(store *trackStore) http.HandlerFunc {
 			switch {
 			case errors.Is(err, errInvalidAutoplayRequest):
 				http.Error(w, err.Error(), http.StatusBadRequest)
-			case errors.Is(err, errTrackNotFound), errors.Is(err, errPlaylistNotFound), errors.Is(err, errAlbumNotFound):
+			case errors.Is(err, errTrackNotFound), errors.Is(err, errPlaylistNotFound), errors.Is(err, errAlbumNotFound), errors.Is(err, errAuthorNotFound):
 				http.NotFound(w, r)
 			default:
 				http.Error(w, "failed to build autoplay continuation", http.StatusInternalServerError)
@@ -5074,12 +5153,12 @@ func decodeAutoplayNextRequest(r *http.Request) (autoplayNextRequest, error) {
 		if req.SourceID != nil {
 			return autoplayNextRequest{}, fmt.Errorf("%w: sourceId must be omitted for sourceType my_vibe", errInvalidAutoplayRequest)
 		}
-	case autoplaySourcePlaylist, autoplaySourceAlbum, autoplaySourceTrack:
+	case autoplaySourcePlaylist, autoplaySourceAlbum, autoplaySourceTrack, autoplaySourceAuthor:
 		if req.SourceID == nil || *req.SourceID <= 0 {
 			return autoplayNextRequest{}, fmt.Errorf("%w: sourceId is required for sourceType %s", errInvalidAutoplayRequest, req.SourceType)
 		}
 	default:
-		return autoplayNextRequest{}, fmt.Errorf("%w: sourceType must be one of my_vibe, playlist, album, track", errInvalidAutoplayRequest)
+		return autoplayNextRequest{}, fmt.Errorf("%w: sourceType must be one of my_vibe, playlist, album, track, author", errInvalidAutoplayRequest)
 	}
 
 	if req.Count == 0 {
@@ -5384,6 +5463,8 @@ func normalizeAutoplaySourceType(value string) string {
 		return autoplaySourceAlbum
 	case autoplaySourceTrack:
 		return autoplaySourceTrack
+	case autoplaySourceAuthor:
+		return autoplaySourceAuthor
 	default:
 		return ""
 	}
@@ -6884,6 +6965,7 @@ var errInvalidTrack = errors.New("invalid track payload")
 var errInvalidAlbum = errors.New("invalid album payload")
 var errAlbumNotFound = errors.New("album not found")
 var errInvalidAuthor = errors.New("invalid author payload")
+var errAuthorNotFound = errors.New("author not found")
 var errInvalidLyricsPayload = errors.New("invalid lyrics payload")
 var errInvalidPlaylistPayload = errors.New("invalid playlist payload")
 var errInvalidAutoplayRequest = errors.New("invalid autoplay request")

@@ -1939,6 +1939,188 @@ func TestAutoplayNextHandlerSupportsAllSourceTypes(t *testing.T) {
 	}
 }
 
+func TestAuthorAutoplayOrdersAndFiltersTracks(t *testing.T) {
+	store := newTestTrackStore(t)
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	selectedAuthor, err := store.createAuthor(upsertAuthorRequest{CurrentName: "Selected Artist"})
+	if err != nil {
+		t.Fatalf("createAuthor(selected) error = %v", err)
+	}
+	otherAuthor, err := store.createAuthor(upsertAuthorRequest{CurrentName: "Other Artist"})
+	if err != nil {
+		t.Fatalf("createAuthor(other) error = %v", err)
+	}
+
+	createAlbum := func(title string, releaseDate time.Time, isPublished bool) album {
+		t.Helper()
+		albumItem, createErr := store.createAlbum(upsertAlbumRequest{
+			Title:       title,
+			ReleaseDate: releaseDate,
+			IsPublished: isPublished,
+		})
+		if createErr != nil {
+			t.Fatalf("createAlbum(%s) error = %v", title, createErr)
+		}
+		return albumItem
+	}
+	createTrack := func(name string, authorIDs []int64, albumItem album, albumOrder int) track {
+		t.Helper()
+		trackItem, createErr := store.create(upsertTrackRequest{
+			Name:          name,
+			AuthorIDs:     authorIDs,
+			AlbumID:       albumItem.ID,
+			AlbumOrder:    albumOrder,
+			AudioFilePath: "/api/songs/" + strings.ToLower(strings.ReplaceAll(name, " ", "-")) + ".mp3",
+		})
+		if createErr != nil {
+			t.Fatalf("create(%s) error = %v", name, createErr)
+		}
+		return trackItem
+	}
+
+	oldAlbum := createAlbum("Old", time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC), true)
+	equalDateLowerIDAlbum := createAlbum("New A", time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC), true)
+	equalDateHigherIDAlbum := createAlbum("New B", time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC), true)
+	unpublishedAlbum := createAlbum("Unpublished", time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC), false)
+	futureAlbum := createAlbum("Future", time.Now().UTC().AddDate(1, 0, 0), true)
+
+	oldFirst := createTrack("Old First", []int64{selectedAuthor.ID}, oldAlbum, 0)
+	oldDisliked := createTrack("Old Disliked", []int64{selectedAuthor.ID}, oldAlbum, 1)
+	createTrack("Other Only", []int64{otherAuthor.ID}, equalDateLowerIDAlbum, 0)
+	featured := createTrack("Featured", []int64{otherAuthor.ID, selectedAuthor.ID}, equalDateLowerIDAlbum, 1)
+	newFirst := createTrack("New First", []int64{selectedAuthor.ID}, equalDateHigherIDAlbum, 0)
+	newSecond := createTrack("New Second", []int64{selectedAuthor.ID}, equalDateHigherIDAlbum, 1)
+	createTrack("Hidden", []int64{selectedAuthor.ID}, unpublishedAlbum, 0)
+	createTrack("Not Released", []int64{selectedAuthor.ID}, futureAlbum, 0)
+
+	if err := store.setDislikedTrack(user.ID, oldDisliked.ID, true); err != nil {
+		t.Fatalf("setDislikedTrack() error = %v", err)
+	}
+
+	response, err := store.nextAutoplayTracks(user.ID, autoplayNextRequest{
+		SourceType: autoplaySourceAuthor,
+		SourceID:   &selectedAuthor.ID,
+		Profile:    defaultAutoplayProfile,
+		Count:      10,
+	})
+	if err != nil {
+		t.Fatalf("nextAutoplayTracks() error = %v", err)
+	}
+	if response.Strategy != "author_release_desc_v1" {
+		t.Fatalf("response.Strategy = %q, want author_release_desc_v1", response.Strategy)
+	}
+	wantTrackIDs := []int64{newFirst.ID, newSecond.ID, featured.ID, oldFirst.ID}
+	if len(response.Tracks) != len(wantTrackIDs) {
+		t.Fatalf("len(response.Tracks) = %d, want %d; tracks=%#v", len(response.Tracks), len(wantTrackIDs), response.Tracks)
+	}
+	for index, wantTrackID := range wantTrackIDs {
+		if response.Tracks[index].ID != wantTrackID {
+			t.Fatalf("response.Tracks[%d].ID = %d, want %d", index, response.Tracks[index].ID, wantTrackID)
+		}
+	}
+
+	response, err = store.nextAutoplayTracks(user.ID, autoplayNextRequest{
+		SourceType:     autoplaySourceAuthor,
+		SourceID:       &selectedAuthor.ID,
+		Profile:        defaultAutoplayProfile,
+		Count:          1,
+		RecentTrackIDs: []int64{newFirst.ID},
+	})
+	if err != nil {
+		t.Fatalf("nextAutoplayTracks(recent) error = %v", err)
+	}
+	if len(response.Tracks) != 1 || response.Tracks[0].ID != newSecond.ID {
+		t.Fatalf("recent-filtered response.Tracks = %#v, want track %d", response.Tracks, newSecond.ID)
+	}
+}
+
+func TestAuthorAutoplayExcludesMissingLocalAudioFiles(t *testing.T) {
+	store := newTestTrackStore(t)
+	store.songsDir = t.TempDir()
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	authorItem, err := store.createAuthor(upsertAuthorRequest{CurrentName: "Artist"})
+	if err != nil {
+		t.Fatalf("createAuthor() error = %v", err)
+	}
+	albumItem, err := store.createAlbum(upsertAlbumRequest{
+		Title:       "Album",
+		ReleaseDate: time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC),
+		IsPublished: true,
+	})
+	if err != nil {
+		t.Fatalf("createAlbum() error = %v", err)
+	}
+	available, err := store.create(upsertTrackRequest{
+		Name:          "Available",
+		AuthorIDs:     []int64{authorItem.ID},
+		AlbumID:       albumItem.ID,
+		AlbumOrder:    0,
+		AudioFilePath: "/api/songs/available.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create(available) error = %v", err)
+	}
+	_, err = store.create(upsertTrackRequest{
+		Name:          "Missing",
+		AuthorIDs:     []int64{authorItem.ID},
+		AlbumID:       albumItem.ID,
+		AlbumOrder:    1,
+		AudioFilePath: "/api/songs/missing.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create(missing) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(store.songsDir, "available.mp3"), []byte("audio"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	response, err := store.nextAutoplayTracks(user.ID, autoplayNextRequest{
+		SourceType: autoplaySourceAuthor,
+		SourceID:   &authorItem.ID,
+		Profile:    defaultAutoplayProfile,
+		Count:      10,
+	})
+	if err != nil {
+		t.Fatalf("nextAutoplayTracks() error = %v", err)
+	}
+	if len(response.Tracks) != 1 || response.Tracks[0].ID != available.ID {
+		t.Fatalf("response.Tracks = %#v, want only track %d", response.Tracks, available.ID)
+	}
+}
+
+func TestAutoplayNextHandlerReturnsNotFoundForMissingAuthorContext(t *testing.T) {
+	store := newTestTrackStore(t)
+	auth := newAuthManager([]byte("test-secret"), time.Hour, 24*time.Hour)
+	handler := requireAuth(auth, store, autoplayNextHandler(store))
+
+	user, err := store.createUser("listener@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	token, _, err := auth.createAccessToken(user.ID)
+	if err != nil {
+		t.Fatalf("createAccessToken() error = %v", err)
+	}
+
+	body := strings.NewReader(`{"sourceType":"author","sourceId":999,"count":1,"recentTrackIds":[],"excludedTrackIds":[]}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/autoplay/next", body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
 func TestAutoplayNextHandlerRejectsMissingSourceIDForPlaylist(t *testing.T) {
 	store := newTestTrackStore(t)
 	auth := newAuthManager([]byte("test-secret"), time.Hour, 24*time.Hour)
