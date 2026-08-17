@@ -17,6 +17,31 @@ import (
 	"time"
 )
 
+func TestHealthzHandler(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+
+	healthzHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", got, "application/json")
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want %q", got, "no-store")
+	}
+
+	var response map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if len(response) != 1 || response["status"] != "ok" {
+		t.Errorf("response = %#v, want map[string]string{\"status\":\"ok\"}", response)
+	}
+}
+
 func TestAnalyticsEventsHandlerStoresAnonymousEvents(t *testing.T) {
 	store := newTestTrackStore(t)
 	handler := analyticsEventsHandler(store, newAuthManager([]byte("test-secret"), time.Hour, time.Hour))

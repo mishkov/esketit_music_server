@@ -663,6 +663,7 @@ func main() {
 	youtubeImport := newYouTubeImportService(youtubeImportConfig, youtubeImportGateway, store, songsDir)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", healthzHandler())
 	mux.HandleFunc("GET /api/songs", listSongsHandler(songsDir))
 	mux.Handle("POST /api/songs", requireRole(auth, store, roleAdmin, uploadSongHandler(songsDir)))
 	mux.Handle("GET /api/songs/unused", requireRole(auth, store, roleAdmin, listUnusedSongsHandler(store, songsDir)))
@@ -6895,6 +6896,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func healthzHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusOK, struct {
+			Status string `json:"status"`
+		}{Status: "ok"})
+	}
 }
 
 func serveOpenAPIHandler(path string) http.HandlerFunc {

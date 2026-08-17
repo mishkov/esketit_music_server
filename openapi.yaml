@@ -11,6 +11,7 @@ servers:
     description: Local development server
 
 tags:
+  - name: Health
   - name: Auth
   - name: Songs
   - name: Album Covers
@@ -25,6 +26,37 @@ tags:
   - name: Telegram
 
 paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Check server liveness
+      description: |
+        Lightweight public liveness and startup check. A successful response means
+        server initialization completed and the HTTP listener is reachable. This
+        endpoint does not query the database or expose internal details.
+      security: []
+      responses:
+        '200':
+          description: Server is live
+          headers:
+            Cache-Control:
+              description: Prevents the health response from being cached
+              schema:
+                type: string
+                enum: [no-store]
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+              example:
+                status: ok
+
   /api/auth/register:
     post:
       tags: [Auth]
