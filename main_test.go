@@ -42,6 +42,29 @@ func TestHealthzHandler(t *testing.T) {
 	}
 }
 
+func TestServeOpenAPIHandlerUsesEmbeddedSpecification(t *testing.T) {
+	want, err := os.ReadFile("openapi.yaml")
+	if err != nil {
+		t.Fatalf("ReadFile(openapi.yaml) error = %v", err)
+	}
+
+	t.Chdir(t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/api/openapi.yaml", nil)
+	rec := httptest.NewRecorder()
+
+	serveOpenAPIHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/yaml; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want %q", got, "application/yaml; charset=utf-8")
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("response body does not match embedded openapi.yaml: got %d bytes, want %d", len(got), len(want))
+	}
+}
+
 func TestAnalyticsEventsHandlerStoresAnonymousEvents(t *testing.T) {
 	store := newTestTrackStore(t)
 	handler := analyticsEventsHandler(store, newAuthManager([]byte("test-secret"), time.Hour, time.Hour))

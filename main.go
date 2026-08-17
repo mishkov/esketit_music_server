@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	_ "embed"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -33,6 +34,9 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+//go:embed openapi.yaml
+var openAPISpec string
 
 const (
 	defaultAccessTokenTTL           = 15 * time.Minute
@@ -741,7 +745,7 @@ func run() error {
 	mux.Handle("GET /api/youtube/cookies/status", requireRole(auth, store, roleAdmin, youtubeCookiesStatusHandler(youtubeCookieStore)))
 	mux.Handle("POST /api/youtube/cookies", requireRole(auth, store, roleAdmin, youtubeCookiesUploadHandler(youtubeCookieStore)))
 	mux.Handle("DELETE /api/youtube/cookies", requireRole(auth, store, roleAdmin, youtubeCookiesDeleteHandler(youtubeCookieStore)))
-	mux.HandleFunc("GET /api/openapi.yaml", serveOpenAPIHandler("openapi.yaml"))
+	mux.HandleFunc("GET /api/openapi.yaml", serveOpenAPIHandler())
 	mux.HandleFunc("GET /api/docs", swaggerUIHandler())
 	mux.HandleFunc("GET /api/redoc", redocHandler())
 
@@ -6971,14 +6975,10 @@ func healthzHandler() http.HandlerFunc {
 	}
 }
 
-func serveOpenAPIHandler(path string) http.HandlerFunc {
+func serveOpenAPIHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if _, err := os.Stat(path); err != nil {
-			http.Error(w, "openapi spec file not found", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/yaml")
-		http.ServeFile(w, r, path)
+		w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
+		_, _ = io.WriteString(w, openAPISpec)
 	}
 }
 
