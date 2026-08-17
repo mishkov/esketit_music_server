@@ -8,3 +8,5 @@ esketit_music_server
 .DS_Store
 telegram_state/
 telegram_import_tmp/
+
+/youtube_cookies.txt
