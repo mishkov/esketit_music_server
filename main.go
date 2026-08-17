@@ -21,12 +21,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -82,6 +84,7 @@ const (
 	analyticsEventPlaybackError     = "playback_error"
 	analyticsEventTrackDislike      = "track_dislike"
 	analyticsEventTrackUndislike    = "track_undislike"
+	gracefulShutdownTimeout         = 30 * time.Second
 )
 
 type contextKey string
@@ -543,13 +546,20 @@ type accessTokenClaims struct {
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Printf("server failed: %v", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	if err := loadDotEnv(".env"); err != nil {
-		log.Fatalf("failed to load .env: %v", err)
+		return fmt.Errorf("failed to load .env: %w", err)
 	}
 
 	home, err := os.UserHomeDir()
 	if err != nil {
-		log.Fatalf("cannot resolve home directory: %v", err)
+		return fmt.Errorf("cannot resolve home directory: %w", err)
 	}
 
 	defaultSongsDir := filepath.Join(home, "Projects", "esketit_music", "media_storage", "songs")
@@ -559,7 +569,7 @@ func main() {
 	}
 
 	if err := ensureDir(songsDir); err != nil {
-		log.Fatalf("invalid songs directory %q: %v", songsDir, err)
+		return fmt.Errorf("invalid songs directory %q: %w", songsDir, err)
 	}
 
 	defaultAlbumCoversDir := filepath.Join(home, "Projects", "esketit_music", "media_storage", "album_covers")
@@ -569,7 +579,7 @@ func main() {
 	}
 
 	if err := ensureDirOrCreate(albumCoversDir); err != nil {
-		log.Fatalf("invalid album covers directory %q: %v", albumCoversDir, err)
+		return fmt.Errorf("invalid album covers directory %q: %w", albumCoversDir, err)
 	}
 
 	defaultAuthorPhotosDir := filepath.Join(home, "Projects", "esketit_music", "media_storage", "author_photos")
@@ -579,7 +589,7 @@ func main() {
 	}
 
 	if err := ensureDirOrCreate(authorPhotosDir); err != nil {
-		log.Fatalf("invalid author photos directory %q: %v", authorPhotosDir, err)
+		return fmt.Errorf("invalid author photos directory %q: %w", authorPhotosDir, err)
 	}
 
 	telegramStateDir := os.Getenv("TELEGRAM_STATE_DIR")
@@ -587,7 +597,7 @@ func main() {
 		telegramStateDir = "telegram_state"
 	}
 	if err := ensureDirOrCreate(telegramStateDir); err != nil {
-		log.Fatalf("invalid telegram state directory %q: %v", telegramStateDir, err)
+		return fmt.Errorf("invalid telegram state directory %q: %w", telegramStateDir, err)
 	}
 
 	telegramImportTempDir := os.Getenv("TELEGRAM_IMPORT_TEMP_DIR")
@@ -595,7 +605,7 @@ func main() {
 		telegramImportTempDir = "telegram_import_tmp"
 	}
 	if err := ensureDirOrCreate(telegramImportTempDir); err != nil {
-		log.Fatalf("invalid telegram import temp directory %q: %v", telegramImportTempDir, err)
+		return fmt.Errorf("invalid telegram import temp directory %q: %w", telegramImportTempDir, err)
 	}
 
 	youtubeImportTempDir := os.Getenv("YOUTUBE_IMPORT_TEMP_DIR")
@@ -603,7 +613,7 @@ func main() {
 		youtubeImportTempDir = "youtube_import_tmp"
 	}
 	if err := ensureDirOrCreate(youtubeImportTempDir); err != nil {
-		log.Fatalf("invalid youtube import temp directory %q: %v", youtubeImportTempDir, err)
+		return fmt.Errorf("invalid youtube import temp directory %q: %w", youtubeImportTempDir, err)
 	}
 
 	youtubeCookiesFile := os.Getenv("YOUTUBE_COOKIES_FILE")
@@ -613,7 +623,7 @@ func main() {
 	youtubeCookiesDir := filepath.Dir(youtubeCookiesFile)
 	if youtubeCookiesDir != "." {
 		if err := ensureDirOrCreate(youtubeCookiesDir); err != nil {
-			log.Fatalf("invalid youtube cookies directory %q: %v", youtubeCookiesDir, err)
+			return fmt.Errorf("invalid youtube cookies directory %q: %w", youtubeCookiesDir, err)
 		}
 	}
 	ytdlpBinary := strings.TrimSpace(os.Getenv("YTDLP_BINARY"))
@@ -632,13 +642,18 @@ func main() {
 
 	authSecret := os.Getenv("AUTH_SECRET")
 	if len(authSecret) < 32 {
-		log.Fatal("AUTH_SECRET must be set and contain at least 32 characters")
+		return errors.New("AUTH_SECRET must be set and contain at least 32 characters")
 	}
 
 	store, err := newTrackStore(tracksDBPath)
 	if err != nil {
-		log.Fatalf("failed to initialize tracks database at %q: %v", tracksDBPath, err)
+		return fmt.Errorf("failed to initialize tracks database at %q: %w", tracksDBPath, err)
 	}
+	defer func() {
+		if err := store.db.Close(); err != nil {
+			log.Printf("failed to close tracks database: %v", err)
+		}
+	}()
 	store.songsDir = songsDir
 
 	auth := newAuthManager([]byte(authSecret), defaultAccessTokenTTL, defaultRefreshTokenTTL)
@@ -647,7 +662,7 @@ func main() {
 	lyricsSearchService := newLyricsSearchServiceFromEnv()
 	telegramConfig, err := loadTelegramConfig(telegramStateDir, telegramImportTempDir)
 	if err != nil {
-		log.Fatalf("failed to initialize telegram configuration: %v", err)
+		return fmt.Errorf("failed to initialize telegram configuration: %w", err)
 	}
 	telegramGateway := newGotdTelegramGateway(telegramConfig)
 	telegramImport := newTelegramImportService(telegramConfig, telegramGateway, store, songsDir)
@@ -746,7 +761,56 @@ func main() {
 	log.Printf("swagger docs available at http://localhost%s/api/docs", addr)
 	log.Printf("redoc available at http://localhost%s/api/redoc", addr)
 	handler := withRequestLogging(withRecovery(withCORS(mux)), logMode)
-	log.Fatal(http.ListenAndServe(addr, handler))
+	server := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+	}
+	shutdownContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	return serveHTTP(shutdownContext, server, gracefulShutdownTimeout)
+}
+
+type gracefulHTTPServer interface {
+	ListenAndServe() error
+	Shutdown(context.Context) error
+	Close() error
+}
+
+func serveHTTP(ctx context.Context, server gracefulHTTPServer, shutdownTimeout time.Duration) error {
+	serveErrors := make(chan error, 1)
+	go func() {
+		serveErrors <- server.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serveErrors:
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("serve HTTP: %w", err)
+	case <-ctx.Done():
+		log.Print("graceful shutdown started")
+	}
+
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
+	shutdownErr := server.Shutdown(shutdownContext)
+	cancelShutdown()
+	if shutdownErr != nil {
+		log.Printf("graceful shutdown failed: %v; force-closing HTTP server", shutdownErr)
+		if closeErr := server.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+			log.Printf("force-closing HTTP server failed: %v", closeErr)
+		}
+		return fmt.Errorf("graceful shutdown: %w", shutdownErr)
+	}
+
+	serveErr := <-serveErrors
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		return fmt.Errorf("serve HTTP: %w", serveErr)
+	}
+
+	log.Print("graceful shutdown completed")
+	return nil
 }
 
 func ensureDir(path string) error {
