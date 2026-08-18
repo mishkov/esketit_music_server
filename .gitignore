@@ -10,3 +10,5 @@ telegram_state/
 telegram_import_tmp/
 
 /youtube_cookies.txt
+
+/dist/
