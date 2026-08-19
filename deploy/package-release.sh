@@ -6,8 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 readonly SCRIPT_DIR REPOSITORY_ROOT
 readonly APP_NAME="esketit_music_server"
-readonly TARGET_OS="linux"
-readonly TARGET_ARCH="amd64"
+readonly RELEASE_TARGET_OS="linux"
+readonly RELEASE_TARGET_ARCH="amd64"
 
 release_dir=""
 release_dir_created=false
@@ -74,7 +74,7 @@ main() {
   short_sha="$(git rev-parse --short=12 HEAD)"
   [[ "$release_sha" =~ ^[0-9a-f]{40}$ ]] || die "unable to resolve a full Git revision"
 
-  release_name="$APP_NAME-$short_sha-$TARGET_OS-$TARGET_ARCH"
+  release_name="$APP_NAME-$short_sha-$RELEASE_TARGET_OS-$RELEASE_TARGET_ARCH"
   release_dir="$REPOSITORY_ROOT/dist/$release_name"
   archive_path="$REPOSITORY_ROOT/dist/$release_name.tar.gz"
   archive_checksum_path="$archive_path.sha256"
@@ -90,10 +90,10 @@ main() {
   mkdir -p "$release_dir"
   release_dir_created=true
 
-  log "Building $APP_NAME for $TARGET_OS/$TARGET_ARCH..."
+  log "Building $APP_NAME for $RELEASE_TARGET_OS/$RELEASE_TARGET_ARCH..."
   OUTPUT_PATH="$release_dir/$APP_NAME" \
-    TARGET_OS="$TARGET_OS" \
-    TARGET_ARCH="$TARGET_ARCH" \
+    TARGET_OS="$RELEASE_TARGET_OS" \
+    TARGET_ARCH="$RELEASE_TARGET_ARCH" \
     "$REPOSITORY_ROOT/build_server.sh"
 
   chmod 0755 "$release_dir/$APP_NAME"
