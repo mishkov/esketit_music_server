@@ -54,7 +54,7 @@ if (
 fi
 
 valid_archive="$test_root/valid.tar.gz"
-tar -C "$valid_bundle" -czf "$valid_archive" .
+COPYFILE_DISABLE=1 tar --no-xattrs -C "$valid_bundle" -czf "$valid_archive" .
 archive_path=$valid_archive
 validate_archive_listing
 
@@ -62,7 +62,7 @@ invalid_archive_bundle="$test_root/invalid-archive"
 cp -R "$valid_bundle" "$invalid_archive_bundle"
 printf 'unexpected\n' > "$invalid_archive_bundle/extra-file"
 invalid_archive="$test_root/invalid.tar.gz"
-tar -C "$invalid_archive_bundle" -czf "$invalid_archive" .
+COPYFILE_DISABLE=1 tar --no-xattrs -C "$invalid_archive_bundle" -czf "$invalid_archive" .
 
 if (
   archive_path=$invalid_archive
