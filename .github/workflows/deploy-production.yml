@@ -1,0 +1,166 @@
+name: Deploy production backend
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: esketit-music-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # A manual run from another branch must never deploy to production.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: https://esketitmusic.online
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      VPS_HOST: ${{ vars.VPS_HOST }}
+      VPS_PORT: ${{ vars.VPS_PORT }}
+      VPS_USER: ${{ vars.VPS_USER }}
+
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Test and package release
+        id: package
+        run: |
+          set -euo pipefail
+
+          actual_revision="$(git rev-parse HEAD)"
+          if [[ "$actual_revision" != "$GITHUB_SHA" ]]; then
+            echo "Expected revision $GITHUB_SHA, checked out $actual_revision" >&2
+            exit 1
+          fi
+
+          ./deploy/package-release.sh
+
+          short_revision="$(git rev-parse --short=12 "$GITHUB_SHA")"
+          archive="dist/esketit_music_server-${short_revision}-linux-amd64.tar.gz"
+          if [[ ! -f "$archive" ]]; then
+            echo "Release archive was not created: $archive" >&2
+            exit 1
+          fi
+
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Configure SSH
+        env:
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          : "${VPS_HOST:?production variable VPS_HOST is required}"
+          : "${VPS_PORT:?production variable VPS_PORT is required}"
+          : "${VPS_USER:?production variable VPS_USER is required}"
+          : "${VPS_KNOWN_HOSTS:?production secret VPS_KNOWN_HOSTS is required}"
+          : "${VPS_SSH_PRIVATE_KEY:?production secret VPS_SSH_PRIVATE_KEY is required}"
+
+          if [[ ! "$VPS_HOST" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+            echo "VPS_HOST contains unsupported characters" >&2
+            exit 1
+          fi
+          if [[ ! "$VPS_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+            echo "VPS_USER is not a valid Linux username" >&2
+            exit 1
+          fi
+          if [[ ! "$VPS_PORT" =~ ^[0-9]+$ ]] || (( VPS_PORT < 1 || VPS_PORT > 65535 )); then
+            echo "VPS_PORT must be between 1 and 65535" >&2
+            exit 1
+          fi
+
+          ssh_dir="$RUNNER_TEMP/esketit-ssh"
+          install -d -m 0700 "$ssh_dir"
+
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" | tr -d '\r' > "$ssh_dir/id_ed25519"
+          chmod 0600 "$ssh_dir/id_ed25519"
+          ssh-keygen -y -f "$ssh_dir/id_ed25519" >/dev/null
+
+          printf '%s\n' "$VPS_KNOWN_HOSTS" | tr -d '\r' > "$ssh_dir/known_hosts"
+          chmod 0600 "$ssh_dir/known_hosts"
+          test -s "$ssh_dir/known_hosts"
+
+          {
+            printf 'Host esketit-production\n'
+            printf '  HostName %s\n' "$VPS_HOST"
+            printf '  Port %s\n' "$VPS_PORT"
+            printf '  User %s\n' "$VPS_USER"
+            printf '  IdentityFile %s/id_ed25519\n' "$ssh_dir"
+            printf '  UserKnownHostsFile %s/known_hosts\n' "$ssh_dir"
+            printf '  BatchMode yes\n'
+            printf '  IdentitiesOnly yes\n'
+            printf '  StrictHostKeyChecking yes\n'
+            printf '  ConnectTimeout 10\n'
+          } > "$ssh_dir/config"
+          chmod 0600 "$ssh_dir/config"
+
+      - name: Upload release
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+
+          scp \
+            -F "$RUNNER_TEMP/esketit-ssh/config" \
+            "$ARCHIVE" \
+            esketit-production:/var/tmp/esketit_music_server/incoming/release.tar.gz.uploading
+
+      - name: Deploy release
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -F "$RUNNER_TEMP/esketit-ssh/config" \
+            esketit-production \
+            'set -eu
+             upload=/var/tmp/esketit_music_server/incoming/release.tar.gz.uploading
+             archive=/var/tmp/esketit_music_server/incoming/release.tar.gz
+             test -s "$upload"
+             chmod 0600 "$upload"
+             mv -- "$upload" "$archive"
+             sudo -n /usr/local/sbin/esketit-deploy "$archive"'
+
+      - name: Verify deployed revision
+        run: |
+          set -euo pipefail
+
+          deployed_revision="$(
+            ssh \
+              -F "$RUNNER_TEMP/esketit-ssh/config" \
+              esketit-production \
+              'cat /opt/esketit_music_server/current/REVISION'
+          )"
+
+          if [[ "$deployed_revision" != "$GITHUB_SHA" ]]; then
+            echo "Expected deployed revision $GITHUB_SHA, got $deployed_revision" >&2
+            exit 1
+          fi
+
+          {
+            echo '### Production deployment succeeded'
+            echo
+            echo "Deployed revision: \`$deployed_revision\`"
+          } >> "$GITHUB_STEP_SUMMARY"
