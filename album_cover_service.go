@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/getsentry/sentry-go"
 )
 
 const (
@@ -28,15 +30,21 @@ const (
 	albumCoverSearchTimeout           = 10 * time.Second
 	albumCoverImportTimeout           = 15 * time.Second
 	spotifySearchPageLimit            = 10
+	maxSpotifySearchResponseBytes     = 2 << 20
+	maxSpotifyTokenResponseBytes      = 64 << 10
 )
 
 var (
-	errAlbumCoverSuggestionsUnavailable = errors.New("album cover suggestions are not configured")
-	errAlbumCoverBlockedRemoteTarget    = errors.New("remote image URL points to a blocked host")
-	errAlbumCoverInvalidRemoteTarget    = errors.New("imageUrl must be an absolute http or https URL")
-	errAlbumCoverRemoteNotImage         = errors.New("remote response is not a supported image")
-	errAlbumCoverRemoteTooLarge         = errors.New("remote image exceeds the maximum allowed size")
-	errAlbumCoverRemoteEmpty            = errors.New("remote image is empty")
+	errAlbumCoverSuggestionsUnavailable   = errors.New("album cover suggestions are not configured")
+	errAlbumCoverBlockedRemoteTarget      = errors.New("remote image URL points to a blocked host")
+	errAlbumCoverInvalidRemoteTarget      = errors.New("imageUrl must be an absolute http or https URL")
+	errAlbumCoverRemoteNotImage           = errors.New("remote response is not a supported image")
+	errAlbumCoverRemoteTooLarge           = errors.New("remote image exceeds the maximum allowed size")
+	errAlbumCoverRemoteEmpty              = errors.New("remote image is empty")
+	errAlbumCoverImporterUnavailable      = errors.New("remote album cover importer is not configured")
+	errAlbumCoverStorage                  = errors.New("album cover storage failed")
+	errAlbumCoverDNSLookupFailed          = errors.New("remote host DNS lookup failed")
+	errAlbumCoverProviderResponseTooLarge = errors.New("album cover provider response is too large")
 )
 
 var acceptedAlbumCoverMIMETypes = map[string]string{
@@ -218,19 +226,21 @@ type spotifyAlbumSearchResponse struct {
 func (p *spotifyAlbumCoverSearchProvider) Search(ctx context.Context, query string, limit int) ([]albumCoverSuggestion, error) {
 	token, err := p.fetchAccessToken(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch Spotify access token: %w", err)
 	}
 
 	items := make([]albumCoverSuggestion, 0, limit)
+	droppedItems := 0
 	for offset := 0; offset < limit && len(items) < limit; offset += spotifySearchPageLimit {
 		pageSize := min(limit-offset, spotifySearchPageLimit)
 		page, err := p.searchAlbumsPage(ctx, token, query, pageSize, offset)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("search Spotify albums: %w", err)
 		}
 		for _, album := range page.Albums.Items {
 			image, thumbnail, ok := pickSpotifyAlbumImages(album.Images)
 			if !ok {
+				droppedItems++
 				continue
 			}
 			suggestion := albumCoverSuggestion{
@@ -242,11 +252,16 @@ func (p *spotifyAlbumCoverSearchProvider) Search(ctx context.Context, query stri
 			}
 			if isValidAlbumCoverSuggestion(suggestion) {
 				items = append(items, suggestion)
+			} else {
+				droppedItems++
 			}
 		}
 		if len(page.Albums.Items) < pageSize {
 			break
 		}
+	}
+	if droppedItems > 0 {
+		log.Printf("Spotify album search omitted %d unusable result(s)", droppedItems)
 	}
 	return items, nil
 }
@@ -254,7 +269,7 @@ func (p *spotifyAlbumCoverSearchProvider) Search(ctx context.Context, query stri
 func (p *spotifyAlbumCoverSearchProvider) searchAlbumsPage(ctx context.Context, token, query string, limit, offset int) (spotifyAlbumSearchResponse, error) {
 	endpoint, err := url.Parse(strings.TrimRight(p.apiBaseURL, "/") + "/search")
 	if err != nil {
-		return spotifyAlbumSearchResponse{}, fmt.Errorf("invalid spotify API base URL: %w", err)
+		return spotifyAlbumSearchResponse{}, fmt.Errorf("invalid Spotify API base URL: %w", albumCoverURLCause(err))
 	}
 	params := endpoint.Query()
 	params.Set("q", query)
@@ -265,23 +280,28 @@ func (p *spotifyAlbumCoverSearchProvider) searchAlbumsPage(ctx context.Context, 
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
-		return spotifyAlbumSearchResponse{}, err
+		return spotifyAlbumSearchResponse{}, fmt.Errorf("build Spotify search request: %w", albumCoverURLCause(err))
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
+	req, span := withAlbumCoverProviderSpan(req, "spotify", "GET spotify.album_search")
 	resp, err := p.client.Do(req)
+	defer finishAlbumCoverProviderSpan(span, resp, err)
 	if err != nil {
-		return spotifyAlbumSearchResponse{}, fmt.Errorf("spotify search request failed: %w", err)
+		return spotifyAlbumSearchResponse{}, fmt.Errorf("spotify search request failed: %w", albumCoverURLCause(err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return spotifyAlbumSearchResponse{}, fmt.Errorf("spotify search returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return spotifyAlbumSearchResponse{}, fmt.Errorf("spotify search returned status %d", resp.StatusCode)
 	}
 
 	var payload spotifyAlbumSearchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := decodeSpotifyJSON(resp.Body, maxSpotifySearchResponseBytes, &payload); err != nil {
+		if span != nil {
+			span.Status = sentry.SpanStatusDataLoss
+		}
 		return spotifyAlbumSearchResponse{}, fmt.Errorf("spotify search returned invalid JSON: %w", err)
 	}
 	return payload, nil
@@ -293,31 +313,50 @@ func (p *spotifyAlbumCoverSearchProvider) fetchAccessToken(ctx context.Context) 
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("build Spotify token request: %w", albumCoverURLCause(err))
 	}
 	req.SetBasicAuth(p.clientID, p.clientSecret)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
+	req, span := withAlbumCoverProviderSpan(req, "spotify", "POST spotify.oauth_token")
 	resp, err := p.client.Do(req)
+	defer finishAlbumCoverProviderSpan(span, resp, err)
 	if err != nil {
-		return "", fmt.Errorf("spotify token request failed: %w", err)
+		return "", fmt.Errorf("spotify token request failed: %w", albumCoverURLCause(err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("spotify token request returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("spotify token request returned status %d", resp.StatusCode)
 	}
 
 	var payload spotifyTokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := decodeSpotifyJSON(resp.Body, maxSpotifyTokenResponseBytes, &payload); err != nil {
+		if span != nil {
+			span.Status = sentry.SpanStatusDataLoss
+		}
 		return "", fmt.Errorf("spotify token response was invalid JSON: %w", err)
 	}
 	if strings.TrimSpace(payload.AccessToken) == "" {
+		if span != nil {
+			span.Status = sentry.SpanStatusDataLoss
+		}
 		return "", errors.New("spotify token response did not include an access token")
 	}
 
 	return payload.AccessToken, nil
+}
+
+func decodeSpotifyJSON(body io.Reader, limit int64, dst any) error {
+	data, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) > limit {
+		return errAlbumCoverProviderResponseTooLarge
+	}
+	return json.Unmarshal(data, dst)
 }
 
 type spotifyAlbumImage struct {
@@ -372,7 +411,7 @@ func isValidExternalHTTPURL(raw string) bool {
 
 func (s *albumCoverService) suggestionsUnavailableError() error {
 	if strings.TrimSpace(s.searchUnavailableMessage) != "" {
-		return errors.New(s.searchUnavailableMessage)
+		return fmt.Errorf("%w: %s", errAlbumCoverSuggestionsUnavailable, s.searchUnavailableMessage)
 	}
 	return errAlbumCoverSuggestionsUnavailable
 }
@@ -390,7 +429,7 @@ func (s *albumCoverService) searchSuggestions(ctx context.Context, query string,
 
 func (s *albumCoverService) importRemoteCover(ctx context.Context, imageURL, suggestedFileName string) (albumCoverImportResponse, error) {
 	if s.remoteFetcher == nil {
-		return albumCoverImportResponse{}, errors.New("remote album cover importer is not configured")
+		return albumCoverImportResponse{}, errAlbumCoverImporterUnavailable
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, albumCoverImportTimeout)
@@ -413,7 +452,7 @@ func (s *albumCoverService) importRemoteCover(ctx context.Context, imageURL, sug
 
 	info, err := storeMediaBytes(s.albumCoversDir, fileName, result.Data, "/api/album-covers/")
 	if err != nil {
-		return albumCoverImportResponse{}, err
+		return albumCoverImportResponse{}, fmt.Errorf("%w: %w", errAlbumCoverStorage, err)
 	}
 
 	return albumCoverImportResponse{
@@ -478,35 +517,52 @@ func storeMediaBytes(dir, fileName string, data []byte, urlPrefix string) (album
 		return albumCoverInfo{}, errors.New("uploaded file is empty")
 	}
 
+	var storedPath string
 	for attempt := 0; attempt < 10; attempt++ {
 		storedName, err := randomizedStoredFileName(name)
 		if err != nil {
-			return albumCoverInfo{}, errors.New("failed to create album cover file")
+			return albumCoverInfo{}, fmt.Errorf("generate album cover filename: %w", err)
 		}
 
 		fullPath := filepath.Join(dir, storedName)
 		file, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err == nil {
 			if _, copyErr := io.Copy(file, bytes.NewReader(data)); copyErr != nil {
-				_ = file.Close()
-				_ = os.Remove(fullPath)
-				return albumCoverInfo{}, errors.New("failed to save uploaded file")
+				cause := error(albumCoverPathCause(copyErr))
+				if closeErr := file.Close(); closeErr != nil {
+					cause = errors.Join(cause, fmt.Errorf("close incomplete album cover: %w", albumCoverPathCause(closeErr)))
+				}
+				if removeErr := removeFileForCleanup(fullPath); removeErr != nil {
+					cause = errors.Join(cause, fmt.Errorf("remove incomplete album cover: %w", albumCoverPathCause(removeErr)))
+				}
+				return albumCoverInfo{}, fmt.Errorf("write album cover file: %w", cause)
 			}
 			if closeErr := file.Close(); closeErr != nil {
-				_ = os.Remove(fullPath)
-				return albumCoverInfo{}, errors.New("failed to save uploaded file")
+				cause := error(albumCoverPathCause(closeErr))
+				if removeErr := removeFileForCleanup(fullPath); removeErr != nil {
+					cause = errors.Join(cause, fmt.Errorf("remove album cover after close failure: %w", albumCoverPathCause(removeErr)))
+				}
+				return albumCoverInfo{}, fmt.Errorf("close album cover file: %w", cause)
 			}
 			name = storedName
+			storedPath = fullPath
 			break
 		}
 		if !errors.Is(err, os.ErrExist) {
-			return albumCoverInfo{}, errors.New("failed to save uploaded file")
+			return albumCoverInfo{}, fmt.Errorf("create album cover file: %w", albumCoverPathCause(err))
 		}
 	}
+	if storedPath == "" {
+		return albumCoverInfo{}, errors.New("could not allocate a unique album cover filename")
+	}
 
-	info, err := os.Stat(filepath.Join(dir, name))
+	info, err := os.Stat(storedPath)
 	if err != nil {
-		return albumCoverInfo{}, errors.New("failed to read saved file")
+		cause := error(albumCoverPathCause(err))
+		if removeErr := removeFileForCleanup(storedPath); removeErr != nil {
+			cause = errors.Join(cause, fmt.Errorf("remove unreadable album cover: %w", albumCoverPathCause(removeErr)))
+		}
+		return albumCoverInfo{}, fmt.Errorf("read saved album cover file: %w", cause)
 	}
 
 	return albumCoverInfo{
@@ -569,7 +625,7 @@ func newSSRFProtectedRemoteImageFetcher(maxBytes int64, timeout time.Duration) r
 				if len(via) >= maxAlbumCoverRedirects {
 					return errors.New("too many redirects")
 				}
-				return validateRemoteAlbumCoverURL(req.URL.String())
+				return validateRemoteAlbumCoverURL(req.Context(), req.URL.String())
 			},
 		},
 		maxBytes: maxBytes,
@@ -577,7 +633,7 @@ func newSSRFProtectedRemoteImageFetcher(maxBytes int64, timeout time.Duration) r
 }
 
 func (f *ssrfProtectedRemoteImageFetcher) Fetch(ctx context.Context, imageURL string) (remoteImageFetchResult, error) {
-	if err := validateRemoteAlbumCoverURL(imageURL); err != nil {
+	if err := validateRemoteAlbumCoverURL(ctx, imageURL); err != nil {
 		return remoteImageFetchResult{}, err
 	}
 
@@ -587,9 +643,11 @@ func (f *ssrfProtectedRemoteImageFetcher) Fetch(ctx context.Context, imageURL st
 	}
 	req.Header.Set("Accept", "image/*")
 
+	req, span := withAlbumCoverProviderSpan(req, "remote_image", "GET album_cover.remote_image")
 	resp, err := f.client.Do(req)
+	defer finishAlbumCoverProviderSpan(span, resp, err)
 	if err != nil {
-		return remoteImageFetchResult{}, err
+		return remoteImageFetchResult{}, fmt.Errorf("remote image request failed: %w", albumCoverURLCause(err))
 	}
 	defer resp.Body.Close()
 
@@ -597,15 +655,24 @@ func (f *ssrfProtectedRemoteImageFetcher) Fetch(ctx context.Context, imageURL st
 		return remoteImageFetchResult{}, fmt.Errorf("remote server returned status %d", resp.StatusCode)
 	}
 	if resp.ContentLength > f.maxBytes {
+		if span != nil {
+			span.Status = sentry.SpanStatusResourceExhausted
+		}
 		return remoteImageFetchResult{}, errAlbumCoverRemoteTooLarge
 	}
 
 	limited := io.LimitReader(resp.Body, f.maxBytes+1)
 	data, err := io.ReadAll(limited)
 	if err != nil {
+		if span != nil {
+			span.Status = sentry.SpanStatusDataLoss
+		}
 		return remoteImageFetchResult{}, fmt.Errorf("failed to read remote image: %w", err)
 	}
 	if int64(len(data)) > f.maxBytes {
+		if span != nil {
+			span.Status = sentry.SpanStatusResourceExhausted
+		}
 		return remoteImageFetchResult{}, errAlbumCoverRemoteTooLarge
 	}
 
@@ -616,7 +683,7 @@ func (f *ssrfProtectedRemoteImageFetcher) Fetch(ctx context.Context, imageURL st
 	}, nil
 }
 
-func validateRemoteAlbumCoverURL(raw string) error {
+func validateRemoteAlbumCoverURL(ctx context.Context, raw string) error {
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return errAlbumCoverInvalidRemoteTarget
@@ -634,11 +701,22 @@ func validateRemoteAlbumCoverURL(raw string) error {
 		return nil
 	}
 
-	ips, err := net.DefaultResolver.LookupIPAddr(context.Background(), host)
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
-		return fmt.Errorf("failed to resolve remote host: %w", err)
+		return sanitizeAlbumCoverDNSLookupError(ctx, err)
 	}
 	return rejectBlockedIPAddrs(ips)
+}
+
+func sanitizeAlbumCoverDNSLookupError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return fmt.Errorf("remote host DNS lookup timed out: %w", context.DeadlineExceeded)
+	}
+	return errAlbumCoverDNSLookupFailed
 }
 
 func rejectBlockedIPAddrs(ips []net.IPAddr) error {
@@ -692,12 +770,24 @@ func albumCoverSuggestionsHandler(service *albumCoverService) http.HandlerFunc {
 
 		items, err := service.searchSuggestions(r.Context(), query, limit)
 		if err != nil {
-			if errors.Is(err, errAlbumCoverSuggestionsUnavailable) || strings.Contains(err.Error(), "unavailable") || strings.Contains(err.Error(), "not configured") {
+			if errors.Is(err, errAlbumCoverSuggestionsUnavailable) {
+				markSentryErrorHandled(r.Context())
 				http.Error(w, err.Error(), http.StatusNotImplemented)
 				return
 			}
-			log.Printf("album cover suggestions failed query=%q limit=%d err=%v", query, limit, err)
-			http.Error(w, "failed to fetch album cover suggestions", http.StatusBadGateway)
+			if errors.Is(err, context.Canceled) {
+				markSentryErrorHandled(r.Context())
+				http.Error(w, "request canceled", http.StatusRequestTimeout)
+				return
+			}
+			log.Printf("album cover suggestions failed: %s", safeOperationalError(err))
+			status := http.StatusBadGateway
+			message := "failed to fetch album cover suggestions"
+			if errors.Is(err, context.DeadlineExceeded) {
+				status = http.StatusGatewayTimeout
+				message = "album cover provider timed out"
+			}
+			writeSentryHTTPError(w, r, err, message, status, "spotify", "search_album_covers")
 			return
 		}
 
@@ -708,10 +798,8 @@ func albumCoverSuggestionsHandler(service *albumCoverService) http.HandlerFunc {
 func importAlbumCoverHandler(service *albumCoverService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req albumCoverImportRequest
-		decoder := json.NewDecoder(r.Body)
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&req); err != nil {
-			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		if err := decodeJSON(r, &req); err != nil {
+			writeRequestDecodeError(w, err)
 			return
 		}
 
@@ -724,7 +812,6 @@ func importAlbumCoverHandler(service *albumCoverService) http.HandlerFunc {
 
 		resp, err := service.importRemoteCover(r.Context(), req.ImageURL, req.SuggestedFileName)
 		if err != nil {
-			log.Printf("album cover import failed imageUrl=%q suggestedFileName=%q err=%v", req.ImageURL, req.SuggestedFileName, err)
 			switch {
 			case errors.Is(err, errAlbumCoverBlockedRemoteTarget),
 				errors.Is(err, errAlbumCoverInvalidRemoteTarget),
@@ -732,12 +819,90 @@ func importAlbumCoverHandler(service *albumCoverService) http.HandlerFunc {
 				errors.Is(err, errAlbumCoverRemoteTooLarge),
 				errors.Is(err, errAlbumCoverRemoteEmpty):
 				http.Error(w, err.Error(), http.StatusBadRequest)
+			case errors.Is(err, errAlbumCoverImporterUnavailable):
+				markSentryErrorHandled(r.Context())
+				http.Error(w, "album cover import is not configured", http.StatusNotImplemented)
+			case errors.Is(err, context.Canceled):
+				markSentryErrorHandled(r.Context())
+				http.Error(w, "request canceled", http.StatusRequestTimeout)
+			case errors.Is(err, context.DeadlineExceeded):
+				log.Printf("album cover import timed out: %s", safeOperationalError(err))
+				writeSentryHTTPError(w, r, err, "album cover provider timed out", http.StatusGatewayTimeout, "remote_image", "import_album_cover")
+			case errors.Is(err, errAlbumCoverStorage):
+				log.Printf("album cover storage failed: %s", safeOperationalError(err))
+				writeSentryHTTPError(w, r, err, "failed to store album cover", http.StatusInternalServerError, "album_cover", "store_imported_cover")
 			default:
-				http.Error(w, "failed to import album cover", http.StatusBadGateway)
+				log.Printf("album cover import failed: %s", safeOperationalError(err))
+				writeSentryHTTPError(w, r, err, "failed to import album cover", http.StatusBadGateway, "remote_image", "import_album_cover")
 			}
 			return
 		}
 
 		writeJSON(w, http.StatusCreated, resp)
 	}
+}
+
+func withAlbumCoverProviderSpan(req *http.Request, component, description string) (*http.Request, *sentry.Span) {
+	parent := sentry.SpanFromContext(req.Context())
+	if parent == nil {
+		return req, nil
+	}
+	span := parent.StartChild("http.client", sentry.WithDescription(description))
+	span.SetTag("component", component)
+	return req.WithContext(span.Context()), span
+}
+
+func finishAlbumCoverProviderSpan(span *sentry.Span, resp *http.Response, err error) {
+	if span == nil {
+		return
+	}
+	if span.Status == sentry.SpanStatusUndefined {
+		switch {
+		case errors.Is(err, context.Canceled):
+			span.Status = sentry.SpanStatusCanceled
+		case errors.Is(err, context.DeadlineExceeded):
+			span.Status = sentry.SpanStatusDeadlineExceeded
+		case err != nil:
+			span.Status = sentry.SpanStatusInternalError
+		case resp != nil:
+			span.Status = sentry.HTTPtoSpanStatus(resp.StatusCode)
+		default:
+			span.Status = sentry.SpanStatusUnknown
+		}
+	}
+	span.Finish()
+}
+
+func albumCoverURLCause(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return albumCoverURLCause(urlErr.Err)
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return sanitizeAlbumCoverDNSLookupError(context.Background(), dnsErr)
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Err != nil {
+		return albumCoverURLCause(opErr.Err)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return context.DeadlineExceeded
+	}
+	return err
+}
+
+func albumCoverPathCause(err error) error {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) && pathErr.Err != nil {
+		return pathErr.Err
+	}
+	return err
 }

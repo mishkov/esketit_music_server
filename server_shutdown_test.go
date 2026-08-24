@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -170,6 +171,22 @@ func TestServeHTTPReturnsUnexpectedServeError(t *testing.T) {
 	}
 }
 
+func TestServeHTTPConvertsListenerPanicToError(t *testing.T) {
+	server := &fakeGracefulHTTPServer{
+		serve: func() error {
+			panic("listener exploded")
+		},
+	}
+
+	err := serveHTTP(context.Background(), server, time.Second)
+	if !errors.Is(err, errHTTPServerPanic) {
+		t.Fatalf("serveHTTP() error = %v, want safe listener panic sentinel", err)
+	}
+	if strings.Contains(err.Error(), "listener exploded") {
+		t.Fatalf("serveHTTP() error leaked recovered panic payload: %v", err)
+	}
+}
+
 func TestServeHTTPForceClosesAfterShutdownTimeout(t *testing.T) {
 	serveStopped := make(chan struct{})
 	shutdownStarted := make(chan struct{})
@@ -211,6 +228,9 @@ func TestServeHTTPForceClosesAfterShutdownTimeout(t *testing.T) {
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("serveHTTP() error = %v, want context deadline exceeded", err)
 		}
+		if !strings.Contains(err.Error(), "wait for HTTP listener after force-close") {
+			t.Fatalf("serveHTTP() error = %v, want bounded listener-exit failure", err)
+		}
 	case <-time.After(shutdownTestTimeout):
 		t.Fatal("serveHTTP() hung after the shutdown deadline")
 	}
@@ -221,6 +241,86 @@ func TestServeHTTPForceClosesAfterShutdownTimeout(t *testing.T) {
 		t.Errorf("Close() calls = %d, want 1", server.closeCalls)
 	}
 	stopServeOnce.Do(func() { close(serveStopped) })
+}
+
+func TestServeHTTPWaitsForListenerExitAndJoinsServeErrorAfterForceClose(t *testing.T) {
+	serveStopped := make(chan struct{})
+	listenerExited := make(chan struct{})
+	wantShutdownErr := errors.New("shutdown failed")
+	wantServeErr := errors.New("listener exit failed")
+	var stopOnce sync.Once
+
+	server := &fakeGracefulHTTPServer{
+		serve: func() error {
+			<-serveStopped
+			close(listenerExited)
+			return wantServeErr
+		},
+		shutdown: func(context.Context) error {
+			return wantShutdownErr
+		},
+		closeServer: func() error {
+			stopOnce.Do(func() { close(serveStopped) })
+			return nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := serveHTTP(ctx, server, time.Second)
+
+	select {
+	case <-listenerExited:
+	default:
+		t.Fatal("serveHTTP() returned before the listener exited")
+	}
+	if !errors.Is(err, wantShutdownErr) || !errors.Is(err, wantServeErr) {
+		t.Fatalf("serveHTTP() error = %v, want joined shutdown and listener errors", err)
+	}
+}
+
+func TestServeHTTPJoinsShutdownAndForceCloseErrors(t *testing.T) {
+	serveStopped := make(chan struct{})
+	shutdownStarted := make(chan struct{})
+	wantShutdownErr := errors.New("shutdown failed")
+	wantCloseErr := errors.New("force close failed")
+	var stopServeOnce sync.Once
+	defer stopServeOnce.Do(func() { close(serveStopped) })
+
+	server := &fakeGracefulHTTPServer{
+		serve: func() error {
+			<-serveStopped
+			return http.ErrServerClosed
+		},
+		shutdown: func(context.Context) error {
+			close(shutdownStarted)
+			return wantShutdownErr
+		},
+		closeServer: func() error {
+			stopServeOnce.Do(func() { close(serveStopped) })
+			return wantCloseErr
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- serveHTTP(ctx, server, time.Second)
+	}()
+	cancel()
+	waitForShutdownTestSignal(t, shutdownStarted, "shutdown to start")
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, wantShutdownErr) {
+			t.Errorf("serveHTTP() error = %v, want shutdown error", err)
+		}
+		if !errors.Is(err, wantCloseErr) {
+			t.Errorf("serveHTTP() error = %v, want force-close error", err)
+		}
+	case <-time.After(shutdownTestTimeout):
+		t.Fatal("serveHTTP() did not return joined shutdown errors")
+	}
 }
 
 type listenerHTTPServer struct {

@@ -42,6 +42,141 @@ func TestHealthzHandler(t *testing.T) {
 	}
 }
 
+func TestCleanupStaleTelegramImportEntriesIsScoped(t *testing.T) {
+	dir := t.TempDir()
+	staleSession := filepath.Join(dir, "AbCdEfGhIjKlMnOpQrStUv")
+	unrelated := filepath.Join(dir, "keep-this-directory")
+	if err := os.MkdirAll(staleSession, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(unrelated, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleanupStaleTelegramImportEntries(dir); err != nil {
+		t.Fatalf("cleanupStaleTelegramImportEntries() error = %v", err)
+	}
+	if _, err := os.Stat(staleSession); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale session still exists or stat failed unexpectedly: %v", err)
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Fatalf("unrelated directory was removed: %v", err)
+	}
+}
+
+func TestEnsurePrivateDirOrCreateRestrictsPermissions(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "integration-secrets")
+	if err := ensurePrivateDirOrCreate(dir); err != nil {
+		t.Fatalf("ensurePrivateDirOrCreate() error = %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("directory mode = %o, want 700", got)
+	}
+
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "integration-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensurePrivateDirOrCreate(link); err == nil {
+		t.Fatal("ensurePrivateDirOrCreate() accepted a symbolic link")
+	}
+}
+
+func TestCleanupStaleYouTubeImportEntriesIsScoped(t *testing.T) {
+	dir := t.TempDir()
+	staleCookies := filepath.Join(dir, "youtube-cookies-42-token.txt")
+	staleAudio := filepath.Join(dir, "001-youtube-source-video-token.bin")
+	unrelated := filepath.Join(dir, "keep.txt")
+	for _, path := range []string{staleCookies, staleAudio, unrelated} {
+		if err := os.WriteFile(path, []byte("test"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := cleanupStaleYouTubeImportEntries(dir); err != nil {
+		t.Fatalf("cleanupStaleYouTubeImportEntries() error = %v", err)
+	}
+	for _, path := range []string{staleCookies, staleAudio} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stale file %q still exists or stat failed unexpectedly: %v", filepath.Base(path), err)
+		}
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Fatalf("unrelated file was removed: %v", err)
+	}
+}
+
+func TestJSONRequestBodyLimitReturns413(t *testing.T) {
+	body := `{"title":"` + strings.Repeat("a", maxJSONRequestBodySize) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/albums", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	createAlbumHandler(nil).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusRequestEntityTooLarge, rec.Body.String())
+	}
+}
+
+func TestDecodeJSONRejectsTrailingValues(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"title":"one"} {"title":"two"}`))
+	var payload map[string]string
+
+	err := decodeJSON(req, &payload)
+	if err == nil || errors.Is(err, errRequestBodyTooLarge) {
+		t.Fatalf("decodeJSON() error = %v, want invalid JSON error", err)
+	}
+}
+
+func TestListSongsRejectsSymbolicLinks(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Symlink(filepath.Join(dir, "missing-target"), filepath.Join(dir, "broken.mp3")); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/songs", nil)
+	rec := httptest.NewRecorder()
+
+	listSongsHandler(dir).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/api/songs/broken.mp3", nil)
+	getRec := httptest.NewRecorder()
+	getSongHandler(dir).ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusNotFound {
+		t.Fatalf("get symlink status = %d, want %d", getRec.Code, http.StatusNotFound)
+	}
+}
+
+func TestServeMediaFileRejectsSymbolicLinks(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "private-cover.jpg")
+	if err := os.WriteFile(target, []byte("private"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "cover.jpg")); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/album-covers/cover.jpg", nil)
+	rec := httptest.NewRecorder()
+
+	serveMediaFile(rec, req, "/api/album-covers/", dir)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	if strings.Contains(rec.Body.String(), "private") {
+		t.Fatalf("response exposed symlink target content: %q", rec.Body.String())
+	}
+}
+
 func TestServeOpenAPIHandlerUsesEmbeddedSpecification(t *testing.T) {
 	want, err := os.ReadFile("openapi.yaml")
 	if err != nil {
@@ -2429,6 +2564,200 @@ func TestNewTrackStoreMigratesTrackCreatedAtColumn(t *testing.T) {
 	}
 	if newer.CreatedAt.Sub(older.CreatedAt) != 1*time.Second {
 		t.Fatalf("createdAt spacing = %s, want 1s", newer.CreatedAt.Sub(older.CreatedAt))
+	}
+}
+
+func TestStoreMutationsRestoreMemoryAfterPersistenceFailure(t *testing.T) {
+	t.Run("delete album", func(t *testing.T) {
+		store := newTestTrackStore(t)
+		_, albumItem := seedPlaylistTrackDependencies(t, store)
+		if err := store.db.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		deleted, err := store.deleteAlbum(albumItem.ID)
+		if err == nil || deleted {
+			t.Fatalf("deleteAlbum() = (%v, %v), want persistence error", deleted, err)
+		}
+		if _, ok := store.getAlbum(albumItem.ID); !ok {
+			t.Fatal("album was not restored after persistence failure")
+		}
+	})
+
+	t.Run("reorder playlist", func(t *testing.T) {
+		store := newTestTrackStore(t)
+		userItem, err := store.createUser("reorder@example.com", "hash")
+		if err != nil {
+			t.Fatal(err)
+		}
+		artist, albumItem := seedPlaylistTrackDependencies(t, store)
+		first, err := store.create(upsertTrackRequest{Name: "First", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AudioFilePath: "/api/songs/first.mp3"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := store.create(upsertTrackRequest{Name: "Second", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AudioFilePath: "/api/songs/second.mp3"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		playlistItem, err := store.createPlaylist(userItem.ID, upsertPlaylistRequest{Name: "Queue", Visibility: playlistVisibilityPrivate})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.addTrackToPlaylists(userItem.ID, first.ID, []int64{playlistItem.ID}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.addTrackToPlaylists(userItem.ID, second.ID, []int64{playlistItem.ID}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.db.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		exists, err := store.reorderPlaylistTracks(userItem.ID, playlistItem.ID, []int64{second.ID, first.ID})
+		if err == nil || !exists {
+			t.Fatalf("reorderPlaylistTracks() = (%v, %v), want persistence error", exists, err)
+		}
+		stored := store.playlists[playlistItem.ID]
+		if len(stored.TrackItems) != 2 || stored.TrackItems[0].TrackID != first.ID || stored.TrackItems[1].TrackID != second.ID {
+			t.Fatalf("playlist order after failure = %#v, want [%d, %d]", stored.TrackItems, first.ID, second.ID)
+		}
+	})
+
+	t.Run("update author", func(t *testing.T) {
+		store := newTestTrackStore(t)
+		authorItem, err := store.createAuthor(upsertAuthorRequest{CurrentName: "Original"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.db.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		_, exists, err := store.updateAuthor(authorItem.ID, upsertAuthorRequest{CurrentName: "Changed"})
+		if err == nil || !exists {
+			t.Fatalf("updateAuthor() exists=%v error=%v, want persistence error", exists, err)
+		}
+		got, ok := store.getAuthor(authorItem.ID)
+		if !ok || got.CurrentName != "Original" {
+			t.Fatalf("author after failure = %#v, ok=%v", got, ok)
+		}
+	})
+
+	t.Run("delete author", func(t *testing.T) {
+		store := newTestTrackStore(t)
+		authorItem, err := store.createAuthor(upsertAuthorRequest{CurrentName: "Keep Me"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.db.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		deleted, err := store.deleteAuthor(authorItem.ID)
+		if err == nil || deleted {
+			t.Fatalf("deleteAuthor() = (%v, %v), want persistence error", deleted, err)
+		}
+		if _, ok := store.getAuthor(authorItem.ID); !ok {
+			t.Fatal("author was not restored after persistence failure")
+		}
+	})
+}
+
+func TestRefreshSessionPurgeRestoresMemoryAfterPersistenceFailure(t *testing.T) {
+	t.Run("create", func(t *testing.T) {
+		store := newTestTrackStore(t)
+		userItem, err := store.createUser("refresh-create@example.com", "hash")
+		if err != nil {
+			t.Fatal(err)
+		}
+		expired := refreshSession{ID: "expired", UserID: userItem.ID, TokenHash: "expired-hash", CreatedAt: time.Now().Add(-2 * time.Hour), ExpiresAt: time.Now().Add(-time.Hour)}
+		store.refreshSession[expired.ID] = expired
+		if err := store.db.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, _, err := store.createRefreshSession(userItem.ID, time.Now().Add(time.Hour)); err == nil {
+			t.Fatal("createRefreshSession() error = nil, want persistence failure")
+		}
+		if got, ok := store.refreshSession[expired.ID]; !ok || got != expired || len(store.refreshSession) != 1 {
+			t.Fatalf("refresh sessions after failure = %#v, want only expired snapshot", store.refreshSession)
+		}
+	})
+
+	t.Run("rotate", func(t *testing.T) {
+		store := newTestTrackStore(t)
+		userItem, err := store.createUser("refresh-rotate@example.com", "hash")
+		if err != nil {
+			t.Fatal(err)
+		}
+		valid, rawToken, err := store.createRefreshSession(userItem.ID, time.Now().Add(time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		expired := refreshSession{ID: "expired", UserID: userItem.ID, TokenHash: "expired-hash", CreatedAt: time.Now().Add(-2 * time.Hour), ExpiresAt: time.Now().Add(-time.Hour)}
+		store.refreshSession[expired.ID] = expired
+		if err := store.db.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, _, _, err := store.rotateRefreshSession(rawToken, time.Now().Add(time.Hour)); err == nil {
+			t.Fatal("rotateRefreshSession() error = nil, want persistence failure")
+		}
+		if got, ok := store.refreshSession[valid.ID]; !ok || got != valid {
+			t.Fatalf("valid refresh session after failure = %#v, ok=%v", got, ok)
+		}
+		if got, ok := store.refreshSession[expired.ID]; !ok || got != expired || len(store.refreshSession) != 2 {
+			t.Fatalf("refresh sessions after failure = %#v, want original snapshot", store.refreshSession)
+		}
+	})
+}
+
+func TestNewTrackStoreRejectsInvalidSQLiteRowWithContext(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "tracks.db")
+	store, err := newTrackStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorItem, err := store.createAuthor(upsertAuthorRequest{CurrentName: "Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE authors SET current_name = '' WHERE id = ?`, authorItem.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = newTrackStore(dbPath)
+	if err == nil || !strings.Contains(err.Error(), "SQLite authors row id "+strconv.FormatInt(authorItem.ID, 10)) {
+		t.Fatalf("newTrackStore() error = %v, want authors table/id context", err)
+	}
+}
+
+func TestAutoplayReportsUnexpectedLocalSongStatFailure(t *testing.T) {
+	store := newTestTrackStore(t)
+	userItem, err := store.createUser("autoplay-stat@example.com", "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, albumItem := seedPlaylistTrackDependencies(t, store)
+	trackItem, err := store.create(upsertTrackRequest{Name: "Track", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AudioFilePath: "/api/songs/track.mp3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	albumItem = store.albums[albumItem.ID]
+	albumItem.IsPublished = true
+	store.albums[albumItem.ID] = albumItem
+	notDirectory := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(notDirectory, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store.songsDir = notDirectory
+
+	_, err = store.nextAutoplayTracks(userItem.ID, autoplayNextRequest{SourceType: autoplaySourceAuthor, SourceID: &artist.ID, Profile: defaultAutoplayProfile, Count: 1})
+	if !errors.Is(err, errAutoplaySongStorage) {
+		t.Fatalf("nextAutoplayTracks() error = %v, want %v for track %d", err, errAutoplaySongStorage, trackItem.ID)
 	}
 }
 

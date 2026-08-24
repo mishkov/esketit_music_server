@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +16,29 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestValidateRemoteAlbumCoverURLHonorsContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := validateRemoteAlbumCoverURL(ctx, "https://context-cancellation-test.invalid/cover.jpg")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("validateRemoteAlbumCoverURL() error = %v, want context canceled", err)
+	}
+}
+
+func TestSanitizeAlbumCoverDNSLookupErrorRemovesHostname(t *testing.T) {
+	err := sanitizeAlbumCoverDNSLookupError(context.Background(), &net.DNSError{
+		Err:  "no such host",
+		Name: "private-customer-host.example",
+	})
+	if !errors.Is(err, errAlbumCoverDNSLookupFailed) {
+		t.Fatalf("sanitizeAlbumCoverDNSLookupError() error = %v", err)
+	}
+	if strings.Contains(err.Error(), "private-customer-host") {
+		t.Fatalf("sanitized DNS error leaked hostname: %v", err)
+	}
+}
 
 func TestAlbumCoverSuggestionsHandlerSuccess(t *testing.T) {
 	service := &albumCoverService{
@@ -146,6 +172,33 @@ func TestSpotifyAlbumCoverSearchProviderSplitsRequestsAboveTen(t *testing.T) {
 	}
 	if searchLimits[1] != 5 || searchOffsets[1] != 10 {
 		t.Fatalf("second request limit/offset = %d/%d, want 5/10", searchLimits[1], searchOffsets[1])
+	}
+}
+
+func TestSpotifyAlbumCoverSearchProviderRejectsOversizedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			_, _ = io.WriteString(w, `{"access_token":"test-token","token_type":"Bearer","expires_in":3600}`)
+		case "/v1/search":
+			_, _ = io.WriteString(w, strings.Repeat("x", maxSpotifySearchResponseBytes+1))
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	provider := &spotifyAlbumCoverSearchProvider{
+		clientID:     "client-id",
+		clientSecret: "client-secret",
+		apiBaseURL:   server.URL + "/v1",
+		tokenURL:     server.URL + "/token",
+		client:       server.Client(),
+	}
+
+	_, err := provider.Search(context.Background(), "query", 1)
+	if !errors.Is(err, errAlbumCoverProviderResponseTooLarge) {
+		t.Fatalf("Search() error = %v, want %v", err, errAlbumCoverProviderResponseTooLarge)
 	}
 }
 
