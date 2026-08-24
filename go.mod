@@ -3,6 +3,7 @@ module esketit_music_server
 go 1.26
 
 require (
+	github.com/getsentry/sentry-go v0.48.0
 	github.com/gotd/td v0.141.0
 	github.com/kkdai/youtube/v2 v2.10.6
 	modernc.org/sqlite v1.53.0
@@ -46,7 +47,7 @@ require (
 	golang.org/x/mod v0.36.0 // indirect
 	golang.org/x/net v0.54.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.44.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/tools v0.45.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -19,12 +18,12 @@ import (
 	"io"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -56,6 +55,8 @@ const (
 	maxAnalyticsPlatformLen         = 64
 	maxAnalyticsAppVersionLen       = 64
 	maxAnalyticsSearchQueryLen      = 1000
+	maxJSONRequestBodySize          = 1 << 20
+	multipartUploadMemoryThreshold  = 8 << 20
 	roleAdmin                       = "admin"
 	roleListener                    = "listener"
 	logModeVerbose                  = "verbose"
@@ -89,7 +90,15 @@ const (
 	analyticsEventTrackDislike      = "track_dislike"
 	analyticsEventTrackUndislike    = "track_undislike"
 	gracefulShutdownTimeout         = 30 * time.Second
+	httpReadHeaderTimeout           = 10 * time.Second
+	httpReadTimeout                 = 20 * time.Minute
+	httpIdleTimeout                 = 2 * time.Minute
+	maxHTTPListenerExitWait         = 5 * time.Second
 )
+
+// songsMutationMu keeps filesystem visibility and track-store commits ordered for
+// song mutations performed by HTTP and integration import handlers.
+var songsMutationMu sync.RWMutex
 
 type contextKey string
 
@@ -512,12 +521,15 @@ type loggingResponseWriter struct {
 	status      int
 	wroteHeader bool
 	bytes       int
-	body        bytes.Buffer
+	request     *http.Request
+}
+
+func (w *loggingResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (w *loggingResponseWriter) WriteHeader(status int) {
 	if w.wroteHeader {
-		w.ResponseWriter.WriteHeader(status)
 		return
 	}
 	w.status = status
@@ -531,10 +543,21 @@ func (w *loggingResponseWriter) Write(p []byte) (int, error) {
 	}
 	n, err := w.ResponseWriter.Write(p)
 	w.bytes += n
-	if shouldLogBodyContentType(w.Header().Get("Content-Type")) {
-		_, _ = w.body.Write(p[:n])
+	if err != nil && w.request != nil {
+		w.reportResponseError(fmt.Errorf("write HTTP response: %w", err), "write_response")
 	}
 	return n, err
+}
+
+func (w *loggingResponseWriter) reportResponseError(err error, operation string) {
+	if err == nil || w.request == nil {
+		return
+	}
+	if w.request.Context().Err() != nil {
+		markSentryErrorHandled(w.request.Context())
+		return
+	}
+	captureSentryError(w.request.Context(), err, "http", operation)
 }
 
 type authManager struct {
@@ -551,15 +574,32 @@ type accessTokenClaims struct {
 
 func main() {
 	if err := run(); err != nil {
-		log.Printf("server failed: %v", err)
+		log.Printf("server failed: %s", safeOperationalError(err))
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run() (runErr error) {
 	if err := loadDotEnv(".env"); err != nil {
 		return fmt.Errorf("failed to load .env: %w", err)
 	}
+
+	sentryEnabled, err := initializeSentry()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if sentryEnabled {
+				reportPanicAndFlushSentry(recovered)
+			}
+			runErr = errors.New("server terminated after panic")
+			return
+		}
+		if sentryEnabled {
+			reportAndFlushSentry(runErr)
+		}
+	}()
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -573,7 +613,10 @@ func run() error {
 	}
 
 	if err := ensureDir(songsDir); err != nil {
-		return fmt.Errorf("invalid songs directory %q: %w", songsDir, err)
+		return fmt.Errorf("invalid songs directory: %w", err)
+	}
+	if err := cleanupStaleYouTubeSongStaging(songsDir); err != nil {
+		return fmt.Errorf("clean stale youtube song staging files: %w", err)
 	}
 
 	defaultAlbumCoversDir := filepath.Join(home, "Projects", "esketit_music", "media_storage", "album_covers")
@@ -583,7 +626,7 @@ func run() error {
 	}
 
 	if err := ensureDirOrCreate(albumCoversDir); err != nil {
-		return fmt.Errorf("invalid album covers directory %q: %w", albumCoversDir, err)
+		return fmt.Errorf("invalid album covers directory: %w", err)
 	}
 
 	defaultAuthorPhotosDir := filepath.Join(home, "Projects", "esketit_music", "media_storage", "author_photos")
@@ -593,31 +636,37 @@ func run() error {
 	}
 
 	if err := ensureDirOrCreate(authorPhotosDir); err != nil {
-		return fmt.Errorf("invalid author photos directory %q: %w", authorPhotosDir, err)
+		return fmt.Errorf("invalid author photos directory: %w", err)
 	}
 
 	telegramStateDir := os.Getenv("TELEGRAM_STATE_DIR")
 	if telegramStateDir == "" {
 		telegramStateDir = "telegram_state"
 	}
-	if err := ensureDirOrCreate(telegramStateDir); err != nil {
-		return fmt.Errorf("invalid telegram state directory %q: %w", telegramStateDir, err)
+	if err := ensurePrivateDirOrCreate(telegramStateDir); err != nil {
+		return fmt.Errorf("invalid telegram state directory: %w", err)
 	}
 
 	telegramImportTempDir := os.Getenv("TELEGRAM_IMPORT_TEMP_DIR")
 	if telegramImportTempDir == "" {
 		telegramImportTempDir = "telegram_import_tmp"
 	}
-	if err := ensureDirOrCreate(telegramImportTempDir); err != nil {
-		return fmt.Errorf("invalid telegram import temp directory %q: %w", telegramImportTempDir, err)
+	if err := ensurePrivateDirOrCreate(telegramImportTempDir); err != nil {
+		return fmt.Errorf("invalid telegram import temp directory: %w", err)
+	}
+	if err := cleanupStaleTelegramImportEntries(telegramImportTempDir); err != nil {
+		return fmt.Errorf("clean stale telegram import files: %w", err)
 	}
 
 	youtubeImportTempDir := os.Getenv("YOUTUBE_IMPORT_TEMP_DIR")
 	if youtubeImportTempDir == "" {
 		youtubeImportTempDir = "youtube_import_tmp"
 	}
-	if err := ensureDirOrCreate(youtubeImportTempDir); err != nil {
-		return fmt.Errorf("invalid youtube import temp directory %q: %w", youtubeImportTempDir, err)
+	if err := ensurePrivateDirOrCreate(youtubeImportTempDir); err != nil {
+		return fmt.Errorf("invalid youtube import temp directory: %w", err)
+	}
+	if err := cleanupStaleYouTubeImportEntries(youtubeImportTempDir); err != nil {
+		return fmt.Errorf("clean stale youtube import files: %w", err)
 	}
 
 	youtubeCookiesFile := os.Getenv("YOUTUBE_COOKIES_FILE")
@@ -626,8 +675,8 @@ func run() error {
 	}
 	youtubeCookiesDir := filepath.Dir(youtubeCookiesFile)
 	if youtubeCookiesDir != "." {
-		if err := ensureDirOrCreate(youtubeCookiesDir); err != nil {
-			return fmt.Errorf("invalid youtube cookies directory %q: %w", youtubeCookiesDir, err)
+		if err := ensurePrivateDirOrCreate(youtubeCookiesDir); err != nil {
+			return fmt.Errorf("invalid youtube cookies directory: %w", err)
 		}
 	}
 	ytdlpBinary := strings.TrimSpace(os.Getenv("YTDLP_BINARY"))
@@ -651,11 +700,11 @@ func run() error {
 
 	store, err := newTrackStore(tracksDBPath)
 	if err != nil {
-		return fmt.Errorf("failed to initialize tracks database at %q: %w", tracksDBPath, err)
+		return fmt.Errorf("failed to initialize tracks database: %w", err)
 	}
 	defer func() {
 		if err := store.db.Close(); err != nil {
-			log.Printf("failed to close tracks database: %v", err)
+			runErr = errors.Join(runErr, fmt.Errorf("close tracks database: %w", err))
 		}
 	}()
 	store.songsDir = songsDir
@@ -670,6 +719,11 @@ func run() error {
 	}
 	telegramGateway := newGotdTelegramGateway(telegramConfig)
 	telegramImport := newTelegramImportService(telegramConfig, telegramGateway, store, songsDir)
+	defer func() {
+		if err := telegramImport.Close(); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("close telegram import service: %w", err))
+		}
+	}()
 	youtubeCookieStore := newYouTubeCookieStore(youtubeCookiesFile)
 	youtubeImportConfig := youtubeImportConfig{
 		ImportTempDir:   youtubeImportTempDir,
@@ -680,6 +734,11 @@ func run() error {
 	}
 	youtubeImportGateway := newLiveYouTubeImportGateway(youtubeImportConfig, youtubeCookieStore)
 	youtubeImport := newYouTubeImportService(youtubeImportConfig, youtubeImportGateway, store, songsDir)
+	defer func() {
+		if err := youtubeImport.Close(); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("close youtube import service: %w", err))
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthzHandler())
@@ -751,28 +810,36 @@ func run() error {
 
 	addr := ":8080"
 	log.Printf("server listening on %s", addr)
-	log.Printf("serving songs from %s", songsDir)
-	log.Printf("serving album covers from %s", albumCoversDir)
-	log.Printf("serving author photos from %s", authorPhotosDir)
-	log.Printf("using tracks database %s", store.path)
-	log.Printf("telegram state directory %s", telegramStateDir)
-	log.Printf("telegram import temp directory %s", telegramImportTempDir)
-	log.Printf("youtube import temp directory %s", youtubeImportTempDir)
-	log.Printf("youtube cookies file %s", youtubeCookiesFile)
-	log.Printf("yt-dlp binary %s", ytdlpBinary)
-	log.Printf("ffmpeg binary %s", ffmpegBinary)
+	log.Print("media, database, and integration storage configured")
 	log.Printf("http logging mode %s", logMode)
 	log.Printf("swagger docs available at http://localhost%s/api/docs", addr)
 	log.Printf("redoc available at http://localhost%s/api/redoc", addr)
-	handler := withRequestLogging(withRecovery(withCORS(mux)), logMode)
-	server := &http.Server{
-		Addr:    addr,
-		Handler: handler,
-	}
+	handler := buildHTTPHandler(mux, logMode, sentryEnabled)
 	shutdownContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		// WriteTimeout remains disabled so large song streams are not truncated.
+		IdleTimeout: httpIdleTimeout,
+		BaseContext: func(net.Listener) context.Context {
+			return shutdownContext
+		},
+	}
 
 	return serveHTTP(shutdownContext, server, gracefulShutdownTimeout)
+}
+
+func buildHTTPHandler(next http.Handler, logMode string, sentryEnabled bool) http.Handler {
+	next = withCORS(next)
+	next = withRequestLogging(next, logMode)
+	next = withRecovery(next)
+	if sentryEnabled {
+		next = withSentry(next)
+	}
+	return withSentryRequestState(next)
 }
 
 type gracefulHTTPServer interface {
@@ -784,7 +851,7 @@ type gracefulHTTPServer interface {
 func serveHTTP(ctx context.Context, server gracefulHTTPServer, shutdownTimeout time.Duration) error {
 	serveErrors := make(chan error, 1)
 	go func() {
-		serveErrors <- server.ListenAndServe()
+		serveErrors <- listenAndServeSafely(server)
 	}()
 
 	select {
@@ -801,11 +868,17 @@ func serveHTTP(ctx context.Context, server gracefulHTTPServer, shutdownTimeout t
 	shutdownErr := server.Shutdown(shutdownContext)
 	cancelShutdown()
 	if shutdownErr != nil {
-		log.Printf("graceful shutdown failed: %v; force-closing HTTP server", shutdownErr)
+		log.Printf("graceful shutdown failed: %s; force-closing HTTP server", safeOperationalError(shutdownErr))
+		var resultErr error
+		resultErr = errors.Join(resultErr, fmt.Errorf("graceful shutdown: %w", shutdownErr))
 		if closeErr := server.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
-			log.Printf("force-closing HTTP server failed: %v", closeErr)
+			log.Printf("force-closing HTTP server failed: %s", safeOperationalError(closeErr))
+			resultErr = errors.Join(resultErr, fmt.Errorf("force-close HTTP server: %w", closeErr))
 		}
-		return fmt.Errorf("graceful shutdown: %w", shutdownErr)
+		if serveErr := waitForHTTPListenerExit(serveErrors, shutdownTimeout); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			resultErr = errors.Join(resultErr, fmt.Errorf("wait for HTTP listener after force-close: %w", serveErr))
+		}
+		return resultErr
 	}
 
 	serveErr := <-serveErrors
@@ -815,6 +888,32 @@ func serveHTTP(ctx context.Context, server gracefulHTTPServer, shutdownTimeout t
 
 	log.Print("graceful shutdown completed")
 	return nil
+}
+
+func waitForHTTPListenerExit(serveErrors <-chan error, shutdownTimeout time.Duration) error {
+	wait := shutdownTimeout
+	if wait <= 0 || wait > maxHTTPListenerExitWait {
+		wait = maxHTTPListenerExitWait
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case err := <-serveErrors:
+		return err
+	case <-timer.C:
+		return context.DeadlineExceeded
+	}
+}
+
+func listenAndServeSafely(server gracefulHTTPServer) (serveErr error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			captureSentryPanic(context.Background(), recovered)
+			serveErr = errHTTPServerPanic
+		}
+	}()
+	return server.ListenAndServe()
 }
 
 func ensureDir(path string) error {
@@ -833,6 +932,70 @@ func ensureDirOrCreate(path string) error {
 		return err
 	}
 	return ensureDir(path)
+}
+
+func ensurePrivateDirOrCreate(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("private path is not a regular directory")
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		return err
+	}
+	return nil
+}
+
+func cleanupStaleTelegramImportEntries(dir string) error {
+	return cleanupStaleImportEntries(dir, func(entry os.DirEntry) bool {
+		return entry.IsDir() && looksLikeImportSessionToken(entry.Name())
+	})
+}
+
+func cleanupStaleYouTubeImportEntries(dir string) error {
+	return cleanupStaleImportEntries(dir, func(entry os.DirEntry) bool {
+		name := entry.Name()
+		return strings.HasPrefix(name, "youtube-cookies-") || strings.Contains(name, "youtube-source-")
+	})
+}
+
+func cleanupStaleImportEntries(dir string, shouldRemove func(os.DirEntry) bool) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var cleanupErr error
+	for _, entry := range entries {
+		if !shouldRemove(entry) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove stale import entry: %w", err))
+		}
+	}
+	return cleanupErr
+}
+
+func looksLikeImportSessionToken(value string) bool {
+	// randomToken(16) uses unpadded base64url, which is always 22 characters.
+	if len(value) != 22 {
+		return false
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '-' || char == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func withCORS(next http.Handler) http.Handler {
@@ -864,13 +1027,11 @@ func withRecovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
+				captureSentryPanic(r.Context(), rec)
 				log.Printf(
-					"panic method=%s path=%s remote=%s err=%v\n%s",
+					"panic recovered method=%s path=%s",
 					r.Method,
-					r.URL.RequestURI(),
-					r.RemoteAddr,
-					rec,
-					debug.Stack(),
+					redactRequestTarget(r.URL.RequestURI()),
 				)
 				http.Error(w, "internal server error", http.StatusInternalServerError)
 			}
@@ -882,97 +1043,45 @@ func withRecovery(next http.Handler) http.Handler {
 
 func withRequestLogging(next http.Handler, mode string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = withSentryRequestCaptureState(r)
 		start := time.Now()
-		requestBody := "[body omitted for privacy]"
-		if !shouldOmitRequestBodyFromLog(r) {
-			var restoreBody func()
-			var err error
-			requestBody, restoreBody, err = captureRequestBody(r)
-			if err != nil {
-				log.Printf("failed to capture request body method=%s path=%s err=%v", r.Method, r.URL.RequestURI(), err)
-				http.Error(w, "failed to read request body", http.StatusInternalServerError)
-				return
-			}
-			if restoreBody != nil {
-				defer restoreBody()
-			}
-		}
 
 		lw := &loggingResponseWriter{
 			ResponseWriter: w,
 			status:         http.StatusOK,
+			request:        r,
 		}
 
 		next.ServeHTTP(lw, r)
+		captureUnhandledHTTPStatus(r, lw.status)
 
 		if mode == logModeErrorOnly && lw.status < http.StatusInternalServerError {
 			return
 		}
 
 		log.Printf(
-			"http request method=%s path=%s status=%d duration=%s request_bytes=%d request_body=%q response_bytes=%d response_body=%q remote=%s user_agent=%q",
+			"http request method=%s path=%s status=%d duration=%s request_bytes=%d request_body=%q response_bytes=%d response_body=%q",
 			r.Method,
-			r.URL.RequestURI(),
+			redactRequestTarget(r.URL.RequestURI()),
 			lw.status,
 			time.Since(start).Round(time.Millisecond),
 			r.ContentLength,
-			requestBody,
+			"[body omitted for privacy]",
 			lw.bytes,
-			responseBodyForLog(lw),
-			r.RemoteAddr,
-			r.UserAgent(),
+			"[body omitted for privacy]",
 		)
 	})
 }
 
-func shouldOmitRequestBodyFromLog(r *http.Request) bool {
-	return r.URL.Path == "/api/analytics/events"
-}
-
-func captureRequestBody(r *http.Request) (string, func(), error) {
-	if r.Body == nil {
-		return "", nil, nil
-	}
-
-	contentType := r.Header.Get("Content-Type")
-	if strings.HasPrefix(contentType, "multipart/form-data") {
-		return fmt.Sprintf("[multipart body omitted content_type=%q size=%d]", contentType, r.ContentLength), nil, nil
-	}
-	if !shouldLogBodyContentType(contentType) {
-		return fmt.Sprintf("[body omitted content_type=%q size=%d]", contentType, r.ContentLength), nil, nil
-	}
-
-	body, err := io.ReadAll(r.Body)
+func redactRequestTarget(target string) string {
+	redacted := redactSentryRequestURL(target)
+	parsed, err := url.Parse(redacted)
 	if err != nil {
-		return "", nil, err
+		return redacted
 	}
-
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	return string(body), func() {
-		r.Body = io.NopCloser(bytes.NewReader(body))
-	}, nil
-}
-
-func responseBodyForLog(w *loggingResponseWriter) string {
-	contentType := w.Header().Get("Content-Type")
-	if !shouldLogBodyContentType(contentType) {
-		return fmt.Sprintf("[body omitted content_type=%q size=%d]", contentType, w.bytes)
-	}
-	return w.body.String()
-}
-
-func shouldLogBodyContentType(contentType string) bool {
-	contentType = strings.ToLower(strings.TrimSpace(contentType))
-	if contentType == "" {
-		return true
-	}
-	if strings.HasPrefix(contentType, "text/") {
-		return true
-	}
-	if strings.Contains(contentType, "json") || strings.Contains(contentType, "xml") || strings.Contains(contentType, "yaml") || strings.Contains(contentType, "form-urlencoded") {
-		return true
-	}
-	return false
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	return parsed.String()
 }
 
 func resolveLogMode(value string) string {
@@ -987,7 +1096,7 @@ func resolveLogMode(value string) string {
 	}
 }
 
-func loadDotEnv(path string) error {
+func loadDotEnv(path string) (returnErr error) {
 	file, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -995,10 +1104,16 @@ func loadDotEnv(path string) error {
 		}
 		return err
 	}
-	defer file.Close()
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close environment file: %w", closeErr))
+		}
+	}()
 
 	scanner := bufio.NewScanner(file)
+	lineNumber := 0
 	for scanner.Scan() {
+		lineNumber++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -1009,12 +1124,12 @@ func loadDotEnv(path string) error {
 
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
-			return fmt.Errorf("invalid line %q", line)
+			return fmt.Errorf("invalid environment file syntax at line %d", lineNumber)
 		}
 
 		key = strings.TrimSpace(key)
 		if key == "" {
-			return fmt.Errorf("invalid line %q", line)
+			return fmt.Errorf("empty environment variable name at line %d", lineNumber)
 		}
 		if _, exists := os.LookupEnv(key); exists {
 			continue
@@ -1023,11 +1138,14 @@ func loadDotEnv(path string) error {
 		value = strings.TrimSpace(value)
 		value = strings.Trim(value, `"'`)
 		if err := os.Setenv(key, value); err != nil {
-			return err
+			return fmt.Errorf("set environment variable %q: %w", key, err)
 		}
 	}
 
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read environment file: %w", err)
+	}
+	return nil
 }
 
 func isAllowedOrigin(origin, configuredOrigin string) bool {
@@ -1080,37 +1198,68 @@ func newTrackStore(path string) (*trackStore, error) {
 	s.db = db
 
 	if err := s.initSQLiteSchema(); err != nil {
-		_ = db.Close()
-		return nil, err
+		return nil, closeDatabaseAfterError(db, err)
 	}
 
 	hasData, err := s.loadSQLiteLocked()
 	if err != nil {
-		_ = db.Close()
-		return nil, err
+		return nil, closeDatabaseAfterError(db, err)
 	}
 	if !hasData {
 		imported, err := s.importLegacyJSONLocked(path, sqlitePath)
 		if err != nil {
-			_ = db.Close()
-			return nil, err
+			return nil, closeDatabaseAfterError(db, err)
 		}
 		if !imported {
 			if err := s.persistLocked(); err != nil {
-				_ = db.Close()
-				return nil, err
+				return nil, closeDatabaseAfterError(db, err)
 			}
 		}
 	} else if err := s.persistLocked(); err != nil {
-		_ = db.Close()
-		return nil, err
+		return nil, closeDatabaseAfterError(db, err)
 	}
 	if err := s.ensureSystemPlaylistUniqueIndex(); err != nil {
-		_ = db.Close()
-		return nil, err
+		return nil, closeDatabaseAfterError(db, err)
 	}
 
 	return s, nil
+}
+
+func closeDatabaseAfterError(db *sql.DB, primaryErr error) error {
+	if db == nil {
+		return primaryErr
+	}
+	if closeErr := db.Close(); closeErr != nil {
+		return errors.Join(primaryErr, fmt.Errorf("close SQLite database after failure: %w", closeErr))
+	}
+	return primaryErr
+}
+
+func joinRollbackError(returnErr *error, tx *sql.Tx, operation string) {
+	if tx == nil {
+		return
+	}
+	rollbackErr := tx.Rollback()
+	if rollbackErr == nil || errors.Is(rollbackErr, sql.ErrTxDone) {
+		return
+	}
+	*returnErr = errors.Join(*returnErr, fmt.Errorf("rollback %s transaction: %w", operation, rollbackErr))
+}
+
+func joinRowsCloseError(returnErr *error, rows *sql.Rows, operation string) {
+	if rows == nil {
+		return
+	}
+	if closeErr := rows.Close(); closeErr != nil {
+		*returnErr = errors.Join(*returnErr, fmt.Errorf("close rows after %s: %w", operation, closeErr))
+	}
+}
+
+func sqliteRowError(table string, id int64, operation string, err error) error {
+	if id > 0 {
+		return fmt.Errorf("SQLite %s row id %d: %s: %w", table, id, operation, err)
+	}
+	return fmt.Errorf("SQLite %s row: %s: %w", table, operation, err)
 }
 
 func (s *trackStore) importLegacyJSONLocked(jsonPath, sqlitePath string) (bool, error) {
@@ -1393,12 +1542,10 @@ func openSQLiteDB(path string) (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
-		_ = db.Close()
-		return nil, err
+		return nil, closeDatabaseAfterError(db, err)
 	}
 	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
-		_ = db.Close()
-		return nil, err
+		return nil, closeDatabaseAfterError(db, err)
 	}
 	return db, nil
 }
@@ -1508,12 +1655,12 @@ func (s *trackStore) initSQLiteSchema() error {
 	return nil
 }
 
-func (s *trackStore) ensureTrackCreatedAtColumn() error {
+func (s *trackStore) ensureTrackCreatedAtColumn() (returnErr error) {
 	rows, err := s.db.Query(`PRAGMA table_info(tracks)`)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer joinRowsCloseError(&returnErr, rows, "inspect tracks schema")
 
 	hasCreatedAt := false
 	for rows.Next() {
@@ -1543,7 +1690,7 @@ func (s *trackStore) ensureTrackCreatedAtColumn() error {
 	committed := false
 	defer func() {
 		if !committed {
-			_ = tx.Rollback()
+			joinRollbackError(&returnErr, tx, "migrate track creation timestamps")
 		}
 	}()
 
@@ -1559,10 +1706,18 @@ func (s *trackStore) ensureTrackCreatedAtColumn() error {
 	for idRows.Next() {
 		var id int64
 		if err := idRows.Scan(&id); err != nil {
-			_ = idRows.Close()
+			if closeErr := idRows.Close(); closeErr != nil {
+				return errors.Join(err, fmt.Errorf("close track migration rows: %w", closeErr))
+			}
 			return err
 		}
 		trackIDs = append(trackIDs, id)
+	}
+	if err := idRows.Err(); err != nil {
+		if closeErr := idRows.Close(); closeErr != nil {
+			return errors.Join(err, fmt.Errorf("close track migration rows: %w", closeErr))
+		}
+		return err
 	}
 	if err := idRows.Close(); err != nil {
 		return err
@@ -1624,10 +1779,155 @@ func (s *trackStore) loadSQLiteLocked() (bool, error) {
 	if err := s.loadSQLiteLyrics(&file); err != nil {
 		return false, err
 	}
+	if err := validateSQLiteDiskDBFile(file); err != nil {
+		return false, err
+	}
 	if err := s.loadDiskDBFileLocked(file); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+func validateSQLiteDiskDBFile(file diskDBFile) error {
+	authorIDs := make(map[int64]struct{}, len(file.Authors))
+	for _, item := range file.Authors {
+		item.CurrentName = strings.TrimSpace(item.CurrentName)
+		item.Photos = normalizePhotos(item.Photos)
+		if item.ID <= 0 {
+			return fmt.Errorf("invalid SQLite authors row id %d: id must be positive", item.ID)
+		}
+		if err := validateAuthor(item); err != nil {
+			return fmt.Errorf("invalid SQLite authors row id %d: %w", item.ID, err)
+		}
+		authorIDs[item.ID] = struct{}{}
+	}
+
+	albumIDs := make(map[int64]struct{}, len(file.Albums))
+	for _, item := range file.Albums {
+		if item.ID <= 0 {
+			return fmt.Errorf("invalid SQLite albums row id %d: id must be positive", item.ID)
+		}
+		item.Title = strings.TrimSpace(item.Title)
+		if item.Title == "" {
+			return fmt.Errorf("invalid SQLite albums row id %d: title is required", item.ID)
+		}
+		if item.ReleaseDate.IsZero() {
+			return fmt.Errorf("invalid SQLite albums row id %d: release date is required", item.ID)
+		}
+		if len(item.TrackIDs) != len(normalizeTrackIDs(item.TrackIDs)) {
+			return fmt.Errorf("invalid SQLite albums row id %d: track ids must be positive and unique", item.ID)
+		}
+		if len(item.AuthorIDs) != len(normalizeAuthorIDs(item.AuthorIDs)) {
+			return fmt.Errorf("invalid SQLite albums row id %d: author ids must be positive and unique", item.ID)
+		}
+		if err := validateAdditionalInfo(normalizeAdditionalInfo(item.AdditionalInfo)); err != nil {
+			return fmt.Errorf("invalid SQLite albums row id %d: %w", item.ID, err)
+		}
+		albumIDs[item.ID] = struct{}{}
+	}
+
+	tracks := make(map[int64]track, len(file.Tracks))
+	for rowIndex, raw := range file.Tracks {
+		var item track
+		if err := json.Unmarshal(raw, &item); err != nil {
+			return fmt.Errorf("invalid SQLite tracks row %d: decode row: %w", rowIndex+1, err)
+		}
+		if item.ID <= 0 {
+			return fmt.Errorf("invalid SQLite tracks row id %d: id must be positive", item.ID)
+		}
+		item.Name = strings.TrimSpace(item.Name)
+		item.AudioFilePath = normalizeAudioFilePath(item.AudioFilePath)
+		if item.Name == "" {
+			return fmt.Errorf("invalid SQLite tracks row id %d: name is required", item.ID)
+		}
+		if item.AudioFilePath == "" {
+			return fmt.Errorf("invalid SQLite tracks row id %d: audio file path is required", item.ID)
+		}
+		if item.AlbumID <= 0 {
+			return fmt.Errorf("invalid SQLite tracks row id %d: album id must be positive", item.ID)
+		}
+		if _, ok := albumIDs[item.AlbumID]; !ok {
+			return fmt.Errorf("invalid SQLite tracks row id %d: album id %d does not exist", item.ID, item.AlbumID)
+		}
+		if len(item.AuthorIDs) == 0 || len(item.AuthorIDs) != len(normalizeAuthorIDs(item.AuthorIDs)) {
+			return fmt.Errorf("invalid SQLite tracks row id %d: author ids must be non-empty, positive, and unique", item.ID)
+		}
+		for _, authorID := range item.AuthorIDs {
+			if _, ok := authorIDs[authorID]; !ok {
+				return fmt.Errorf("invalid SQLite tracks row id %d: author id %d does not exist", item.ID, authorID)
+			}
+		}
+		if err := validateAdditionalInfo(normalizeAdditionalInfo(item.AdditionalInfo)); err != nil {
+			return fmt.Errorf("invalid SQLite tracks row id %d: %w", item.ID, err)
+		}
+		if err := validateSourceMetadata(normalizeSourceMetadata(item.SourceMetadata)); err != nil {
+			return fmt.Errorf("invalid SQLite tracks row id %d: %w", item.ID, err)
+		}
+		tracks[item.ID] = item
+	}
+	for _, item := range file.Albums {
+		for _, trackID := range item.TrackIDs {
+			trackItem, ok := tracks[trackID]
+			if !ok {
+				return fmt.Errorf("invalid SQLite albums row id %d: track id %d does not exist", item.ID, trackID)
+			}
+			if trackItem.AlbumID != item.ID {
+				return fmt.Errorf("invalid SQLite albums row id %d: track id %d belongs to album id %d", item.ID, trackID, trackItem.AlbumID)
+			}
+		}
+	}
+
+	userIDs := make(map[int64]struct{}, len(file.Users))
+	emails := make(map[string]int64, len(file.Users))
+	for _, item := range file.Users {
+		email := normalizeEmail(item.Email)
+		role := normalizeRole(item.Role)
+		if item.ID <= 0 || email == "" || item.PasswordHash == "" || role == "" || item.CreatedAt.IsZero() {
+			return fmt.Errorf("invalid SQLite users row id %d: required user fields are invalid", item.ID)
+		}
+		if existingID, ok := emails[email]; ok && existingID != item.ID {
+			return fmt.Errorf("invalid SQLite users row id %d: normalized email duplicates row id %d", item.ID, existingID)
+		}
+		emails[email] = item.ID
+		userIDs[item.ID] = struct{}{}
+	}
+
+	for _, item := range file.Playlists {
+		item.Name = strings.TrimSpace(item.Name)
+		item.Description = strings.TrimSpace(item.Description)
+		item.Visibility = normalizePlaylistVisibility(item.Visibility)
+		item.Kind = normalizePlaylistKind(item.Kind, item.System)
+		item.ShareToken = strings.TrimSpace(item.ShareToken)
+		if item.ID <= 0 {
+			return fmt.Errorf("invalid SQLite playlists row id %d: id must be positive", item.ID)
+		}
+		if _, ok := userIDs[item.UserID]; !ok {
+			return fmt.Errorf("invalid SQLite playlists row id %d: user id %d does not exist", item.ID, item.UserID)
+		}
+		if err := validatePlaylist(item); err != nil {
+			return fmt.Errorf("invalid SQLite playlists row id %d: %w", item.ID, err)
+		}
+	}
+
+	for _, item := range file.Lyrics {
+		normalized, ok := normalizeLyrics(item)
+		if !ok {
+			return fmt.Errorf("invalid SQLite lyrics row id %d: lyrics fields are invalid", item.ID)
+		}
+		if _, ok := tracks[normalized.TrackID]; !ok {
+			return fmt.Errorf("invalid SQLite lyrics row id %d: track id %d does not exist", item.ID, normalized.TrackID)
+		}
+	}
+
+	for _, item := range file.Sessions {
+		if item.ID == "" || item.UserID <= 0 || item.TokenHash == "" || item.CreatedAt.IsZero() || item.ExpiresAt.IsZero() {
+			return fmt.Errorf("invalid SQLite refresh_sessions row for user id %d: required session fields are invalid", item.UserID)
+		}
+		if _, ok := userIDs[item.UserID]; !ok {
+			return fmt.Errorf("invalid SQLite refresh_sessions row for user id %d: user does not exist", item.UserID)
+		}
+	}
+	return nil
 }
 
 func (s *trackStore) sqliteHasData() (bool, error) {
@@ -1644,18 +1944,18 @@ func (s *trackStore) sqliteHasData() (bool, error) {
 	return false, nil
 }
 
-func (s *trackStore) loadSQLiteMetadata(file *diskDBFile) error {
+func (s *trackStore) loadSQLiteMetadata(file *diskDBFile) (returnErr error) {
 	rows, err := s.db.Query(`SELECT key, value FROM store_metadata`)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer joinRowsCloseError(&returnErr, rows, "load store metadata")
 
 	for rows.Next() {
 		var key string
 		var value int64
 		if err := rows.Scan(&key, &value); err != nil {
-			return err
+			return fmt.Errorf("SQLite store_metadata row: scan: %w", err)
 		}
 		switch key {
 		case "next_track_id":
@@ -1674,180 +1974,201 @@ func (s *trackStore) loadSQLiteMetadata(file *diskDBFile) error {
 			file.NextLyricsLineID = value
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("SQLite store_metadata rows: iterate: %w", err)
+	}
+	return nil
 }
 
-func (s *trackStore) loadSQLiteAuthors(file *diskDBFile) error {
+func (s *trackStore) loadSQLiteAuthors(file *diskDBFile) (returnErr error) {
 	rows, err := s.db.Query(`SELECT id, current_name, photos_json FROM authors ORDER BY id`)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer joinRowsCloseError(&returnErr, rows, "load authors")
 
 	for rows.Next() {
 		var item author
 		var photosJSON string
 		if err := rows.Scan(&item.ID, &item.CurrentName, &photosJSON); err != nil {
-			return err
+			return sqliteRowError("authors", item.ID, "scan", err)
 		}
 		if err := unmarshalJSONColumn(photosJSON, &item.Photos); err != nil {
-			return err
+			return sqliteRowError("authors", item.ID, "decode photos_json", err)
 		}
 		file.Authors = append(file.Authors, item)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("SQLite authors rows: iterate: %w", err)
+	}
+	return nil
 }
 
-func (s *trackStore) loadSQLiteAlbums(file *diskDBFile) error {
+func (s *trackStore) loadSQLiteAlbums(file *diskDBFile) (returnErr error) {
 	rows, err := s.db.Query(`SELECT id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json FROM albums ORDER BY id`)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer joinRowsCloseError(&returnErr, rows, "load albums")
 
 	for rows.Next() {
 		var item album
 		var authorIDsJSON, releaseDate, trackIDsJSON, additionalInfoJSON string
 		var isPublished int
 		if err := rows.Scan(&item.ID, &item.Title, &item.CoverImagePath, &authorIDsJSON, &releaseDate, &isPublished, &trackIDsJSON, &additionalInfoJSON); err != nil {
-			return err
+			return sqliteRowError("albums", item.ID, "scan", err)
 		}
 		if err := unmarshalJSONColumn(authorIDsJSON, &item.AuthorIDs); err != nil {
-			return err
+			return sqliteRowError("albums", item.ID, "decode author_ids_json", err)
 		}
 		if err := unmarshalJSONColumn(trackIDsJSON, &item.TrackIDs); err != nil {
-			return err
+			return sqliteRowError("albums", item.ID, "decode track_ids_json", err)
 		}
 		if err := unmarshalJSONColumn(additionalInfoJSON, &item.AdditionalInfo); err != nil {
-			return err
+			return sqliteRowError("albums", item.ID, "decode additional_info_json", err)
 		}
 		parsed, err := parseSQLiteTime(releaseDate)
 		if err != nil {
-			return err
+			return sqliteRowError("albums", item.ID, "parse release_date", err)
 		}
 		item.ReleaseDate = parsed
 		item.IsPublished = isPublished != 0
 		file.Albums = append(file.Albums, item)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("SQLite albums rows: iterate: %w", err)
+	}
+	return nil
 }
 
-func (s *trackStore) loadSQLiteTracks(file *diskDBFile) error {
+func (s *trackStore) loadSQLiteTracks(file *diskDBFile) (returnErr error) {
 	rows, err := s.db.Query(`SELECT id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at FROM tracks ORDER BY id`)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer joinRowsCloseError(&returnErr, rows, "load tracks")
 
 	for rows.Next() {
 		var item track
 		var authorIDsJSON, additionalInfoJSON, sourceMetadataJSON, createdAt string
 		if err := rows.Scan(&item.ID, &item.Name, &authorIDsJSON, &item.AlbumID, &item.AudioFilePath, &additionalInfoJSON, &sourceMetadataJSON, &createdAt); err != nil {
-			return err
+			return sqliteRowError("tracks", item.ID, "scan", err)
 		}
 		if err := unmarshalJSONColumn(authorIDsJSON, &item.AuthorIDs); err != nil {
-			return err
+			return sqliteRowError("tracks", item.ID, "decode author_ids_json", err)
 		}
 		if err := unmarshalJSONColumn(additionalInfoJSON, &item.AdditionalInfo); err != nil {
-			return err
+			return sqliteRowError("tracks", item.ID, "decode additional_info_json", err)
 		}
 		if err := unmarshalJSONColumn(sourceMetadataJSON, &item.SourceMetadata); err != nil {
-			return err
+			return sqliteRowError("tracks", item.ID, "decode source_metadata_json", err)
 		}
 		parsedCreatedAt, err := parseSQLiteTime(createdAt)
 		if err != nil {
-			return err
+			return sqliteRowError("tracks", item.ID, "parse created_at", err)
 		}
 		item.CreatedAt = parsedCreatedAt
 		raw, err := json.Marshal(item)
 		if err != nil {
-			return err
+			return sqliteRowError("tracks", item.ID, "encode loaded row", err)
 		}
 		file.Tracks = append(file.Tracks, raw)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("SQLite tracks rows: iterate: %w", err)
+	}
+	return nil
 }
 
-func (s *trackStore) loadSQLiteUsers(file *diskDBFile) error {
+func (s *trackStore) loadSQLiteUsers(file *diskDBFile) (returnErr error) {
 	rows, err := s.db.Query(`SELECT id, email, role, password_hash, created_at FROM users ORDER BY id`)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer joinRowsCloseError(&returnErr, rows, "load users")
 
 	for rows.Next() {
 		var item user
 		var createdAt string
 		if err := rows.Scan(&item.ID, &item.Email, &item.Role, &item.PasswordHash, &createdAt); err != nil {
-			return err
+			return sqliteRowError("users", item.ID, "scan", err)
 		}
 		parsed, err := parseSQLiteTime(createdAt)
 		if err != nil {
-			return err
+			return sqliteRowError("users", item.ID, "parse created_at", err)
 		}
 		item.CreatedAt = parsed
 		file.Users = append(file.Users, item)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("SQLite users rows: iterate: %w", err)
+	}
+	return nil
 }
 
-func (s *trackStore) loadSQLiteSessions(file *diskDBFile) error {
+func (s *trackStore) loadSQLiteSessions(file *diskDBFile) (returnErr error) {
 	rows, err := s.db.Query(`SELECT id, user_id, token_hash, created_at, expires_at FROM refresh_sessions ORDER BY user_id, created_at`)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer joinRowsCloseError(&returnErr, rows, "load refresh sessions")
 
 	for rows.Next() {
 		var item refreshSession
 		var createdAt, expiresAt string
 		if err := rows.Scan(&item.ID, &item.UserID, &item.TokenHash, &createdAt, &expiresAt); err != nil {
-			return err
+			return fmt.Errorf("SQLite refresh_sessions row: scan: %w", err)
 		}
 		parsedCreatedAt, err := parseSQLiteTime(createdAt)
 		if err != nil {
-			return err
+			return fmt.Errorf("SQLite refresh_sessions row for user id %d: parse created_at: %w", item.UserID, err)
 		}
 		parsedExpiresAt, err := parseSQLiteTime(expiresAt)
 		if err != nil {
-			return err
+			return fmt.Errorf("SQLite refresh_sessions row for user id %d: parse expires_at: %w", item.UserID, err)
 		}
 		item.CreatedAt = parsedCreatedAt
 		item.ExpiresAt = parsedExpiresAt
 		file.Sessions = append(file.Sessions, item)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("SQLite refresh_sessions rows: iterate: %w", err)
+	}
+	return nil
 }
 
-func (s *trackStore) loadSQLitePlaylists(file *diskDBFile) error {
+func (s *trackStore) loadSQLitePlaylists(file *diskDBFile) (returnErr error) {
 	rows, err := s.db.Query(`SELECT id, user_id, name, description, cover_image_path, visibility, share_token, track_items_json, system, kind FROM playlists ORDER BY user_id, id`)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer joinRowsCloseError(&returnErr, rows, "load playlists")
 
 	for rows.Next() {
 		var item playlist
 		var trackItemsJSON string
 		var system int
 		if err := rows.Scan(&item.ID, &item.UserID, &item.Name, &item.Description, &item.CoverImagePath, &item.Visibility, &item.ShareToken, &trackItemsJSON, &system, &item.Kind); err != nil {
-			return err
+			return sqliteRowError("playlists", item.ID, "scan", err)
 		}
 		if err := unmarshalJSONColumn(trackItemsJSON, &item.TrackItems); err != nil {
-			return err
+			return sqliteRowError("playlists", item.ID, "decode track_items_json", err)
 		}
 		item.System = system != 0
 		file.Playlists = append(file.Playlists, item)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("SQLite playlists rows: iterate: %w", err)
+	}
+	return nil
 }
 
-func (s *trackStore) loadSQLiteLyrics(file *diskDBFile) error {
+func (s *trackStore) loadSQLiteLyrics(file *diskDBFile) (returnErr error) {
 	rows, err := s.db.Query(`SELECT id, track_id, type, plain_text, language_code, source, is_verified, updated_at, created_at, lines_json FROM lyrics ORDER BY track_id`)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer joinRowsCloseError(&returnErr, rows, "load lyrics")
 
 	for rows.Next() {
 		var item lyrics
@@ -1855,7 +2176,7 @@ func (s *trackStore) loadSQLiteLyrics(file *diskDBFile) error {
 		var updatedAt, createdAt, linesJSON string
 		var isVerified int
 		if err := rows.Scan(&item.ID, &item.TrackID, &item.Type, &plainText, &languageCode, &source, &isVerified, &updatedAt, &createdAt, &linesJSON); err != nil {
-			return err
+			return sqliteRowError("lyrics", item.ID, "scan", err)
 		}
 		item.PlainText = nullStringPointer(plainText)
 		item.LanguageCode = nullStringPointer(languageCode)
@@ -1863,20 +2184,23 @@ func (s *trackStore) loadSQLiteLyrics(file *diskDBFile) error {
 		item.IsVerified = isVerified != 0
 		parsedUpdatedAt, err := parseSQLiteTime(updatedAt)
 		if err != nil {
-			return err
+			return sqliteRowError("lyrics", item.ID, "parse updated_at", err)
 		}
 		parsedCreatedAt, err := parseSQLiteTime(createdAt)
 		if err != nil {
-			return err
+			return sqliteRowError("lyrics", item.ID, "parse created_at", err)
 		}
 		item.UpdatedAt = parsedUpdatedAt
 		item.CreatedAt = parsedCreatedAt
 		if err := unmarshalJSONColumn(linesJSON, &item.Lines); err != nil {
-			return err
+			return sqliteRowError("lyrics", item.ID, "decode lines_json", err)
 		}
 		file.Lyrics = append(file.Lyrics, item)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("SQLite lyrics rows: iterate: %w", err)
+	}
+	return nil
 }
 
 func (s *trackStore) list() []track {
@@ -2087,6 +2411,7 @@ func (s *trackStore) deleteAlbum(id int64) (bool, error) {
 	}
 	delete(s.albums, id)
 	if err := s.persistLocked(); err != nil {
+		s.albums[id] = a
 		return false, err
 	}
 	return true, nil
@@ -2658,6 +2983,9 @@ func (s *trackStore) setTrackPreference(userID, trackID int64, kind string, enab
 }
 
 func (s *trackStore) nextAutoplayTracks(userID int64, req autoplayNextRequest) (autoplayNextResponse, error) {
+	songsMutationMu.RLock()
+	defer songsMutationMu.RUnlock()
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2690,7 +3018,7 @@ func (s *trackStore) nextAutoplayTracks(userID int64, req autoplayNextRequest) (
 
 	excluded, dislikedIDs := s.automaticPlaybackExcludedTrackSetLocked(userID, req.RecentTrackIDs, req.ExcludedTrackIDs)
 	if req.SourceType == autoplaySourceAuthor {
-		return s.nextAuthorAutoplayTracksLocked(userID, req, excluded, dislikedIDs), nil
+		return s.nextAuthorAutoplayTracksLocked(userID, req, excluded, dislikedIDs)
 	}
 
 	candidates := make([]track, 0, len(s.tracks))
@@ -2728,7 +3056,7 @@ func (s *trackStore) nextAuthorAutoplayTracksLocked(
 	userID int64,
 	req autoplayNextRequest,
 	excluded, dislikedIDs map[int64]struct{},
-) autoplayNextResponse {
+) (autoplayNextResponse, error) {
 	authorID := *req.SourceID
 	albums := make([]album, 0, len(s.albums))
 	now := time.Now().UTC()
@@ -2756,7 +3084,14 @@ func (s *trackStore) nextAuthorAutoplayTracksLocked(
 				continue
 			}
 			trackItem, ok := s.tracks[trackID]
-			if !ok || trackItem.AlbumID != albumItem.ID || !s.isTrackAutomaticallyPlayableLocked(trackItem) || !containsInt64(trackItem.AuthorIDs, authorID) {
+			if !ok || trackItem.AlbumID != albumItem.ID || !containsInt64(trackItem.AuthorIDs, authorID) {
+				continue
+			}
+			playable, err := s.isTrackAutomaticallyPlayableLocked(trackItem)
+			if err != nil {
+				return autoplayNextResponse{}, err
+			}
+			if !playable {
 				continue
 			}
 			_, isFavorite := favoriteIDs[trackID]
@@ -2774,23 +3109,33 @@ func (s *trackStore) nextAuthorAutoplayTracksLocked(
 		Profile:    req.Profile,
 		Strategy:   "author_release_desc_v1",
 		Tracks:     chosen,
-	}
+	}, nil
 }
 
-func (s *trackStore) isTrackAutomaticallyPlayableLocked(trackItem track) bool {
+func (s *trackStore) isTrackAutomaticallyPlayableLocked(trackItem track) (bool, error) {
 	if trackItem.AudioFilePath == "" {
-		return false
+		return false, nil
 	}
 	fileName, isLocalSong := extractReferencedSongFileName(trackItem.AudioFilePath)
 	if !isLocalSong {
 		parsed, err := url.Parse(trackItem.AudioFilePath)
-		return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != ""
+		return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "", nil
 	}
 	if s.songsDir == "" {
-		return true
+		return true, nil
 	}
 	info, err := os.Stat(filepath.Join(s.songsDir, fileName))
-	return err == nil && info.Mode().IsRegular() && info.Size() > 0
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) && pathErr.Err != nil {
+			err = pathErr.Err
+		}
+		return false, fmt.Errorf("%w: %w", errAutoplaySongStorage, err)
+	}
+	return info.Mode().IsRegular() && info.Size() > 0, nil
 }
 
 func (s *trackStore) reorderPlaylistTracks(userID, playlistID int64, trackIDs []int64) (bool, error) {
@@ -2807,9 +3152,11 @@ func (s *trackStore) reorderPlaylistTracks(userID, playlistID int64, trackIDs []
 	if err := validatePlaylistTrackOrder(trackIDs, p.TrackItems); err != nil {
 		return true, err
 	}
+	currentPlaylist := clonePlaylist(p)
 	p.TrackItems = reorderPlaylistTrackItems(p.TrackItems, trackIDs)
 	s.playlists[playlistID] = p
 	if err := s.persistLocked(); err != nil {
+		s.playlists[playlistID] = currentPlaylist
 		return true, err
 	}
 	return true, nil
@@ -2963,7 +3310,7 @@ func (s *trackStore) createAuthor(req upsertAuthorRequest) (author, error) {
 	return a, nil
 }
 
-func (s *trackStore) appendAnalyticsEvents(events []analyticsEventRecord) (analyticsEventsResponse, error) {
+func (s *trackStore) appendAnalyticsEvents(events []analyticsEventRecord) (response analyticsEventsResponse, returnErr error) {
 	if s.db == nil {
 		return analyticsEventsResponse{}, errors.New("sqlite database is not initialized")
 	}
@@ -2975,11 +3322,11 @@ func (s *trackStore) appendAnalyticsEvents(events []analyticsEventRecord) (analy
 	committed := false
 	defer func() {
 		if !committed {
-			_ = tx.Rollback()
+			joinRollbackError(&returnErr, tx, "append analytics events")
 		}
 	}()
 
-	response := analyticsEventsResponse{}
+	response = analyticsEventsResponse{}
 	for _, event := range events {
 		metadataJSON, err := marshalJSONColumn(event.Metadata)
 		if err != nil {
@@ -3046,7 +3393,8 @@ func (s *trackStore) updateAuthor(id int64, req upsertAuthorRequest) (author, bo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.authors[id]; !ok {
+	current, ok := s.authors[id]
+	if !ok {
 		return author{}, false, nil
 	}
 
@@ -3061,6 +3409,7 @@ func (s *trackStore) updateAuthor(id int64, req upsertAuthorRequest) (author, bo
 
 	s.authors[id] = a
 	if err := s.persistLocked(); err != nil {
+		s.authors[id] = current
 		return author{}, true, err
 	}
 	return a, true, nil
@@ -3070,7 +3419,8 @@ func (s *trackStore) deleteAuthor(id int64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.authors[id]; !ok {
+	current, ok := s.authors[id]
+	if !ok {
 		return false, nil
 	}
 	for _, t := range s.tracks {
@@ -3083,6 +3433,7 @@ func (s *trackStore) deleteAuthor(id int64) (bool, error) {
 
 	delete(s.authors, id)
 	if err := s.persistLocked(); err != nil {
+		s.authors[id] = current
 		return false, err
 	}
 	return true, nil
@@ -3158,16 +3509,19 @@ func (s *trackStore) createRefreshSession(userID int64, expiresAt time.Time) (re
 		return refreshSession{}, "", errInvalidCredentials
 	}
 
+	sessionsSnapshot := cloneRefreshSessionsMap(s.refreshSession)
 	now := time.Now().UTC()
 	s.removeExpiredSessionsLocked(now)
 
 	rawToken, err := randomToken(32)
 	if err != nil {
+		s.refreshSession = sessionsSnapshot
 		return refreshSession{}, "", err
 	}
 
 	sessionID, err := randomToken(16)
 	if err != nil {
+		s.refreshSession = sessionsSnapshot
 		return refreshSession{}, "", err
 	}
 
@@ -3181,7 +3535,7 @@ func (s *trackStore) createRefreshSession(userID int64, expiresAt time.Time) (re
 
 	s.refreshSession[session.ID] = session
 	if err := s.persistLocked(); err != nil {
-		delete(s.refreshSession, session.ID)
+		s.refreshSession = sessionsSnapshot
 		return refreshSession{}, "", err
 	}
 	return session, rawToken, nil
@@ -3191,18 +3545,23 @@ func (s *trackStore) rotateRefreshSession(rawToken string, expiresAt time.Time) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	sessionsSnapshot := cloneRefreshSessionsMap(s.refreshSession)
 	now := time.Now().UTC()
 	s.removeExpiredSessionsLocked(now)
 
 	session, ok := s.findRefreshSessionLocked(rawToken)
 	if !ok {
+		s.refreshSession = sessionsSnapshot
 		return user{}, refreshSession{}, "", errInvalidRefreshToken
 	}
 
 	u, ok := s.users[session.UserID]
 	if !ok {
 		delete(s.refreshSession, session.ID)
-		_ = s.persistLocked()
+		if err := s.persistLocked(); err != nil {
+			s.refreshSession = sessionsSnapshot
+			return user{}, refreshSession{}, "", fmt.Errorf("remove refresh session for missing user: %w", err)
+		}
 		return user{}, refreshSession{}, "", errInvalidRefreshToken
 	}
 
@@ -3210,13 +3569,13 @@ func (s *trackStore) rotateRefreshSession(rawToken string, expiresAt time.Time) 
 
 	newRawToken, err := randomToken(32)
 	if err != nil {
-		s.refreshSession[session.ID] = session
+		s.refreshSession = sessionsSnapshot
 		return user{}, refreshSession{}, "", err
 	}
 
 	newSessionID, err := randomToken(16)
 	if err != nil {
-		s.refreshSession[session.ID] = session
+		s.refreshSession = sessionsSnapshot
 		return user{}, refreshSession{}, "", err
 	}
 
@@ -3230,8 +3589,7 @@ func (s *trackStore) rotateRefreshSession(rawToken string, expiresAt time.Time) 
 
 	s.refreshSession[newSession.ID] = newSession
 	if err := s.persistLocked(); err != nil {
-		delete(s.refreshSession, newSession.ID)
-		s.refreshSession[session.ID] = session
+		s.refreshSession = sessionsSnapshot
 		return user{}, refreshSession{}, "", err
 	}
 
@@ -3309,7 +3667,7 @@ func (s *trackStore) backfillMissingTrackCreatedAtLocked(baseTime time.Time) {
 	}
 }
 
-func (s *trackStore) persistLocked() error {
+func (s *trackStore) persistLocked() (returnErr error) {
 	if s.db == nil {
 		return errors.New("sqlite database is not initialized")
 	}
@@ -3383,7 +3741,7 @@ func (s *trackStore) persistLocked() error {
 	committed := false
 	defer func() {
 		if !committed {
-			_ = tx.Rollback()
+			joinRollbackError(&returnErr, tx, "persist track store")
 		}
 	}()
 
@@ -3621,9 +3979,12 @@ func nullStringPointer(value sql.NullString) *string {
 
 func listSongsHandler(songsDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		songsMutationMu.RLock()
+		defer songsMutationMu.RUnlock()
+
 		entries, err := os.ReadDir(songsDir)
 		if err != nil {
-			http.Error(w, "failed to read songs directory", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, fmt.Errorf("read songs directory: %w", err), "failed to read songs directory", "storage", "songs.list")
 			return
 		}
 
@@ -3632,11 +3993,16 @@ func listSongsHandler(songsDir string) http.HandlerFunc {
 			if entry.IsDir() {
 				continue
 			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				writeSentryInternalError(w, r, errors.New("songs directory contains an unsupported symbolic link"), "failed to read songs directory", "storage", "songs.list_entry")
+				return
+			}
 
 			name := entry.Name()
 			info, err := entry.Info()
 			if err != nil {
-				continue
+				writeSentryInternalError(w, r, fmt.Errorf("read song directory entry metadata: %w", err), "failed to read songs directory", "storage", "songs.list_entry")
+				return
 			}
 
 			songs = append(songs, buildSongInfo(name, info))
@@ -3654,7 +4020,7 @@ func uploadSongHandler(songsDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		info, err := uploadMediaFile(w, r, songsDir, "failed to create song file", "/api/songs/")
 		if err != nil {
-			writeUploadError(w, err)
+			writeUploadError(w, r, err, "songs.upload")
 			return
 		}
 		writeJSON(w, http.StatusCreated, info)
@@ -3663,15 +4029,18 @@ func uploadSongHandler(songsDir string) http.HandlerFunc {
 
 func getSongHandler(songsDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		serveMediaFile(w, r, "/api/songs/", songsDir)
+		serveSongFile(w, r, songsDir)
 	}
 }
 
 func listUnusedSongsHandler(store *trackStore, songsDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		songsMutationMu.RLock()
+		defer songsMutationMu.RUnlock()
+
 		entries, err := os.ReadDir(songsDir)
 		if err != nil {
-			http.Error(w, "failed to read songs directory", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, fmt.Errorf("read unused songs directory: %w", err), "failed to read songs directory", "storage", "songs.list_unused")
 			return
 		}
 
@@ -3681,6 +4050,10 @@ func listUnusedSongsHandler(store *trackStore, songsDir string) http.HandlerFunc
 			if entry.IsDir() {
 				continue
 			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				writeSentryInternalError(w, r, errors.New("songs directory contains an unsupported symbolic link"), "failed to read songs directory", "storage", "songs.list_unused_entry")
+				return
+			}
 
 			name := entry.Name()
 			if _, ok := referenced[name]; ok {
@@ -3689,7 +4062,8 @@ func listUnusedSongsHandler(store *trackStore, songsDir string) http.HandlerFunc
 
 			info, err := entry.Info()
 			if err != nil {
-				continue
+				writeSentryInternalError(w, r, fmt.Errorf("read unused song directory entry metadata: %w", err), "failed to read songs directory", "storage", "songs.list_unused_entry")
+				return
 			}
 
 			songs = append(songs, buildSongInfo(name, info))
@@ -3711,6 +4085,9 @@ func deleteSongHandler(store *trackStore, songsDir string) http.HandlerFunc {
 			return
 		}
 
+		songsMutationMu.Lock()
+		defer songsMutationMu.Unlock()
+
 		inUse, trackID := store.songFileReferenced(name)
 		if inUse {
 			http.Error(w, fmt.Sprintf("song is referenced by track %d", trackID), http.StatusConflict)
@@ -3723,7 +4100,7 @@ func deleteSongHandler(store *trackStore, songsDir string) http.HandlerFunc {
 				http.NotFound(w, r)
 				return
 			}
-			http.Error(w, "failed to delete file", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, fmt.Errorf("delete song file: %w", err), "failed to delete file", "storage", "songs.delete")
 			return
 		}
 
@@ -3741,7 +4118,7 @@ func uploadAuthorPhotoHandler(authorPhotosDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		info, err := uploadMediaFile(w, r, authorPhotosDir, "failed to create author photo file", "/api/author-photos/")
 		if err != nil {
-			writeUploadError(w, err)
+			writeUploadError(w, r, err, "author_photos.upload")
 			return
 		}
 		writeJSON(w, http.StatusCreated, info)
@@ -3809,16 +4186,104 @@ func serveMediaFile(w http.ResponseWriter, r *http.Request, prefix, dir string) 
 	}
 
 	fullPath := filepath.Join(dir, name)
-	if _, err := os.Stat(fullPath); err != nil {
-		if os.IsNotExist(err) {
+	pathInfo, err := os.Lstat(fullPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
 			http.NotFound(w, r)
 			return
 		}
-		http.Error(w, "failed to read file", http.StatusInternalServerError)
+		writeSentryInternalError(w, r, fmt.Errorf("inspect media path: %w", err), "failed to read file", "storage", "media.lstat")
+		return
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 {
+		http.NotFound(w, r)
 		return
 	}
 
-	http.ServeFile(w, r, fullPath)
+	file, err := os.Open(fullPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			http.NotFound(w, r)
+			return
+		}
+		writeSentryInternalError(w, r, fmt.Errorf("open media file: %w", err), "failed to read file", "storage", "media.open")
+		return
+	}
+	info, statErr := file.Stat()
+	if statErr != nil {
+		if closeErr := file.Close(); closeErr != nil {
+			statErr = errors.Join(statErr, fmt.Errorf("close media after stat failure: %w", closeErr))
+		}
+		writeSentryInternalError(w, r, fmt.Errorf("stat opened media file: %w", statErr), "failed to read file", "storage", "media.stat")
+		return
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			captureSentryError(r.Context(), fmt.Errorf("close served media file: %w", closeErr), "storage", "media.close")
+		}
+	}()
+	if !info.Mode().IsRegular() {
+		http.NotFound(w, r)
+		return
+	}
+
+	http.ServeContent(w, r, name, info.ModTime(), file)
+}
+
+func serveSongFile(w http.ResponseWriter, r *http.Request, songsDir string) {
+	name, err := extractMediaFileName(r.URL.Path, "/api/songs/")
+	if err != nil {
+		http.Error(w, "invalid song name", http.StatusBadRequest)
+		return
+	}
+
+	songsMutationMu.RLock()
+	fullPath := filepath.Join(songsDir, name)
+	pathInfo, err := os.Lstat(fullPath)
+	if err != nil {
+		songsMutationMu.RUnlock()
+		if errors.Is(err, os.ErrNotExist) {
+			http.NotFound(w, r)
+			return
+		}
+		writeSentryInternalError(w, r, fmt.Errorf("inspect song path: %w", err), "failed to read file", "storage", "songs.lstat")
+		return
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 {
+		songsMutationMu.RUnlock()
+		http.NotFound(w, r)
+		return
+	}
+	file, err := os.Open(fullPath)
+	if err != nil {
+		songsMutationMu.RUnlock()
+		if errors.Is(err, os.ErrNotExist) {
+			http.NotFound(w, r)
+			return
+		}
+		writeSentryInternalError(w, r, fmt.Errorf("open song file: %w", err), "failed to read file", "storage", "songs.open")
+		return
+	}
+	info, statErr := file.Stat()
+	songsMutationMu.RUnlock()
+	if statErr != nil {
+		if closeErr := file.Close(); closeErr != nil {
+			statErr = errors.Join(statErr, fmt.Errorf("close song after stat failure: %w", closeErr))
+		}
+		writeSentryInternalError(w, r, fmt.Errorf("stat opened song file: %w", statErr), "failed to read file", "storage", "songs.stat")
+		return
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			captureSentryError(r.Context(), fmt.Errorf("close served song file: %w", closeErr), "storage", "songs.close")
+		}
+	}()
+	if !info.Mode().IsRegular() {
+		http.NotFound(w, r)
+		return
+	}
+
+	http.ServeContent(w, r, name, info.ModTime(), file)
 }
 
 func extractMediaFileName(path, prefix string) (string, error) {
@@ -3837,19 +4302,48 @@ func extractMediaFileName(path, prefix string) (string, error) {
 
 func uploadMediaFile(w http.ResponseWriter, r *http.Request, dir, createFailureMessage, urlPrefix string) (albumCoverInfo, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxSongUploadSize)
-	if err := r.ParseMultipartForm(maxSongUploadSize); err != nil {
+	parseErr := r.ParseMultipartForm(multipartUploadMemoryThreshold)
+	if r.MultipartForm != nil {
+		defer func() {
+			if cleanupErr := r.MultipartForm.RemoveAll(); cleanupErr != nil {
+				captureSentryError(r.Context(), fmt.Errorf("remove multipart upload temporary files: %w", cleanupErr), "storage", "upload.cleanup_multipart")
+			}
+		}()
+	}
+	if parseErr != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(parseErr, &maxBytesErr) {
+			return albumCoverInfo{}, errors.New("uploaded file is too large")
+		}
+		var pathErr *os.PathError
+		if errors.As(parseErr, &pathErr) {
+			return albumCoverInfo{}, uploadError{message: "failed to process uploaded file", cause: fmt.Errorf("parse multipart upload: %w", parseErr)}
+		}
 		return albumCoverInfo{}, errors.New("invalid multipart form")
 	}
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			return albumCoverInfo{}, uploadError{message: "failed to process uploaded file", cause: fmt.Errorf("open multipart upload: %w", err)}
+		}
 		return albumCoverInfo{}, errors.New("file is required")
 	}
-	defer file.Close()
+	uploadSucceeded := false
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil && uploadSucceeded {
+			captureSentryError(r.Context(), fmt.Errorf("close multipart upload: %w", closeErr), "storage", "upload.close_source")
+		}
+	}()
 
 	name, err := sanitizeSongFileName(header.Filename)
 	if err != nil {
 		return albumCoverInfo{}, err
+	}
+	if urlPrefix == "/api/songs/" {
+		songsMutationMu.Lock()
+		defer songsMutationMu.Unlock()
 	}
 
 	var (
@@ -3859,7 +4353,7 @@ func uploadMediaFile(w http.ResponseWriter, r *http.Request, dir, createFailureM
 	for attempt := 0; attempt < 10; attempt++ {
 		storedName, err := randomizedStoredFileName(name)
 		if err != nil {
-			return albumCoverInfo{}, errors.New(createFailureMessage)
+			return albumCoverInfo{}, uploadError{message: createFailureMessage, cause: fmt.Errorf("generate stored media filename: %w", err)}
 		}
 
 		fullPath = filepath.Join(dir, storedName)
@@ -3869,36 +4363,44 @@ func uploadMediaFile(w http.ResponseWriter, r *http.Request, dir, createFailureM
 			break
 		}
 		if !errors.Is(err, os.ErrExist) {
-			return albumCoverInfo{}, errors.New(createFailureMessage)
+			return albumCoverInfo{}, uploadError{message: createFailureMessage, cause: fmt.Errorf("create uploaded media file: %w", err)}
 		}
 	}
 	if dst == nil {
-		return albumCoverInfo{}, errors.New(createFailureMessage)
+		return albumCoverInfo{}, uploadError{message: createFailureMessage, cause: errors.New("could not allocate a unique media filename")}
 	}
 
-	copyErr := false
+	var saveErr error
 	if _, err := io.Copy(dst, file); err != nil {
-		copyErr = true
+		saveErr = errors.Join(saveErr, fmt.Errorf("copy uploaded media: %w", err))
 	}
 	if err := dst.Close(); err != nil {
-		copyErr = true
+		saveErr = errors.Join(saveErr, fmt.Errorf("close uploaded media: %w", err))
 	}
-	if copyErr {
-		_ = os.Remove(fullPath)
-		return albumCoverInfo{}, errors.New("failed to save uploaded file")
+	if saveErr != nil {
+		if cleanupErr := removeFileForCleanup(fullPath); cleanupErr != nil {
+			saveErr = errors.Join(saveErr, fmt.Errorf("remove incomplete uploaded media: %w", cleanupErr))
+		}
+		return albumCoverInfo{}, uploadError{message: "failed to save uploaded file", cause: saveErr}
 	}
 
 	info, err := os.Stat(fullPath)
 	if err != nil {
-		_ = os.Remove(fullPath)
-		return albumCoverInfo{}, errors.New("failed to read saved file")
+		readErr := fmt.Errorf("stat saved media: %w", err)
+		if cleanupErr := removeFileForCleanup(fullPath); cleanupErr != nil {
+			readErr = errors.Join(readErr, fmt.Errorf("remove unreadable uploaded media: %w", cleanupErr))
+		}
+		return albumCoverInfo{}, uploadError{message: "failed to read saved file", cause: readErr}
 	}
 	if info.Size() == 0 {
-		_ = os.Remove(fullPath)
+		if cleanupErr := removeFileForCleanup(fullPath); cleanupErr != nil {
+			captureSentryError(r.Context(), fmt.Errorf("remove empty uploaded media: %w", cleanupErr), "storage", "upload.cleanup")
+		}
 		return albumCoverInfo{}, errors.New("uploaded file is empty")
 	}
 
 	path := urlPrefix + url.PathEscape(name)
+	uploadSucceeded = true
 	return albumCoverInfo{
 		Name:         name,
 		SizeBytes:    info.Size(),
@@ -3908,11 +4410,32 @@ func uploadMediaFile(w http.ResponseWriter, r *http.Request, dir, createFailureM
 	}, nil
 }
 
-func removeUploadedMediaFile(dir, name string) {
-	if strings.TrimSpace(name) == "" {
-		return
+type uploadError struct {
+	message string
+	cause   error
+}
+
+func (e uploadError) Error() string {
+	return e.message
+}
+
+func (e uploadError) Unwrap() error {
+	return e.cause
+}
+
+func removeFileForCleanup(path string) error {
+	err := os.Remove(path)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	_ = os.Remove(filepath.Join(dir, name))
+	return err
+}
+
+func removeUploadedMediaFile(dir, name string) error {
+	if strings.TrimSpace(name) == "" {
+		return nil
+	}
+	return removeFileForCleanup(filepath.Join(dir, name))
 }
 
 func randomizedStoredFileName(name string) (string, error) {
@@ -3938,14 +4461,16 @@ func randomFileNameToken(size int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(bytes), nil
 }
 
-func writeUploadError(w http.ResponseWriter, err error) {
+func writeUploadError(w http.ResponseWriter, r *http.Request, err error, operation string) {
 	switch err.Error() {
 	case "invalid multipart form", "file is required", "uploaded filename is required", "invalid song name", "uploaded file is empty":
 		http.Error(w, err.Error(), http.StatusBadRequest)
+	case "uploaded file is too large":
+		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 	case "song already exists", "album cover already exists":
 		http.Error(w, err.Error(), http.StatusConflict)
-	case "failed to create song file", "failed to create album cover file", "failed to create author photo file", "failed to save uploaded file", "failed to read saved file":
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	case "failed to create song file", "failed to create album cover file", "failed to create author photo file", "failed to process uploaded file", "failed to save uploaded file", "failed to read saved file":
+		writeSentryInternalError(w, r, err, err.Error(), "storage", operation)
 	default:
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	}
@@ -3962,6 +4487,7 @@ func listAlbumsHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 		if auth != nil {
 			userID, err := auth.authenticateRequest(r)
 			if err == nil {
+				setSentryUser(r.Context(), userID)
 				if user, ok := store.getUser(userID); ok && user.Role == roleAdmin {
 					filter.IncludeEmpty = true
 				}
@@ -3975,7 +4501,7 @@ func createAlbumHandler(store *trackStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		req, err := decodeUpsertAlbumRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 
@@ -3985,7 +4511,7 @@ func createAlbumHandler(store *trackStore) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			http.Error(w, "failed to create album", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to create album", "database", "albums.create")
 			return
 		}
 		writeJSON(w, http.StatusCreated, a)
@@ -4043,7 +4569,7 @@ func updateAlbumByRouteHandler(store *trackStore) http.HandlerFunc {
 		}
 		req, err := decodeUpsertAlbumRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 		a, exists, err := store.updateAlbum(id, req)
@@ -4056,7 +4582,7 @@ func updateAlbumByRouteHandler(store *trackStore) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			http.Error(w, "failed to update album", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to update album", "database", "albums.update")
 			return
 		}
 		writeJSON(w, http.StatusOK, a)
@@ -4076,7 +4602,7 @@ func deleteAlbumByRouteHandler(store *trackStore) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusConflict)
 				return
 			}
-			http.Error(w, "failed to delete album", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to delete album", "database", "albums.delete")
 			return
 		}
 		if !deleted {
@@ -4091,7 +4617,7 @@ func uploadAlbumCoverHandler(albumCoversDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		info, err := uploadMediaFile(w, r, albumCoversDir, "failed to create album cover file", "/api/album-covers/")
 		if err != nil {
-			writeUploadError(w, err)
+			writeUploadError(w, r, err, "album_covers.upload")
 			return
 		}
 		writeJSON(w, http.StatusCreated, info)
@@ -4123,7 +4649,7 @@ func createPlaylistHandler(store *trackStore) http.HandlerFunc {
 		}
 		req, err := decodeUpsertPlaylistRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 		p, err := store.createPlaylist(userID, req)
@@ -4132,7 +4658,7 @@ func createPlaylistHandler(store *trackStore) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			http.Error(w, "failed to create playlist", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to create playlist", "database", "playlists.create")
 			return
 		}
 		writeJSON(w, http.StatusCreated, p)
@@ -4304,29 +4830,37 @@ func uploadPlaylistCoverByRouteHandler(store *trackStore, albumCoversDir string)
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			http.Error(w, "failed to update playlist cover", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to update playlist cover", "database", "playlists.cover_validate")
 			return
 		}
 
 		info, err := uploadMediaFile(w, r, albumCoversDir, "failed to create album cover file", "/api/album-covers/")
 		if err != nil {
-			writeUploadError(w, err)
+			writeUploadError(w, r, err, "playlists.cover_upload")
 			return
 		}
 
 		p, exists, err := store.updatePlaylistCoverImage(userID, id, info.URL)
 		if !exists {
-			removeUploadedMediaFile(albumCoversDir, info.Name)
+			if cleanupErr := removeUploadedMediaFile(albumCoversDir, info.Name); cleanupErr != nil {
+				captureSentryError(r.Context(), fmt.Errorf("remove orphaned playlist cover: %w", cleanupErr), "storage", "playlists.cover_cleanup")
+			}
 			http.NotFound(w, r)
 			return
 		}
 		if err != nil {
-			removeUploadedMediaFile(albumCoversDir, info.Name)
+			cleanupErr := removeUploadedMediaFile(albumCoversDir, info.Name)
 			if errors.Is(err, errSystemPlaylistImmutable) {
+				if cleanupErr != nil {
+					captureSentryError(r.Context(), fmt.Errorf("remove rejected playlist cover upload: %w", cleanupErr), "storage", "playlists.cover_cleanup")
+				}
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			http.Error(w, "failed to update playlist cover", http.StatusInternalServerError)
+			if cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("remove failed playlist cover upload: %w", cleanupErr))
+			}
+			writeSentryInternalError(w, r, err, "failed to update playlist cover", "database", "playlists.cover_update")
 			return
 		}
 
@@ -4352,7 +4886,7 @@ func updatePlaylistByRouteHandler(store *trackStore) http.HandlerFunc {
 		}
 		req, err := decodeUpsertPlaylistRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 		p, exists, err := store.updatePlaylist(userID, id, req)
@@ -4365,7 +4899,7 @@ func updatePlaylistByRouteHandler(store *trackStore) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			http.Error(w, "failed to update playlist", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to update playlist", "database", "playlists.update")
 			return
 		}
 		writeJSON(w, http.StatusOK, p)
@@ -4390,7 +4924,7 @@ func deletePlaylistByRouteHandler(store *trackStore) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			http.Error(w, "failed to delete playlist", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to delete playlist", "database", "playlists.delete")
 			return
 		}
 		if !deleted {
@@ -4415,7 +4949,7 @@ func reorderPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
 		}
 		req, err := decodeReorderPlaylistTracksRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 		exists, err := store.reorderPlaylistTracks(userID, id, req.TrackIDs)
@@ -4428,7 +4962,7 @@ func reorderPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			http.Error(w, "failed to reorder playlist tracks", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to reorder playlist tracks", "database", "playlists.reorder_tracks")
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -4450,7 +4984,7 @@ func createTrackHandler(store *trackStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		req, err := decodeUpsertTrackRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 
@@ -4460,7 +4994,7 @@ func createTrackHandler(store *trackStore) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			http.Error(w, "failed to create track", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to create track", "database", "tracks.create")
 			return
 		}
 		writeJSON(w, http.StatusCreated, store.toTrackResponse(t, false, false, true))
@@ -4503,7 +5037,7 @@ func updateTrackHandler(store *trackStore) http.HandlerFunc {
 
 		req, err := decodeUpsertTrackRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 
@@ -4517,7 +5051,7 @@ func updateTrackHandler(store *trackStore) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			http.Error(w, "failed to update track", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to update track", "database", "tracks.update")
 			return
 		}
 		writeJSON(w, http.StatusOK, store.toTrackResponse(t, false, false, true))
@@ -4538,7 +5072,7 @@ func deleteTrackHandler(store *trackStore) http.HandlerFunc {
 			return
 		}
 		if err != nil {
-			http.Error(w, "failed to delete track", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to delete track", "database", "tracks.delete")
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -4605,7 +5139,7 @@ func addTrackToPlaylistsHandler(store *trackStore) http.HandlerFunc {
 		}
 		req, err := decodeAddTrackToPlaylistsRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 		if err := store.addTrackToPlaylists(userID, trackID, req.PlaylistIDs); err != nil {
@@ -4615,7 +5149,7 @@ func addTrackToPlaylistsHandler(store *trackStore) http.HandlerFunc {
 			case errors.Is(err, errTrackNotFound), errors.Is(err, errPlaylistNotFound):
 				http.NotFound(w, r)
 			default:
-				http.Error(w, "failed to add track to playlists", http.StatusInternalServerError)
+				writeSentryInternalError(w, r, err, "failed to add track to playlists", "database", "playlists.add_track")
 			}
 			return
 		}
@@ -4641,7 +5175,7 @@ func removeTrackFromPlaylistHandler(store *trackStore) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			http.Error(w, "failed to remove track from playlist", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to remove track from playlist", "database", "playlists.remove_track")
 			return
 		}
 		if !deleted {
@@ -4669,7 +5203,7 @@ func favoriteTrackHandler(store *trackStore, favorite bool) http.HandlerFunc {
 			case errors.Is(err, errTrackNotFound), errors.Is(err, errPlaylistNotFound):
 				http.NotFound(w, r)
 			default:
-				http.Error(w, "failed to update favorite track", http.StatusInternalServerError)
+				writeSentryInternalError(w, r, err, "failed to update favorite track", "database", "tracks.favorite")
 			}
 			return
 		}
@@ -4694,7 +5228,7 @@ func dislikeTrackHandler(store *trackStore, disliked bool) http.HandlerFunc {
 			case errors.Is(err, errTrackNotFound), errors.Is(err, errPlaylistNotFound):
 				http.NotFound(w, r)
 			default:
-				http.Error(w, "failed to update disliked track", http.StatusInternalServerError)
+				writeSentryInternalError(w, r, err, "failed to update disliked track", "database", "tracks.dislike")
 			}
 			return
 		}
@@ -4712,7 +5246,7 @@ func autoplayNextHandler(store *trackStore) http.HandlerFunc {
 
 		req, err := decodeAutoplayNextRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 
@@ -4723,8 +5257,10 @@ func autoplayNextHandler(store *trackStore) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 			case errors.Is(err, errTrackNotFound), errors.Is(err, errPlaylistNotFound), errors.Is(err, errAlbumNotFound), errors.Is(err, errAuthorNotFound):
 				http.NotFound(w, r)
+			case errors.Is(err, errAutoplaySongStorage):
+				writeSentryInternalError(w, r, err, "failed to inspect local song", "storage", "autoplay.inspect_song")
 			default:
-				http.Error(w, "failed to build autoplay continuation", http.StatusInternalServerError)
+				writeSentryInternalError(w, r, err, "failed to build autoplay continuation", "database", "autoplay.next")
 			}
 			return
 		}
@@ -4743,7 +5279,7 @@ func analyticsEventsHandler(store *trackStore, auth *authManager) http.HandlerFu
 
 		req, err := decodeAnalyticsEventsRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 
@@ -4772,7 +5308,7 @@ func analyticsEventsHandler(store *trackStore, auth *authManager) http.HandlerFu
 
 		response, err := store.appendAnalyticsEvents(records)
 		if err != nil {
-			http.Error(w, "failed to store analytics events", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to store analytics events", "database", "analytics.append")
 			return
 		}
 
@@ -4796,6 +5332,7 @@ func searchHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 		if auth != nil {
 			userID, err := auth.authenticateRequest(r)
 			if err == nil {
+				setSentryUser(r.Context(), userID)
 				if user, ok := store.getUser(userID); ok && user.Role == roleAdmin {
 					filter.IncludeEmpty = true
 				}
@@ -4809,7 +5346,7 @@ func createAuthorHandler(store *trackStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		req, err := decodeUpsertAuthorRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 		a, err := store.createAuthor(req)
@@ -4818,7 +5355,7 @@ func createAuthorHandler(store *trackStore) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			http.Error(w, "failed to create author", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to create author", "database", "authors.create")
 			return
 		}
 		writeJSON(w, http.StatusCreated, a)
@@ -4851,7 +5388,7 @@ func updateAuthorHandler(store *trackStore) http.HandlerFunc {
 
 		req, err := decodeUpsertAuthorRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 
@@ -4865,7 +5402,7 @@ func updateAuthorHandler(store *trackStore) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			http.Error(w, "failed to update author", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to update author", "database", "authors.update")
 			return
 		}
 		writeJSON(w, http.StatusOK, a)
@@ -4886,7 +5423,7 @@ func deleteAuthorHandler(store *trackStore) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusConflict)
 				return
 			}
-			http.Error(w, "failed to delete author", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to delete author", "database", "authors.delete")
 			return
 		}
 		if !deleted {
@@ -4901,13 +5438,13 @@ func registerHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		req, err := decodeRegisterRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 
 		passwordHash, err := hashPassword(req.Password)
 		if err != nil {
-			http.Error(w, "failed to hash password", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, fmt.Errorf("hash registration password: %w", err), "failed to hash password", "auth", "register.hash_password")
 			return
 		}
 
@@ -4917,11 +5454,12 @@ func registerHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusConflict)
 				return
 			}
-			http.Error(w, "failed to create user", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to create user", "database", "users.create")
 			return
 		}
 
-		writeAuthResponse(w, http.StatusCreated, auth, store, u)
+		setSentryUser(r.Context(), u.ID)
+		writeAuthResponse(w, r, http.StatusCreated, auth, store, u)
 	}
 }
 
@@ -4929,7 +5467,7 @@ func loginHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		req, err := decodeLoginRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 
@@ -4939,7 +5477,8 @@ func loginHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 			return
 		}
 
-		writeAuthResponse(w, http.StatusOK, auth, store, u)
+		setSentryUser(r.Context(), u.ID)
+		writeAuthResponse(w, r, http.StatusOK, auth, store, u)
 	}
 }
 
@@ -4947,7 +5486,7 @@ func refreshHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		req, err := decodeRefreshRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 
@@ -4958,13 +5497,14 @@ func refreshHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusUnauthorized)
 				return
 			}
-			http.Error(w, "failed to refresh token", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to refresh token", "auth", "refresh.rotate_session")
 			return
 		}
+		setSentryUser(r.Context(), u.ID)
 
 		accessToken, accessExpiresAt, err := auth.createAccessToken(u.ID)
 		if err != nil {
-			http.Error(w, "failed to issue access token", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, fmt.Errorf("create access token: %w", err), "failed to issue access token", "auth", "refresh.issue_access_token")
 			return
 		}
 
@@ -4982,13 +5522,13 @@ func logoutHandler(store *trackStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		req, err := decodeRefreshRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 
 		_, err = store.deleteRefreshSession(req.RefreshToken)
 		if err != nil {
-			http.Error(w, "failed to logout", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, err, "failed to logout", "auth", "logout.delete_session")
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -5025,6 +5565,7 @@ func requireAuth(auth *authManager, store *trackStore, next http.Handler) http.H
 			return
 		}
 
+		setSentryUser(r.Context(), userID)
 		ctx := context.WithValue(r.Context(), userContextKey, userID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -5048,21 +5589,22 @@ func requireRole(auth *authManager, store *trackStore, role string, next http.Ha
 			return
 		}
 
+		setSentryUser(r.Context(), userID)
 		ctx := context.WithValue(r.Context(), userContextKey, userID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-func writeAuthResponse(w http.ResponseWriter, status int, auth *authManager, store *trackStore, u user) {
+func writeAuthResponse(w http.ResponseWriter, r *http.Request, status int, auth *authManager, store *trackStore, u user) {
 	accessToken, accessExpiresAt, err := auth.createAccessToken(u.ID)
 	if err != nil {
-		http.Error(w, "failed to issue access token", http.StatusInternalServerError)
+		writeSentryInternalError(w, r, fmt.Errorf("create access token: %w", err), "failed to issue access token", "auth", "login.issue_access_token")
 		return
 	}
 
 	refreshSession, refreshToken, err := store.createRefreshSession(u.ID, time.Now().UTC().Add(auth.refreshTokenTTL))
 	if err != nil {
-		http.Error(w, "failed to issue refresh token", http.StatusInternalServerError)
+		writeSentryInternalError(w, r, fmt.Errorf("create refresh session: %w", err), "failed to issue refresh token", "auth", "login.issue_refresh_token")
 		return
 	}
 
@@ -5380,12 +5922,33 @@ func decodeRefreshRequest(r *http.Request) (refreshRequest, error) {
 }
 
 func decodeJSON(r *http.Request, dst any) error {
-	decoder := json.NewDecoder(r.Body)
+	limited := &io.LimitedReader{R: r.Body, N: maxJSONRequestBodySize + 1}
+	decoder := json.NewDecoder(limited)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dst); err != nil {
+		if limited.N == 0 {
+			return errRequestBodyTooLarge
+		}
 		return errors.New("invalid JSON body")
 	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if limited.N == 0 {
+			return errRequestBodyTooLarge
+		}
+		return errors.New("invalid JSON body")
+	}
+	if limited.N == 0 {
+		return errRequestBodyTooLarge
+	}
 	return nil
+}
+
+func writeRequestDecodeError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errRequestBodyTooLarge) {
+		http.Error(w, errRequestBodyTooLarge.Error(), http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
 }
 
 func validateCredentials(email, password string) error {
@@ -5634,6 +6197,7 @@ func analyticsUserIDFromRequest(r *http.Request, auth *authManager, store *track
 	if _, ok := store.getUser(userID); !ok {
 		return nil, errors.New("authentication required")
 	}
+	setSentryUser(r.Context(), userID)
 	return &userID, nil
 }
 
@@ -5645,6 +6209,7 @@ func optionalUserIDFromRequest(r *http.Request, auth *authManager) int64 {
 	if err != nil {
 		return 0
 	}
+	setSentryUser(r.Context(), userID)
 	return userID
 }
 
@@ -6796,6 +7361,14 @@ func clonePlaylistsMap(src map[int64]playlist) map[int64]playlist {
 	return cloned
 }
 
+func cloneRefreshSessionsMap(src map[string]refreshSession) map[string]refreshSession {
+	cloned := make(map[string]refreshSession, len(src))
+	for id, item := range src {
+		cloned[id] = item
+	}
+	return cloned
+}
+
 func appendPlaylistTrack(items []playlistTrack, item playlistTrack) []playlistTrack {
 	for _, existing := range items {
 		if existing.TrackID == item.TrackID {
@@ -6963,7 +7536,15 @@ func validateAuthor(a author) error {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		if reporter, ok := w.(interface {
+			reportResponseError(error, string)
+		}); ok {
+			reporter.reportResponseError(fmt.Errorf("encode JSON response: %w", err), "encode_json_response")
+		} else {
+			log.Printf("failed to encode JSON response: %s", safeOperationalError(err))
+		}
+	}
 }
 
 func healthzHandler() http.HandlerFunc {
@@ -7007,7 +7588,7 @@ func swaggerUIHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := tmpl.Execute(w, nil); err != nil {
-			http.Error(w, "failed to render docs page", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, fmt.Errorf("render Swagger UI: %w", err), "failed to render docs page", "docs", "swagger.render")
 		}
 	}
 }
@@ -7030,12 +7611,14 @@ func redocHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := tmpl.Execute(w, nil); err != nil {
-			http.Error(w, "failed to render docs page", http.StatusInternalServerError)
+			writeSentryInternalError(w, r, fmt.Errorf("render ReDoc UI: %w", err), "failed to render docs page", "docs", "redoc.render")
 		}
 	}
 }
 
 var errInvalidTrack = errors.New("invalid track payload")
+var errHTTPServerPanic = errors.New("HTTP server panicked")
+var errRequestBodyTooLarge = errors.New("request body is too large")
 var errInvalidAlbum = errors.New("invalid album payload")
 var errAlbumNotFound = errors.New("album not found")
 var errInvalidAuthor = errors.New("invalid author payload")
@@ -7043,6 +7626,7 @@ var errAuthorNotFound = errors.New("author not found")
 var errInvalidLyricsPayload = errors.New("invalid lyrics payload")
 var errInvalidPlaylistPayload = errors.New("invalid playlist payload")
 var errInvalidAutoplayRequest = errors.New("invalid autoplay request")
+var errAutoplaySongStorage = errors.New("failed to inspect local song for autoplay")
 var errAlbumInUse = errors.New("album is used by one or more tracks")
 var errAuthorInUse = errors.New("author is used by one or more tracks")
 var errEmailAlreadyExists = errors.New("user with this email already exists")

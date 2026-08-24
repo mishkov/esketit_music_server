@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,16 +15,23 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	youtube "github.com/kkdai/youtube/v2"
 )
 
 const (
 	youtubeImportStatusActive    = "active"
 	youtubeImportStatusCompleted = "completed"
+	maxYouTubeArtistHTMLBytes    = 8 << 20
+	maxYouTubeMetadataBytes      = 16 << 20
+	maxYouTubeYTDLPJSONBytes     = 16 << 20
+	maxYouTubeCookiesBytes       = 1 << 20
+	maxYouTubeCookiesUploadBytes = maxYouTubeCookiesBytes + (64 << 10)
 
 	youtubeImportSourceTrack    = "track"
 	youtubeImportSourcePlaylist = "playlist"
@@ -37,16 +45,436 @@ const (
 )
 
 var (
-	errYouTubeInvalidURL      = errors.New("invalid youtube or youtube music url")
-	errYouTubeNoTracks        = errors.New("no importable youtube tracks found")
-	errYouTubeSessionActive   = errors.New("youtube import session is already active")
-	errYouTubeSessionNotFound = errors.New("youtube import session not found")
-	errYouTubeCurrentConflict = errors.New("current youtube item is already connected to an existing track")
-	errYouTubeUnsupportedMode = errors.New("unsupported youtube import add mode")
-	errYouTubeCurrentNotFound = errors.New("youtube import item not found")
-	errYouTubeDownloadFailed  = errors.New("failed to download youtube track audio")
-	errYouTubeTranscodeFailed = errors.New("failed to transcode youtube track audio")
+	errYouTubeInvalidURL       = errors.New("invalid youtube or youtube music url")
+	errYouTubeNoTracks         = errors.New("no importable youtube tracks found")
+	errYouTubeSessionActive    = errors.New("youtube import session is already active")
+	errYouTubeSessionNotFound  = errors.New("youtube import session not found")
+	errYouTubeCurrentConflict  = errors.New("current youtube item is already connected to an existing track")
+	errYouTubeUnsupportedMode  = errors.New("unsupported youtube import add mode")
+	errYouTubeCurrentNotFound  = errors.New("youtube import item not found")
+	errYouTubeDownloadFailed   = errors.New("failed to download youtube track audio")
+	errYouTubeTranscodeFailed  = errors.New("failed to transcode youtube track audio")
+	errYouTubeUpstreamFailed   = errors.New("youtube upstream request failed")
+	errYouTubeUpstreamTimeout  = errors.New("youtube upstream request timed out")
+	errYouTubeDependency       = errors.New("youtube import dependency is unavailable")
+	errYouTubeStorageFailed    = errors.New("youtube import storage operation failed")
+	errYouTubeCookiesNotSet    = errors.New("youtube cookies file is not configured")
+	errYouTubeCookiesEmpty     = errors.New("uploaded file is empty")
+	errYouTubeCookiesTooLarge  = errors.New("youtube cookies file exceeds the maximum allowed size")
+	errYouTubeResponseTooLarge = errors.New("youtube upstream response is too large")
+	errYouTubeAudioTooLarge    = errors.New("youtube audio exceeds the maximum allowed size")
+	errYouTubeSessionChanged   = errors.New("youtube import session changed during operation")
+	errYouTubeShuttingDown     = errors.New("youtube import service is shutting down")
 )
+
+type youtubeCleanupError struct {
+	operation string
+	err       error
+}
+
+func newYouTubeCleanupError(operation string, err error) error {
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return &youtubeCleanupError{operation: operation, err: err}
+}
+
+func (e *youtubeCleanupError) Error() string {
+	return fmt.Sprintf("youtube cleanup failed during %s: %v", e.operation, e.err)
+}
+
+func (e *youtubeCleanupError) Unwrap() error {
+	return e.err
+}
+
+func hasYouTubeCleanupError(err error) bool {
+	var cleanupErr *youtubeCleanupError
+	return errors.As(err, &cleanupErr)
+}
+
+func youtubeStageError(kind error, stage string, cause error) error {
+	if cause == nil {
+		return fmt.Errorf("%w: %s", kind, stage)
+	}
+	return fmt.Errorf("%w: %s: %w", kind, stage, cause)
+}
+
+func sanitizeYouTubeCause(err error) (error, bool) {
+	if err == nil {
+		return nil, false
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		cause, _ := sanitizeYouTubeCause(urlErr.Err)
+		return fmt.Errorf("youtube upstream %s failed: %w", urlErr.Op, cause), true
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return fmt.Errorf("filesystem %s failed: %w", pathErr.Op, pathErr.Err), true
+	}
+	var linkErr *os.LinkError
+	if errors.As(err, &linkErr) {
+		return fmt.Errorf("filesystem %s failed: %w", linkErr.Op, linkErr.Err), true
+	}
+	var lookupErr *exec.Error
+	if errors.As(err, &lookupErr) {
+		return fmt.Errorf("executable lookup failed: %w", lookupErr.Err), true
+	}
+	return err, false
+}
+
+func sanitizeYouTubeCapturedError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		causes := joined.Unwrap()
+		sanitized := make([]error, 0, len(causes))
+		for _, cause := range causes {
+			if cause != nil {
+				sanitized = append(sanitized, sanitizeYouTubeCapturedError(cause))
+			}
+		}
+		return errors.Join(sanitized...)
+	}
+	if cleanupErr, ok := err.(*youtubeCleanupError); ok {
+		return &youtubeCleanupError{
+			operation: cleanupErr.operation,
+			err:       sanitizeYouTubeCapturedError(cleanupErr.err),
+		}
+	}
+	sanitized, changed := sanitizeYouTubeCause(err)
+	if !changed {
+		return err
+	}
+	causes := []error{sanitized}
+	for _, known := range []error{
+		errYouTubeDownloadFailed,
+		errYouTubeTranscodeFailed,
+		errYouTubeUpstreamFailed,
+		errYouTubeUpstreamTimeout,
+		errYouTubeDependency,
+		errYouTubeStorageFailed,
+	} {
+		if errors.Is(err, known) {
+			causes = append(causes, known)
+		}
+	}
+	return errors.Join(causes...)
+}
+
+func youtubeErrorDiagnostic(err error) string {
+	if err == nil {
+		return "none"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "type=context_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "type=context_deadline_exceeded"
+	}
+	var statusErr youtube.ErrUnexpectedStatusCode
+	if errors.As(err, &statusErr) {
+		return fmt.Sprintf("type=upstream_http_status status=%d", int(statusErr))
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return fmt.Sprintf("type=process_exit exit_code=%d", exitErr.ExitCode())
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return fmt.Sprintf("type=%T timeout=true", err)
+	}
+	return fmt.Sprintf("type=%T", err)
+}
+
+func sanitizeYouTubeFilesystemError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	cause := err
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		cause = pathErr.Err
+	}
+	var linkErr *os.LinkError
+	if errors.As(err, &linkErr) {
+		cause = linkErr.Err
+	}
+	return youtubeStageError(errYouTubeStorageFailed, operation, cause)
+}
+
+func removeYouTubeFile(path, operation string) error {
+	err := os.Remove(path)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return newYouTubeCleanupError(operation, sanitizeYouTubeFilesystemError(operation, err))
+}
+
+func classifyYouTubeScanError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("youtube request canceled: %w", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		cause, _ := sanitizeYouTubeCause(err)
+		return youtubeStageError(errYouTubeUpstreamTimeout, "scan", cause)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		cause, _ := sanitizeYouTubeCause(err)
+		return youtubeStageError(errYouTubeUpstreamTimeout, "scan", cause)
+	}
+
+	for _, known := range []error{
+		errYouTubeInvalidURL,
+		errYouTubeNoTracks,
+		errYouTubeUpstreamFailed,
+		errYouTubeUpstreamTimeout,
+		errYouTubeDependency,
+		errYouTubeStorageFailed,
+	} {
+		if errors.Is(err, known) {
+			return err
+		}
+	}
+
+	var statusErr youtube.ErrUnexpectedStatusCode
+	if errors.As(err, &statusErr) {
+		status := int(statusErr)
+		if status == http.StatusRequestTimeout || status == http.StatusGatewayTimeout {
+			return youtubeStageError(errYouTubeUpstreamTimeout, "scan", statusErr)
+		}
+		if status == http.StatusTooManyRequests || status >= http.StatusInternalServerError || status < http.StatusBadRequest {
+			return youtubeStageError(errYouTubeUpstreamFailed, "scan", statusErr)
+		}
+		return youtubeStageError(errYouTubeInvalidURL, "upstream rejected source", statusErr)
+	}
+
+	for _, expected := range []error{
+		youtube.ErrInvalidCharactersInVideoID,
+		youtube.ErrVideoIDMinLength,
+		youtube.ErrLoginRequired,
+		youtube.ErrVideoPrivate,
+		youtube.ErrInvalidPlaylist,
+	} {
+		if errors.Is(err, expected) {
+			return youtubeStageError(errYouTubeInvalidURL, "upstream rejected source", err)
+		}
+	}
+	var playbackErr youtube.ErrPlayabiltyStatus
+	if errors.As(err, &playbackErr) {
+		return youtubeStageError(errYouTubeInvalidURL, "upstream rejected source", err)
+	}
+	var playlistErr youtube.ErrPlaylistStatus
+	if errors.As(err, &playlistErr) {
+		return youtubeStageError(errYouTubeInvalidURL, "upstream rejected source", err)
+	}
+
+	cause, _ := sanitizeYouTubeCause(err)
+	return youtubeStageError(errYouTubeUpstreamFailed, "scan", cause)
+}
+
+func combineYouTubeScanErrors(errs ...error) error {
+	classified := make([]error, 0, len(errs))
+	for _, err := range errs {
+		if err != nil {
+			classified = append(classified, classifyYouTubeScanError(err))
+		}
+	}
+	return errors.Join(classified...)
+}
+
+func withYouTubeTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func withYouTubeDownloadTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	return withYouTubeTimeout(parent, timeout)
+}
+
+type boundedYouTubeOutput struct {
+	limit    int
+	data     []byte
+	overflow bool
+}
+
+type boundedYouTubeAudioWriter struct {
+	destination io.Writer
+	remaining   int64
+	overflow    bool
+}
+
+func (w *boundedYouTubeAudioWriter) Write(p []byte) (int, error) {
+	if w.remaining <= 0 {
+		w.overflow = true
+		return 0, errYouTubeAudioTooLarge
+	}
+	if int64(len(p)) <= w.remaining {
+		n, err := w.destination.Write(p)
+		w.remaining -= int64(n)
+		return n, err
+	}
+	n, err := w.destination.Write(p[:w.remaining])
+	w.remaining -= int64(n)
+	w.overflow = true
+	if err != nil {
+		return n, err
+	}
+	return n, errYouTubeAudioTooLarge
+}
+
+func copyYouTubeAudio(destination io.Writer, source io.Reader, limit int64) (int64, error) {
+	if limit < 0 {
+		limit = 0
+	}
+	bounded := &boundedYouTubeAudioWriter{destination: destination, remaining: limit}
+	written, err := io.Copy(bounded, source)
+	if bounded.overflow {
+		return written, errYouTubeAudioTooLarge
+	}
+	return written, err
+}
+
+func newBoundedYouTubeOutput(limit int) *boundedYouTubeOutput {
+	if limit < 0 {
+		limit = 0
+	}
+	return &boundedYouTubeOutput{
+		limit: limit,
+		data:  make([]byte, 0, min(limit, 64<<10)),
+	}
+}
+
+func (w *boundedYouTubeOutput) Write(p []byte) (int, error) {
+	written := len(p)
+	remaining := w.limit - len(w.data)
+	if remaining < 0 {
+		remaining = 0
+	}
+	if remaining > 0 {
+		retained := min(remaining, len(p))
+		w.data = append(w.data, p[:retained]...)
+	}
+	if len(p) > remaining {
+		w.overflow = true
+	}
+	return written, nil
+}
+
+func runYouTubeCommandWithOutputLimit(ctx context.Context, binaryName string, args []string, limit int) ([]byte, error) {
+	output := newBoundedYouTubeOutput(limit)
+	cmd := exec.CommandContext(ctx, binaryName, args...)
+	cmd.Stdout = output
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+	if output.overflow {
+		return nil, errYouTubeResponseTooLarge
+	}
+	return output.data, nil
+}
+
+func readYouTubeHTML(body io.Reader, limit int64) (string, error) {
+	content, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return "", err
+	}
+	if int64(len(content)) > limit {
+		return "", youtubeStageError(errYouTubeUpstreamFailed, "artist html response", errYouTubeResponseTooLarge)
+	}
+	return string(content), nil
+}
+
+type youtubeLimitedResponseBody struct {
+	body      io.ReadCloser
+	remaining int64
+}
+
+func (b *youtubeLimitedResponseBody) Read(p []byte) (int, error) {
+	if b.remaining < 0 {
+		return 0, errYouTubeResponseTooLarge
+	}
+	if b.remaining == 0 {
+		var probe [1]byte
+		n, err := b.body.Read(probe[:])
+		if n > 0 {
+			b.remaining = -1
+			return 0, errYouTubeResponseTooLarge
+		}
+		return 0, err
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.body.Read(p)
+	b.remaining -= int64(n)
+	return n, err
+}
+
+func (b *youtubeLimitedResponseBody) Close() error {
+	return b.body.Close()
+}
+
+type youtubeMetadataLimitTransport struct {
+	base  http.RoundTripper
+	limit int64
+}
+
+func (t youtubeMetadataLimitTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	response, err := base.RoundTrip(req)
+	if err != nil || response == nil || isYouTubeMediaRequest(req) {
+		return response, err
+	}
+	limit := t.limit
+	if limit <= 0 {
+		limit = maxYouTubeMetadataBytes
+	}
+	if response.ContentLength > limit {
+		closeErr := response.Body.Close()
+		if closeErr != nil {
+			return nil, errors.Join(errYouTubeResponseTooLarge, closeErr)
+		}
+		return nil, errYouTubeResponseTooLarge
+	}
+	response.Body = &youtubeLimitedResponseBody{body: response.Body, remaining: limit}
+	return response, nil
+}
+
+func isYouTubeMediaRequest(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	host := strings.ToLower(req.URL.Hostname())
+	return host == "googlevideo.com" || strings.HasSuffix(host, ".googlevideo.com")
+}
+
+func addYouTubeBreadcrumb(ctx context.Context, operation, message string, count int) {
+	hub := sentry.GetHubFromContext(ctx)
+	if hub == nil {
+		return
+	}
+	data := map[string]any{}
+	if count > 0 {
+		data["failure_count"] = count
+	}
+	hub.AddBreadcrumb(&sentry.Breadcrumb{
+		Category: "youtube." + operation,
+		Message:  message,
+		Level:    sentry.LevelWarning,
+		Data:     data,
+	}, nil)
+}
 
 var (
 	youtubePlaylistIDPattern = regexp.MustCompile(`(?:playlist\?list=|["']playlistId["']\s*:\s*["'])([A-Za-z0-9_-]{10,})`)
@@ -186,13 +614,43 @@ type youtubeImportGateway interface {
 	DownloadAudio(ctx context.Context, item youtubeImportItem, destinationPath string, cookiesPath string) error
 }
 
+type youtubeCookieSnapshotter interface {
+	SnapshotCookies(destinationPath string) (bool, error)
+}
+
 type youtubeImportService struct {
-	mu       sync.Mutex
-	cfg      youtubeImportConfig
-	gateway  youtubeImportGateway
-	store    *trackStore
-	songsDir string
-	sessions map[int64]*youtubeImportSession
+	closeMu          sync.Mutex
+	lifecycleMu      sync.Mutex
+	operations       sync.WaitGroup
+	closing          bool
+	mu               sync.Mutex
+	operationLocksMu sync.Mutex
+	operationLocks   map[int64]*youtubeImportUserLock
+	filesMu          sync.Mutex
+	activeFiles      map[string]struct{}
+	cfg              youtubeImportConfig
+	gateway          youtubeImportGateway
+	store            *trackStore
+	songsDir         string
+	sessions         map[int64]*youtubeImportSession
+}
+
+func (s *youtubeImportService) beginOperation() (func(), error) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.closing {
+		return nil, errYouTubeShuttingDown
+	}
+	s.operations.Add(1)
+	var finishOnce sync.Once
+	return func() {
+		finishOnce.Do(s.operations.Done)
+	}, nil
+}
+
+type youtubeImportUserLock struct {
+	token chan struct{}
+	refs  int
 }
 
 type youtubeCookiesStatus struct {
@@ -210,36 +668,53 @@ func newYouTubeCookieStore(path string) *youtubeCookieStore {
 	return &youtubeCookieStore{path: strings.TrimSpace(path)}
 }
 
-func (s *youtubeCookieStore) pathIfPresent() (string, bool) {
+func (s *youtubeCookieStore) pathIfPresent() (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if strings.TrimSpace(s.path) == "" {
-		return "", false
+		return "", false, nil
 	}
 	info, err := os.Stat(s.path)
-	if err != nil || info.IsDir() || info.Size() == 0 {
-		return "", false
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
 	}
-	return s.path, true
+	if err != nil {
+		return "", false, sanitizeYouTubeFilesystemError("inspect configured cookies file", err)
+	}
+	if info.IsDir() || info.Size() == 0 {
+		return "", false, nil
+	}
+	return s.path, true, nil
 }
 
 func (s *youtubeCookieStore) Status() youtubeCookiesStatus {
+	status, _ := s.status()
+	return status
+}
+
+func (s *youtubeCookieStore) status() (youtubeCookiesStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	status := youtubeCookiesStatus{Configured: strings.TrimSpace(s.path) != ""}
 	if !status.Configured {
-		return status
+		return status, nil
 	}
 	info, err := os.Stat(s.path)
-	if err != nil || info.IsDir() || info.Size() == 0 {
-		return status
+	if errors.Is(err, os.ErrNotExist) {
+		return status, nil
+	}
+	if err != nil {
+		return status, sanitizeYouTubeFilesystemError("inspect configured cookies file", err)
+	}
+	if info.IsDir() || info.Size() == 0 {
+		return status, nil
 	}
 	lastModified := info.ModTime()
 	status.FilePresent = true
 	status.LastModified = &lastModified
-	return status
+	return status, nil
 }
 
 func (s *youtubeCookieStore) Replace(r io.Reader) error {
@@ -247,38 +722,63 @@ func (s *youtubeCookieStore) Replace(r io.Reader) error {
 	defer s.mu.Unlock()
 
 	if strings.TrimSpace(s.path) == "" {
-		return errors.New("youtube cookies file is not configured")
+		return errYouTubeCookiesNotSet
 	}
 	dir := filepath.Dir(s.path)
 	if dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
+			return sanitizeYouTubeFilesystemError("create cookies directory", err)
 		}
 	}
 	tempPath := s.path + ".tmp"
 	file, err := os.OpenFile(tempPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return sanitizeYouTubeFilesystemError("create temporary cookies file", err)
 	}
-	if _, err := io.Copy(file, r); err != nil {
-		_ = file.Close()
-		_ = os.Remove(tempPath)
-		return err
+	copied, copyErr := io.Copy(file, io.LimitReader(r, maxYouTubeCookiesBytes+1))
+	if copyErr != nil {
+		closeErr := file.Close()
+		removeErr := removeYouTubeFile(tempPath, "remove temporary cookies file")
+		return errors.Join(
+			sanitizeYouTubeFilesystemError("write cookies file", copyErr),
+			sanitizeYouTubeFilesystemError("close temporary cookies file", closeErr),
+			removeErr,
+		)
+	}
+	if copied > maxYouTubeCookiesBytes {
+		closeErr := file.Close()
+		return errors.Join(
+			errYouTubeCookiesTooLarge,
+			newYouTubeCleanupError("close oversized temporary cookies file", sanitizeYouTubeFilesystemError("close temporary cookies file", closeErr)),
+			removeYouTubeFile(tempPath, "remove oversized temporary cookies file"),
+		)
 	}
 	if err := file.Close(); err != nil {
-		_ = os.Remove(tempPath)
-		return err
+		return errors.Join(
+			sanitizeYouTubeFilesystemError("close temporary cookies file", err),
+			removeYouTubeFile(tempPath, "remove temporary cookies file"),
+		)
 	}
 	info, err := os.Stat(tempPath)
 	if err != nil {
-		_ = os.Remove(tempPath)
-		return err
+		return errors.Join(
+			sanitizeYouTubeFilesystemError("inspect temporary cookies file", err),
+			removeYouTubeFile(tempPath, "remove temporary cookies file"),
+		)
 	}
 	if info.Size() == 0 {
-		_ = os.Remove(tempPath)
-		return errors.New("uploaded file is empty")
+		return errors.Join(
+			errYouTubeCookiesEmpty,
+			removeYouTubeFile(tempPath, "remove temporary cookies file"),
+		)
 	}
-	return os.Rename(tempPath, s.path)
+	if err := os.Rename(tempPath, s.path); err != nil {
+		return errors.Join(
+			sanitizeYouTubeFilesystemError("replace cookies file", err),
+			removeYouTubeFile(tempPath, "remove temporary cookies file"),
+		)
+	}
+	return nil
 }
 
 func (s *youtubeCookieStore) Delete() error {
@@ -286,29 +786,252 @@ func (s *youtubeCookieStore) Delete() error {
 	defer s.mu.Unlock()
 
 	if strings.TrimSpace(s.path) == "" {
-		return errors.New("youtube cookies file is not configured")
+		return errYouTubeCookiesNotSet
 	}
 	if err := os.Remove(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+		return sanitizeYouTubeFilesystemError("delete cookies file", err)
+	}
+	return nil
+}
+
+func (s *youtubeCookieStore) snapshotTo(destinationPath string) (resultErr error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	destinationCreated := false
+	defer func() {
+		if resultErr != nil && destinationCreated {
+			resultErr = errors.Join(resultErr, removeYouTubeFile(destinationPath, "remove failed session cookies snapshot"))
+		}
+	}()
+
+	if strings.TrimSpace(s.path) == "" {
+		return os.ErrNotExist
+	}
+	source, err := os.Open(s.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return os.ErrNotExist
+		}
+		return sanitizeYouTubeFilesystemError("open configured cookies file", err)
+	}
+	defer func() {
+		if err := source.Close(); err != nil {
+			resultErr = errors.Join(resultErr, sanitizeYouTubeFilesystemError("close configured cookies file", err))
+		}
+	}()
+
+	info, err := source.Stat()
+	if err != nil {
+		return sanitizeYouTubeFilesystemError("inspect configured cookies file", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		return os.ErrNotExist
+	}
+	if info.Size() > maxYouTubeCookiesBytes {
+		return errYouTubeCookiesTooLarge
+	}
+
+	destination, err := os.OpenFile(destinationPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return sanitizeYouTubeFilesystemError("create session cookies snapshot", err)
+	}
+	destinationCreated = true
+	copied, copyErr := io.CopyN(destination, source, maxYouTubeCookiesBytes+1)
+	closeErr := destination.Close()
+	if copyErr != nil && !errors.Is(copyErr, io.EOF) {
+		return errors.Join(
+			sanitizeYouTubeFilesystemError("copy configured cookies file", copyErr),
+			sanitizeYouTubeFilesystemError("close session cookies snapshot", closeErr),
+			removeYouTubeFile(destinationPath, "remove incomplete session cookies snapshot"),
+		)
+	}
+	if copied > maxYouTubeCookiesBytes {
+		return errors.Join(
+			errYouTubeCookiesTooLarge,
+			sanitizeYouTubeFilesystemError("close session cookies snapshot", closeErr),
+			removeYouTubeFile(destinationPath, "remove oversized session cookies snapshot"),
+		)
+	}
+	if closeErr != nil {
+		return errors.Join(
+			sanitizeYouTubeFilesystemError("close session cookies snapshot", closeErr),
+			removeYouTubeFile(destinationPath, "remove incomplete session cookies snapshot"),
+		)
 	}
 	return nil
 }
 
 func newYouTubeImportService(cfg youtubeImportConfig, gateway youtubeImportGateway, store *trackStore, songsDir string) *youtubeImportService {
 	return &youtubeImportService{
-		cfg:      cfg,
-		gateway:  gateway,
-		store:    store,
-		songsDir: songsDir,
-		sessions: make(map[int64]*youtubeImportSession),
+		cfg:            cfg,
+		gateway:        gateway,
+		store:          store,
+		songsDir:       songsDir,
+		sessions:       make(map[int64]*youtubeImportSession),
+		operationLocks: make(map[int64]*youtubeImportUserLock),
+		activeFiles:    make(map[string]struct{}),
 	}
 }
 
-func (s *youtubeImportService) StartSession(ctx context.Context, userID int64, rawURL string, cutoff *time.Time, replaceExisting bool, youtubeCookies string) (youtubeImportSessionDTO, error) {
+func (s *youtubeImportService) lockUserOperation(ctx context.Context, userID int64) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.operationLocksMu.Lock()
+	if s.operationLocks == nil {
+		s.operationLocks = make(map[int64]*youtubeImportUserLock)
+	}
+	operationLock := s.operationLocks[userID]
+	if operationLock == nil {
+		operationLock = &youtubeImportUserLock{token: make(chan struct{}, 1)}
+		operationLock.token <- struct{}{}
+		s.operationLocks[userID] = operationLock
+	}
+	operationLock.refs++
+	s.operationLocksMu.Unlock()
+
+	select {
+	case <-operationLock.token:
+		return func() {
+			operationLock.token <- struct{}{}
+			s.releaseUserOperationRef(userID, operationLock)
+		}, nil
+	case <-ctx.Done():
+		s.releaseUserOperationRef(userID, operationLock)
+		return nil, ctx.Err()
+	}
+}
+
+func (s *youtubeImportService) releaseUserOperationRef(userID int64, operationLock *youtubeImportUserLock) {
+	s.operationLocksMu.Lock()
+	defer s.operationLocksMu.Unlock()
+
+	operationLock.refs--
+	if operationLock.refs == 0 && s.operationLocks[userID] == operationLock {
+		delete(s.operationLocks, userID)
+	}
+}
+
+func (s *youtubeImportService) registerActiveFile(path string) {
+	if strings.TrimSpace(path) == "" {
+		return
+	}
+	s.filesMu.Lock()
+	if s.activeFiles == nil {
+		s.activeFiles = make(map[string]struct{})
+	}
+	s.activeFiles[path] = struct{}{}
+	s.filesMu.Unlock()
+}
+
+func (s *youtubeImportService) removeActiveFile(path, operation string) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	err := removeYouTubeFile(path, operation)
+	if err == nil {
+		s.filesMu.Lock()
+		delete(s.activeFiles, path)
+		s.filesMu.Unlock()
+	}
+	return err
+}
+
+// Close prevents new mutations, waits for in-flight mutations to finish, and
+// removes all ephemeral YouTube import files.
+func (s *youtubeImportService) Close() error {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+
+	s.lifecycleMu.Lock()
+	s.closing = true
+	s.lifecycleMu.Unlock()
+	s.operations.Wait()
+
+	s.mu.Lock()
+	cleanupErrs := make([]error, 0)
+	for userID, session := range s.sessions {
+		if err := s.cleanupSessionFilesLocked(session); err != nil {
+			cleanupErrs = append(cleanupErrs, err)
+		}
+		delete(s.sessions, userID)
+	}
+	s.mu.Unlock()
+
+	s.filesMu.Lock()
+	paths := make([]string, 0, len(s.activeFiles))
+	for path := range s.activeFiles {
+		paths = append(paths, path)
+	}
+	s.filesMu.Unlock()
+	for _, path := range paths {
+		if err := s.removeActiveFile(path, "remove active youtube import file"); err != nil {
+			cleanupErrs = append(cleanupErrs, err)
+		}
+	}
+	if err := cleanupStaleYouTubeSongStaging(s.songsDir); err != nil {
+		cleanupErrs = append(cleanupErrs, err)
+	}
+	return errors.Join(cleanupErrs...)
+}
+
+func cleanupStaleYouTubeSongStaging(songsDir string) error {
+	stagingDir := filepath.Join(songsDir, ".youtube-import-staging")
+	entries, err := os.ReadDir(stagingDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return sanitizeYouTubeFilesystemError("read youtube audio staging directory", err)
+	}
+
+	cleanupErrs := make([]error, 0)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			cleanupErrs = append(cleanupErrs, youtubeStageError(
+				errYouTubeStorageFailed,
+				"clean youtube audio staging directory",
+				errors.New("unexpected nested directory"),
+			))
+			continue
+		}
+		if err := removeYouTubeFile(filepath.Join(stagingDir, entry.Name()), "remove stale staged audio file"); err != nil {
+			cleanupErrs = append(cleanupErrs, err)
+		}
+	}
+	if len(cleanupErrs) > 0 {
+		return errors.Join(cleanupErrs...)
+	}
+	if err := os.Remove(stagingDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return sanitizeYouTubeFilesystemError("remove youtube audio staging directory", err)
+	}
+	return nil
+}
+
+func (s *youtubeImportService) StartSession(ctx context.Context, userID int64, rawURL string, cutoff *time.Time, replaceExisting bool, youtubeCookies string) (result youtubeImportSessionDTO, resultErr error) {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
-		return youtubeImportSessionDTO{}, errors.New("url is required")
+		return youtubeImportSessionDTO{}, errYouTubeInvalidURL
 	}
+	finishOperation, err := s.beginOperation()
+	if err != nil {
+		return youtubeImportSessionDTO{}, err
+	}
+	defer finishOperation()
+	unlockOperation, err := s.lockUserOperation(ctx, userID)
+	if err != nil {
+		return youtubeImportSessionDTO{}, err
+	}
+	defer unlockOperation()
+	if err := ctx.Err(); err != nil {
+		return youtubeImportSessionDTO{}, err
+	}
+	s.mu.Lock()
+	if existing, ok := s.sessions[userID]; ok && existing.Status == youtubeImportStatusActive && !replaceExisting {
+		s.mu.Unlock()
+		return youtubeImportSessionDTO{}, errYouTubeSessionActive
+	}
+	s.mu.Unlock()
 
 	cookiesPath, cleanupCookies, err := s.writeSessionCookies(userID, youtubeCookies)
 	if err != nil {
@@ -317,16 +1040,9 @@ func (s *youtubeImportService) StartSession(ctx context.Context, userID int64, r
 	committedCookies := false
 	defer func() {
 		if !committedCookies {
-			cleanupCookies()
+			resultErr = errors.Join(resultErr, cleanupCookies())
 		}
 	}()
-
-	s.mu.Lock()
-	if existing, ok := s.sessions[userID]; ok && existing.Status == youtubeImportStatusActive && !replaceExisting {
-		s.mu.Unlock()
-		return youtubeImportSessionDTO{}, errYouTubeSessionActive
-	}
-	s.mu.Unlock()
 
 	items, source, err := s.gateway.Scan(ctx, rawURL, cutoff, cookiesPath)
 	if err != nil {
@@ -334,6 +1050,9 @@ func (s *youtubeImportService) StartSession(ctx context.Context, userID int64, r
 	}
 	if len(items) == 0 {
 		return youtubeImportSessionDTO{}, errYouTubeNoTracks
+	}
+	if err := ctx.Err(); err != nil {
+		return youtubeImportSessionDTO{}, err
 	}
 
 	sessionID, err := randomToken(16)
@@ -356,34 +1075,67 @@ func (s *youtubeImportService) StartSession(ctx context.Context, userID int64, r
 		UpdatedAt:         now,
 	}
 
+	if err := ctx.Err(); err != nil {
+		return youtubeImportSessionDTO{}, err
+	}
+	var replacedSessionCleanupErr error
 	s.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return youtubeImportSessionDTO{}, err
+	}
+	if existing, ok := s.sessions[userID]; ok && existing.Status == youtubeImportStatusActive && !replaceExisting {
+		s.mu.Unlock()
+		return youtubeImportSessionDTO{}, errYouTubeSessionActive
+	}
 	if existing, ok := s.sessions[userID]; ok {
-		s.cleanupSessionFilesLocked(existing)
+		replacedSessionCleanupErr = s.cleanupSessionFilesLocked(existing)
 	}
 	s.sessions[userID] = session
 	s.mu.Unlock()
 	committedCookies = true
+	if replacedSessionCleanupErr != nil {
+		captureSentryError(ctx, replacedSessionCleanupErr, "youtube", "import.start.cleanup")
+	}
 
 	return s.CurrentSession(userID)
 }
 
-func (s *youtubeImportService) writeSessionCookies(userID int64, rawCookies string) (string, func(), error) {
+func (s *youtubeImportService) writeSessionCookies(userID int64, rawCookies string) (string, func() error, error) {
 	rawCookies = strings.TrimSpace(rawCookies)
-	if rawCookies == "" {
-		return "", func() {}, nil
+	if len(rawCookies) > maxYouTubeCookiesBytes {
+		return "", func() error { return nil }, errYouTubeCookiesTooLarge
 	}
 	if err := os.MkdirAll(s.cfg.ImportTempDir, 0o700); err != nil {
-		return "", func() {}, err
+		return "", func() error { return nil }, sanitizeYouTubeFilesystemError("create import directory", err)
 	}
 	token, err := randomToken(12)
 	if err != nil {
-		return "", func() {}, err
+		return "", func() error { return nil }, fmt.Errorf("generate session cookies file token: %w", err)
 	}
 	path := filepath.Join(s.cfg.ImportTempDir, fmt.Sprintf("youtube-cookies-%d-%s.txt", userID, token))
-	if err := os.WriteFile(path, []byte(rawCookies+"\n"), 0o600); err != nil {
-		return "", func() {}, err
+	if rawCookies != "" {
+		if err := os.WriteFile(path, []byte(rawCookies+"\n"), 0o600); err != nil {
+			return "", func() error { return nil }, errors.Join(
+				sanitizeYouTubeFilesystemError("write session cookies file", err),
+				removeYouTubeFile(path, "remove incomplete session cookies file"),
+			)
+		}
+	} else {
+		snapshotter, ok := s.gateway.(youtubeCookieSnapshotter)
+		if !ok {
+			return "", func() error { return nil }, nil
+		}
+		present, err := snapshotter.SnapshotCookies(path)
+		if err != nil {
+			return "", func() error { return nil }, err
+		}
+		if !present {
+			return "", func() error { return nil }, nil
+		}
 	}
-	return path, func() { _ = os.Remove(path) }, nil
+	s.registerActiveFile(path)
+	return path, func() error { return s.removeActiveFile(path, "remove session cookies file") }, nil
 }
 
 func (s *youtubeImportService) CurrentSession(userID int64) (youtubeImportSessionDTO, error) {
@@ -398,16 +1150,40 @@ func (s *youtubeImportService) CurrentSession(userID int64) (youtubeImportSessio
 }
 
 func (s *youtubeImportService) SkipCurrent(userID int64) (youtubeImportSessionDTO, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.skipCurrent(context.Background(), userID)
+}
 
+func (s *youtubeImportService) skipCurrent(ctx context.Context, userID int64) (youtubeImportSessionDTO, error) {
+	finishOperation, err := s.beginOperation()
+	if err != nil {
+		return youtubeImportSessionDTO{}, err
+	}
+	defer finishOperation()
+
+	unlockOperation, err := s.lockUserOperation(ctx, userID)
+	if err != nil {
+		return youtubeImportSessionDTO{}, err
+	}
+	defer unlockOperation()
+	if err := ctx.Err(); err != nil {
+		return youtubeImportSessionDTO{}, err
+	}
+
+	s.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return youtubeImportSessionDTO{}, err
+	}
 	session, ok := s.sessions[userID]
 	if !ok {
+		s.mu.Unlock()
 		return youtubeImportSessionDTO{}, errYouTubeSessionNotFound
 	}
 	item, ok := session.currentItem()
 	if !ok {
-		return s.buildSessionDTOLocked(session), nil
+		result := s.buildSessionDTOLocked(session)
+		s.mu.Unlock()
+		return result, nil
 	}
 	session.SkippedItems = append(session.SkippedItems, youtubeSkippedItem{
 		VideoID:   item.VideoID,
@@ -416,14 +1192,35 @@ func (s *youtubeImportService) SkipCurrent(userID int64) (youtubeImportSessionDT
 	})
 	session.CurrentIndex++
 	session.UpdatedAt = time.Now().UTC()
+	var cleanupErr error
 	if session.CurrentIndex >= len(session.Items) {
 		session.Status = youtubeImportStatusCompleted
-		s.cleanupSessionFilesLocked(session)
+		cleanupErr = s.cleanupSessionFilesLocked(session)
 	}
-	return s.buildSessionDTOLocked(session), nil
+	result := s.buildSessionDTOLocked(session)
+	s.mu.Unlock()
+	if cleanupErr != nil {
+		captureSentryError(ctx, cleanupErr, "youtube", "import.skip.cleanup")
+	}
+	return result, nil
 }
 
-func (s *youtubeImportService) AddCurrent(ctx context.Context, userID int64, req youtubeAddCurrentRequest) (youtubeImportSessionDTO, track, error) {
+func (s *youtubeImportService) AddCurrent(ctx context.Context, userID int64, req youtubeAddCurrentRequest) (result youtubeImportSessionDTO, savedTrack track, resultErr error) {
+	finishOperation, err := s.beginOperation()
+	if err != nil {
+		return youtubeImportSessionDTO{}, track{}, err
+	}
+	defer finishOperation()
+
+	unlockOperation, err := s.lockUserOperation(ctx, userID)
+	if err != nil {
+		return youtubeImportSessionDTO{}, track{}, err
+	}
+	defer unlockOperation()
+	if err := ctx.Err(); err != nil {
+		return youtubeImportSessionDTO{}, track{}, err
+	}
+
 	s.mu.Lock()
 	session, ok := s.sessions[userID]
 	if !ok {
@@ -431,6 +1228,7 @@ func (s *youtubeImportService) AddCurrent(ctx context.Context, userID int64, req
 		return youtubeImportSessionDTO{}, track{}, errYouTubeSessionNotFound
 	}
 	itemIndex := session.CurrentIndex
+	sessionID := session.ID
 	item, ok := session.currentItem()
 	cookiesPath := session.CookiesPath
 	s.mu.Unlock()
@@ -450,78 +1248,168 @@ func (s *youtubeImportService) AddCurrent(ctx context.Context, userID int64, req
 			return youtubeImportSessionDTO{}, track{}, errYouTubeCurrentConflict
 		}
 
-		audioPath, cleanup, err := s.downloadCurrentToSongs(ctx, itemIndex, item, cookiesPath)
+		preparedAudio, err := s.downloadCurrentToSongs(ctx, itemIndex, item, cookiesPath)
 		if err != nil {
 			return youtubeImportSessionDTO{}, track{}, err
 		}
 		committed := false
 		defer func() {
-			cleanup(committed)
+			cleanupErr := preparedAudio.cleanup(committed)
+			if cleanupErr == nil {
+				return
+			}
+			if resultErr != nil {
+				resultErr = errors.Join(resultErr, cleanupErr)
+				return
+			}
+			captureSentryError(ctx, cleanupErr, "youtube", "import.add.cleanup")
 		}()
+		if err := s.validateCurrentSession(userID, sessionID, itemIndex); err != nil {
+			return youtubeImportSessionDTO{}, track{}, err
+		}
+		if err := ctx.Err(); err != nil {
+			return youtubeImportSessionDTO{}, track{}, err
+		}
 
-		createdTrack, err := s.store.create(upsertTrackRequest{
+		songsMutationMu.Lock()
+		if err := ctx.Err(); err != nil {
+			songsMutationMu.Unlock()
+			return youtubeImportSessionDTO{}, track{}, err
+		}
+		finalName, finalPath, err := availableYouTubeSongDestination(s.songsDir, preparedAudio.fileName)
+		if err != nil {
+			songsMutationMu.Unlock()
+			return youtubeImportSessionDTO{}, track{}, err
+		}
+		preparedAudio.finalPath = finalPath
+		createdTrack, err := s.store.createTrackIfSourceAbsent(upsertTrackRequest{
 			Name:           strings.TrimSpace(req.Name),
 			AuthorIDs:      req.AuthorIDs,
 			AlbumID:        req.AlbumID,
 			AlbumOrder:     req.AlbumOrder,
-			AudioFilePath:  audioPath,
+			AudioFilePath:  "/api/songs/" + url.PathEscape(finalName),
 			AdditionalInfo: generatedAdditionalInfo,
 			SourceMetadata: generatedSourceMetadata,
+		}, generatedSourceMetadata[0], func() error {
+			if err := os.Link(preparedAudio.stagingPath, finalPath); err != nil {
+				return sanitizeYouTubeFilesystemError("publish imported audio file", err)
+			}
+			return nil
 		})
+		songsMutationMu.Unlock()
 		if err != nil {
 			return youtubeImportSessionDTO{}, track{}, err
 		}
 		committed = true
-		return s.advanceSaved(userID, createdTrack)
+		return s.advanceSaved(ctx, userID, sessionID, itemIndex, createdTrack)
 	case youtubeAddModeAttach:
-		updatedTrack, exists, err := s.store.attachTrackImportMetadata(req.TrackID, generatedAdditionalInfo, generatedSourceMetadata)
+		if err := s.validateCurrentSession(userID, sessionID, itemIndex); err != nil {
+			return youtubeImportSessionDTO{}, track{}, err
+		}
+		if err := ctx.Err(); err != nil {
+			return youtubeImportSessionDTO{}, track{}, err
+		}
+		updatedTrack, exists, err := s.store.attachTrackImportMetadataIfSourceAbsent(req.TrackID, generatedAdditionalInfo, generatedSourceMetadata, generatedSourceMetadata[0])
 		if err != nil {
 			return youtubeImportSessionDTO{}, track{}, err
 		}
 		if !exists {
 			return youtubeImportSessionDTO{}, track{}, errTrackNotFound
 		}
-		return s.advanceSaved(userID, updatedTrack)
+		return s.advanceSaved(ctx, userID, sessionID, itemIndex, updatedTrack)
 	default:
 		return youtubeImportSessionDTO{}, track{}, errYouTubeUnsupportedMode
 	}
 }
 
-func (s *youtubeImportService) advanceSaved(userID int64, savedTrack track) (youtubeImportSessionDTO, track, error) {
+func (s *youtubeImportService) validateCurrentSession(userID int64, expectedSessionID string, expectedIndex int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	session, ok := s.sessions[userID]
 	if !ok {
+		return errYouTubeSessionNotFound
+	}
+	if session.ID != expectedSessionID || session.Status != youtubeImportStatusActive || session.CurrentIndex != expectedIndex {
+		return errYouTubeSessionChanged
+	}
+	if _, ok := session.currentItem(); !ok {
+		return errYouTubeCurrentNotFound
+	}
+	return nil
+}
+
+func (s *youtubeImportService) advanceSaved(ctx context.Context, userID int64, expectedSessionID string, expectedIndex int, savedTrack track) (youtubeImportSessionDTO, track, error) {
+	s.mu.Lock()
+	session, ok := s.sessions[userID]
+	if !ok {
+		s.mu.Unlock()
 		return youtubeImportSessionDTO{}, track{}, errYouTubeSessionNotFound
+	}
+	if session.ID != expectedSessionID || session.Status != youtubeImportStatusActive || session.CurrentIndex != expectedIndex {
+		s.mu.Unlock()
+		return youtubeImportSessionDTO{}, track{}, errYouTubeSessionChanged
 	}
 	session.CurrentIndex++
 	session.SavedCount++
 	session.UpdatedAt = time.Now().UTC()
+	var cleanupErr error
 	if session.CurrentIndex >= len(session.Items) {
 		session.Status = youtubeImportStatusCompleted
-		s.cleanupSessionFilesLocked(session)
+		cleanupErr = s.cleanupSessionFilesLocked(session)
 	}
-	return s.buildSessionDTOLocked(session), savedTrack, nil
+	result := s.buildSessionDTOLocked(session)
+	s.mu.Unlock()
+	if cleanupErr != nil {
+		captureSentryError(ctx, cleanupErr, "youtube", "import.add.cleanup")
+	}
+	return result, savedTrack, nil
 }
 
 func (s *youtubeImportService) CancelSession(userID int64) error {
+	return s.cancelSession(context.Background(), userID)
+}
+
+func (s *youtubeImportService) cancelSession(ctx context.Context, userID int64) error {
+	finishOperation, err := s.beginOperation()
+	if err != nil {
+		return err
+	}
+	defer finishOperation()
+
+	unlockOperation, err := s.lockUserOperation(ctx, userID)
+	if err != nil {
+		return err
+	}
+	defer unlockOperation()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if _, ok := s.sessions[userID]; !ok {
 		return errYouTubeSessionNotFound
 	}
-	s.cleanupSessionFilesLocked(s.sessions[userID])
+	if err := s.cleanupSessionFilesLocked(s.sessions[userID]); err != nil {
+		return err
+	}
 	delete(s.sessions, userID)
 	return nil
 }
 
-func (s *youtubeImportService) cleanupSessionFilesLocked(session *youtubeImportSession) {
+func (s *youtubeImportService) cleanupSessionFilesLocked(session *youtubeImportSession) error {
 	if strings.TrimSpace(session.CookiesPath) != "" {
-		_ = os.Remove(session.CookiesPath)
+		if err := s.removeActiveFile(session.CookiesPath, "remove session cookies file"); err != nil {
+			return err
+		}
 		session.CookiesPath = ""
 	}
+	return nil
 }
 
 func (s *youtubeImportService) buildSessionDTOLocked(session *youtubeImportSession) youtubeImportSessionDTO {
@@ -561,44 +1449,119 @@ func (s *youtubeImportService) buildSessionDTOLocked(session *youtubeImportSessi
 	return dto
 }
 
-func (s *youtubeImportService) downloadCurrentToSongs(ctx context.Context, index int, item youtubeImportItem, cookiesPath string) (string, func(bool), error) {
+type preparedYouTubeAudio struct {
+	service     *youtubeImportService
+	fileName    string
+	sourcePath  string
+	stagingPath string
+	finalPath   string
+}
+
+func (a *preparedYouTubeAudio) cleanup(committed bool) error {
+	cleanupErr := errors.Join(
+		a.service.removeActiveFile(a.sourcePath, "remove temporary audio file"),
+		a.service.removeActiveFile(a.stagingPath, "remove staged audio file"),
+	)
+	if !committed && strings.TrimSpace(a.finalPath) != "" {
+		cleanupErr = errors.Join(cleanupErr, removeYouTubeFile(a.finalPath, "remove uncommitted audio file"))
+	}
+	return cleanupErr
+}
+
+func availableYouTubeSongDestination(dir, fileName string) (string, string, error) {
+	base := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+	ext := filepath.Ext(fileName)
+	for attempt := 0; attempt < 10_000; attempt++ {
+		candidate := fileName
+		if attempt > 0 {
+			candidate = fmt.Sprintf("%s-%d%s", base, attempt, ext)
+		}
+		path := filepath.Join(dir, candidate)
+		_, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return candidate, path, nil
+		}
+		if err != nil {
+			return "", "", sanitizeYouTubeFilesystemError("inspect destination audio file", err)
+		}
+	}
+	return "", "", youtubeStageError(errYouTubeStorageFailed, "select destination audio file name", errors.New("unique filename attempts exhausted"))
+}
+
+func (s *youtubeImportService) downloadCurrentToSongs(ctx context.Context, index int, item youtubeImportItem, cookiesPath string) (*preparedYouTubeAudio, error) {
+	operationCtx, cancel := withYouTubeDownloadTimeout(ctx, s.cfg.DownloadTimeout)
+	defer cancel()
+
 	if err := os.MkdirAll(s.cfg.ImportTempDir, 0o755); err != nil {
-		return "", func(bool) {}, err
+		return nil, sanitizeYouTubeFilesystemError("create import directory", err)
+	}
+	if err := os.MkdirAll(s.songsDir, 0o755); err != nil {
+		return nil, sanitizeYouTubeFilesystemError("create songs directory", err)
+	}
+	stagingDir := filepath.Join(s.songsDir, ".youtube-import-staging")
+	if err := os.MkdirAll(stagingDir, 0o700); err != nil {
+		return nil, sanitizeYouTubeFilesystemError("create audio staging directory", err)
 	}
 	fileName, err := youtubeImportFileName(item)
 	if err != nil {
-		return "", func(bool) {}, err
+		return nil, err
 	}
 	tempSourceName, err := randomizedStoredFileName("youtube-source-" + item.VideoID + ".bin")
 	if err != nil {
-		return "", func(bool) {}, err
+		return nil, fmt.Errorf("generate temporary audio file name: %w", err)
 	}
 	tempSourcePath := filepath.Join(s.cfg.ImportTempDir, fmt.Sprintf("%03d-%s", index+1, tempSourceName))
-	if err := s.gateway.DownloadAudio(ctx, item, tempSourcePath, cookiesPath); err != nil {
-		_ = os.Remove(tempSourcePath)
-		return "", func(bool) {}, err
-	}
-
-	finalName, err := uniqueFileName(s.songsDir, fileName)
+	s.registerActiveFile(tempSourcePath)
+	downloadSpan := sentry.StartSpan(operationCtx, "youtube.download", sentry.WithDescription("audio"))
+	err = s.gateway.DownloadAudio(downloadSpan.Context(), item, tempSourcePath, cookiesPath)
+	downloadSpan.Finish()
 	if err != nil {
-		_ = os.Remove(tempSourcePath)
-		return "", func(bool) {}, err
-	}
-	finalPath := filepath.Join(s.songsDir, finalName)
-	if err := s.transcodeToMP3(ctx, tempSourcePath, finalPath); err != nil {
-		_ = os.Remove(tempSourcePath)
-		_ = os.Remove(finalPath)
-		return "", func(bool) {}, err
-	}
-	_ = os.Remove(tempSourcePath)
-
-	cleanup := func(committed bool) {
-		if committed {
-			return
+		if ctxErr := operationCtx.Err(); ctxErr != nil {
+			err = errors.Join(err, ctxErr)
 		}
-		_ = os.Remove(finalPath)
+		if !errors.Is(err, errYouTubeDownloadFailed) {
+			err = youtubeStageError(errYouTubeDownloadFailed, "download", err)
+		}
+		return nil, errors.Join(err, s.removeActiveFile(tempSourcePath, "remove temporary audio file"))
 	}
-	return "/api/songs/" + url.PathEscape(finalName), cleanup, nil
+
+	stagingFile, err := os.CreateTemp(stagingDir, "youtube-import-*.mp3")
+	if err != nil {
+		return nil, errors.Join(
+			sanitizeYouTubeFilesystemError("create staged audio file", err),
+			s.removeActiveFile(tempSourcePath, "remove temporary audio file"),
+		)
+	}
+	stagingPath := stagingFile.Name()
+	s.registerActiveFile(stagingPath)
+	if err := stagingFile.Chmod(0o644); err != nil {
+		return nil, errors.Join(
+			sanitizeYouTubeFilesystemError("set staged audio file permissions", err),
+			sanitizeYouTubeFilesystemError("close staged audio file", stagingFile.Close()),
+			s.removeActiveFile(tempSourcePath, "remove temporary audio file"),
+			s.removeActiveFile(stagingPath, "remove staged audio file"),
+		)
+	}
+	if err := stagingFile.Close(); err != nil {
+		return nil, errors.Join(
+			sanitizeYouTubeFilesystemError("close staged audio file", err),
+			s.removeActiveFile(tempSourcePath, "remove temporary audio file"),
+			s.removeActiveFile(stagingPath, "remove staged audio file"),
+		)
+	}
+	if err := s.transcodeToMP3(operationCtx, tempSourcePath, stagingPath); err != nil {
+		return nil, errors.Join(
+			err,
+			s.removeActiveFile(tempSourcePath, "remove temporary audio file"),
+			s.removeActiveFile(stagingPath, "remove incomplete staged audio file"),
+		)
+	}
+	return &preparedYouTubeAudio{
+		service:     s,
+		fileName:    fileName,
+		sourcePath:  tempSourcePath,
+		stagingPath: stagingPath,
+	}, nil
 }
 
 func youtubeImportFileName(item youtubeImportItem) (string, error) {
@@ -613,13 +1576,19 @@ func youtubeImportFileName(item youtubeImportItem) (string, error) {
 }
 
 func (s *youtubeImportService) transcodeToMP3(ctx context.Context, sourcePath, targetPath string) error {
+	span := sentry.StartSpan(ctx, "youtube.transcode", sentry.WithDescription("mp3"))
+	defer span.Finish()
+	ctx = span.Context()
+
 	binaryName := strings.TrimSpace(s.cfg.FFmpegBinary)
 	if binaryName == "" {
 		binaryName = "ffmpeg"
 	}
 	if _, err := exec.LookPath(binaryName); err != nil {
-		log.Printf("youtube transcode failed stage=ffmpeg_lookup source=%q target=%q err=%v", sourcePath, targetPath, err)
-		return fmt.Errorf("%w: ffmpeg_lookup", errYouTubeTranscodeFailed)
+		log.Printf("youtube transcode failed stage=ffmpeg_lookup diagnostic=%s", youtubeErrorDiagnostic(err))
+		cause, _ := sanitizeYouTubeCause(err)
+		dependencyErr := youtubeStageError(errYouTubeDependency, "ffmpeg lookup", cause)
+		return youtubeStageError(errYouTubeTranscodeFailed, "ffmpeg lookup", dependencyErr)
 	}
 	args := []string{
 		"-y",
@@ -627,21 +1596,31 @@ func (s *youtubeImportService) transcodeToMP3(ctx context.Context, sourcePath, t
 		"-vn",
 		"-codec:a", "libmp3lame",
 		"-q:a", "2",
+		"-fs", strconv.FormatInt(maxSongUploadSize, 10),
 		targetPath,
 	}
 	cmd := exec.CommandContext(ctx, binaryName, args...)
-	output, err := cmd.CombinedOutput()
+	err := cmd.Run()
 	if err != nil {
-		log.Printf("youtube transcode failed stage=ffmpeg_run source=%q target=%q err=%v output=%s", sourcePath, targetPath, err, strings.TrimSpace(string(output)))
-		return fmt.Errorf("%w: ffmpeg_run", errYouTubeTranscodeFailed)
+		log.Printf("youtube transcode failed stage=ffmpeg_run diagnostic=%s", youtubeErrorDiagnostic(err))
+		cause := err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			cause = errors.Join(cause, ctxErr)
+		}
+		return youtubeStageError(errYouTubeTranscodeFailed, "ffmpeg run", cause)
 	}
 	info, err := os.Stat(targetPath)
 	if err != nil || info.Size() == 0 {
 		if err == nil {
 			err = errors.New("ffmpeg produced empty output file")
+		} else {
+			err = sanitizeYouTubeFilesystemError("inspect transcoded audio file", err)
 		}
-		log.Printf("youtube transcode failed stage=ffmpeg_output source=%q target=%q err=%v", sourcePath, targetPath, err)
-		return fmt.Errorf("%w: ffmpeg_output", errYouTubeTranscodeFailed)
+		log.Printf("youtube transcode failed stage=ffmpeg_output diagnostic=%s", youtubeErrorDiagnostic(err))
+		return youtubeStageError(errYouTubeTranscodeFailed, "ffmpeg output", err)
+	}
+	if info.Size() > maxSongUploadSize {
+		return youtubeStageError(errYouTubeTranscodeFailed, "ffmpeg output", errYouTubeAudioTooLarge)
 	}
 	return nil
 }
@@ -702,20 +1681,41 @@ func (s *youtubeImportSession) currentItem() (youtubeImportItem, bool) {
 }
 
 type liveYouTubeImportGateway struct {
-	client      *youtube.Client
 	httpClient  *http.Client
 	cfg         youtubeImportConfig
 	cookieStore *youtubeCookieStore
 }
 
 func newLiveYouTubeImportGateway(cfg youtubeImportConfig, cookieStore *youtubeCookieStore) *liveYouTubeImportGateway {
-	httpClient := &http.Client{Timeout: cfg.RequestTimeout}
+	httpClient := &http.Client{
+		Transport: youtubeMetadataLimitTransport{
+			base:  http.DefaultTransport,
+			limit: maxYouTubeMetadataBytes,
+		},
+	}
 	return &liveYouTubeImportGateway{
-		client:      &youtube.Client{HTTPClient: httpClient},
 		httpClient:  httpClient,
 		cfg:         cfg,
 		cookieStore: cookieStore,
 	}
+}
+
+func (g *liveYouTubeImportGateway) SnapshotCookies(destinationPath string) (bool, error) {
+	if g.cookieStore == nil {
+		return false, nil
+	}
+	err := g.cookieStore.snapshotTo(destinationPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (g *liveYouTubeImportGateway) newClient() *youtube.Client {
+	return &youtube.Client{HTTPClient: g.httpClient}
 }
 
 func (g *liveYouTubeImportGateway) Scan(ctx context.Context, rawURL string, cutoff *time.Time, cookiesPath string) ([]youtubeImportItem, youtubeImportScanSource, error) {
@@ -723,16 +1723,27 @@ func (g *liveYouTubeImportGateway) Scan(ctx context.Context, rawURL string, cuto
 	if err != nil {
 		return nil, youtubeImportScanSource{}, err
 	}
+	ctx, cancel := withYouTubeTimeout(ctx, g.cfg.RequestTimeout)
+	defer cancel()
+	span := sentry.StartSpan(ctx, "youtube.scan", sentry.WithDescription(sourceType))
+	defer span.Finish()
+	ctx = span.Context()
+	client := g.newClient()
 
 	switch sourceType {
 	case youtubeImportSourceTrack:
-		video, err := g.client.GetVideoContext(ctx, canonicalURL)
+		video, err := client.GetVideoContext(ctx, canonicalURL)
 		if err != nil {
 			item, fallbackErr := g.scanTrackWithYTDLP(ctx, canonicalURL, rawURL, cookiesPath)
 			if fallbackErr != nil {
-				log.Printf("youtube track scan yt-dlp fallback failed source_url=%q err=%v fallback_err=%v", rawURL, err, fallbackErr)
-				return nil, youtubeImportScanSource{}, err
+				log.Printf(
+					"youtube track scan fallbacks failed primary_diagnostic=%s fallback_diagnostic=%s",
+					youtubeErrorDiagnostic(err),
+					youtubeErrorDiagnostic(fallbackErr),
+				)
+				return nil, youtubeImportScanSource{}, combineYouTubeScanErrors(err, fallbackErr)
 			}
+			addYouTubeBreadcrumb(ctx, "scan", "track metadata fallback succeeded", 1)
 			if !isImportableYouTubeVideo(item) || !passesYouTubeCutoff(item, cutoff) {
 				return nil, youtubeImportScanSource{}, errYouTubeNoTracks
 			}
@@ -744,22 +1755,30 @@ func (g *liveYouTubeImportGateway) Scan(ctx context.Context, rawURL string, cuto
 		}
 		return []youtubeImportItem{item}, youtubeImportScanSource{SourceType: youtubeImportSourceTrack, CanonicalURL: canonicalURL}, nil
 	case youtubeImportSourcePlaylist:
-		items, err := g.scanPlaylist(ctx, canonicalURL, rawURL, linkProviderFromURL(rawURL), cutoff)
-		return items, youtubeImportScanSource{SourceType: youtubeImportSourcePlaylist, CanonicalURL: canonicalURL}, err
+		items, err := g.scanPlaylist(ctx, client, canonicalURL, rawURL, linkProviderFromURL(rawURL), cutoff)
+		return items, youtubeImportScanSource{SourceType: youtubeImportSourcePlaylist, CanonicalURL: canonicalURL}, classifyYouTubeScanError(err)
 	case youtubeImportSourceArtist:
-		items, err := g.scanArtist(ctx, canonicalURL, cutoff, cookiesPath)
-		return items, youtubeImportScanSource{SourceType: youtubeImportSourceArtist, CanonicalURL: canonicalURL}, err
+		items, err := g.scanArtist(ctx, client, canonicalURL, cutoff, cookiesPath)
+		return items, youtubeImportScanSource{SourceType: youtubeImportSourceArtist, CanonicalURL: canonicalURL}, classifyYouTubeScanError(err)
 	default:
 		return nil, youtubeImportScanSource{}, errYouTubeInvalidURL
 	}
 }
 
-func (g *liveYouTubeImportGateway) DownloadAudio(ctx context.Context, item youtubeImportItem, destinationPath string, cookiesPath string) error {
-	if resolvedCookiesPath, ok := g.resolveCookiesPath(cookiesPath); ok {
+func (g *liveYouTubeImportGateway) DownloadAudio(ctx context.Context, item youtubeImportItem, destinationPath string, cookiesPath string) (resultErr error) {
+	ctx, cancel := withYouTubeDownloadTimeout(ctx, g.cfg.DownloadTimeout)
+	defer cancel()
+
+	resolvedCookiesPath, hasCookies, err := g.resolveCookiesPath(cookiesPath)
+	if err != nil {
+		return youtubeDownloadError(item, "resolve_cookies", nil, err)
+	}
+	if hasCookies {
 		return g.downloadAudioWithYTDLP(ctx, item, destinationPath, resolvedCookiesPath)
 	}
 
-	video, err := g.client.GetVideoContext(ctx, item.SourceURL)
+	client := g.newClient()
+	video, err := client.GetVideoContext(ctx, item.SourceURL)
 	if err != nil {
 		return youtubeDownloadError(item, "get_video", nil, err)
 	}
@@ -767,38 +1786,68 @@ func (g *liveYouTubeImportGateway) DownloadAudio(ctx context.Context, item youtu
 	if format == nil {
 		return youtubeDownloadError(item, "select_format", nil, errors.New("no downloadable audio format found"))
 	}
-	if err := os.MkdirAll(filepath.Dir(destinationPath), 0o755); err != nil {
-		return err
+	if format.ContentLength > maxSongUploadSize {
+		return youtubeDownloadError(item, "format_size", format, errYouTubeAudioTooLarge)
 	}
-	reader, _, err := g.client.GetStreamContext(ctx, video, format)
+	if err := os.MkdirAll(filepath.Dir(destinationPath), 0o755); err != nil {
+		return sanitizeYouTubeFilesystemError("create audio download directory", err)
+	}
+	reader, contentLength, err := client.GetStreamContext(ctx, video, format)
 	if err != nil {
 		return youtubeDownloadError(item, "get_stream", format, err)
 	}
-	defer reader.Close()
+	defer func() {
+		if err := reader.Close(); err != nil {
+			resultErr = errors.Join(
+				resultErr,
+				newYouTubeCleanupError("close downloaded audio stream", youtubeDownloadError(item, "close_stream", format, err)),
+				removeYouTubeFile(destinationPath, "remove audio after stream close failure"),
+			)
+		}
+	}()
+	if contentLength > maxSongUploadSize {
+		return youtubeDownloadError(item, "stream_size", format, errYouTubeAudioTooLarge)
+	}
 
 	output, err := os.OpenFile(destinationPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
 	if err != nil {
-		return err
+		return sanitizeYouTubeFilesystemError("create downloaded audio file", err)
 	}
-	if _, err := io.Copy(output, reader); err != nil {
-		_ = output.Close()
-		_ = os.Remove(destinationPath)
-		return youtubeDownloadError(item, "copy_stream", format, err)
+	if _, err := copyYouTubeAudio(output, reader, maxSongUploadSize); err != nil {
+		copyErr := err
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			copyErr = sanitizeYouTubeFilesystemError("write downloaded audio file", err)
+		}
+		return errors.Join(
+			youtubeDownloadError(item, "copy_stream", format, copyErr),
+			newYouTubeCleanupError("close incomplete downloaded audio file", sanitizeYouTubeFilesystemError("close incomplete downloaded audio file", output.Close())),
+			removeYouTubeFile(destinationPath, "remove incomplete downloaded audio file"),
+		)
 	}
 	if err := output.Close(); err != nil {
-		_ = os.Remove(destinationPath)
-		return youtubeDownloadError(item, "close_output", format, err)
+		return errors.Join(
+			youtubeDownloadError(item, "close_output", format, sanitizeYouTubeFilesystemError("close downloaded audio file", err)),
+			removeYouTubeFile(destinationPath, "remove incomplete downloaded audio file"),
+		)
 	}
 	return nil
 }
 
-func (g *liveYouTubeImportGateway) resolveCookiesPath(cookiesPath string) (string, bool) {
+func (g *liveYouTubeImportGateway) resolveCookiesPath(cookiesPath string) (string, bool, error) {
 	cookiesPath = strings.TrimSpace(cookiesPath)
 	if cookiesPath != "" {
 		info, err := os.Stat(cookiesPath)
-		if err == nil && !info.IsDir() && info.Size() > 0 {
-			return cookiesPath, true
+		if err != nil {
+			return "", false, sanitizeYouTubeFilesystemError("inspect session cookies file", err)
 		}
+		if info.IsDir() || info.Size() == 0 {
+			return "", false, youtubeStageError(errYouTubeStorageFailed, "inspect session cookies file", errors.New("cookies file is not a non-empty regular file"))
+		}
+		return cookiesPath, true, nil
+	}
+	if g.cookieStore == nil {
+		return "", false, nil
 	}
 	return g.cookieStore.pathIfPresent()
 }
@@ -809,50 +1858,95 @@ func (g *liveYouTubeImportGateway) downloadAudioWithYTDLP(ctx context.Context, i
 		binaryName = "yt-dlp"
 	}
 	if _, err := exec.LookPath(binaryName); err != nil {
-		return youtubeDownloadError(item, "ytdlp_lookup", nil, err)
+		cause, _ := sanitizeYouTubeCause(err)
+		return youtubeDownloadError(item, "ytdlp_lookup", nil, youtubeStageError(errYouTubeDependency, "yt-dlp lookup", cause))
 	}
 	if err := os.MkdirAll(filepath.Dir(destinationPath), 0o755); err != nil {
-		return err
+		return sanitizeYouTubeFilesystemError("create audio download directory", err)
 	}
 	args := []string{
 		"--cookies", cookiesPath,
 		"--no-playlist",
 		"--no-part",
+		"--no-progress",
+		"--max-filesize", strconv.FormatInt(maxSongUploadSize, 10),
 		"-f", "bestaudio/best",
-		"-o", destinationPath,
+		"-o", "-",
 		item.SourceURL,
 	}
-	cmd := exec.CommandContext(ctx, binaryName, args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("yt-dlp failed video_id=%q source_url=%q err=%v output=%s", item.VideoID, item.SourceURL, err, strings.TrimSpace(string(output)))
-		return youtubeDownloadError(item, "ytdlp_run", nil, err)
-	}
-	info, err := os.Stat(destinationPath)
-	if err != nil || info.Size() == 0 {
-		if err == nil {
-			err = errors.New("yt-dlp produced empty output file")
+	if err := runYTDLPDownload(ctx, binaryName, args, destinationPath, maxSongUploadSize); err != nil {
+		log.Printf("yt-dlp failed stage=download diagnostic=%s", youtubeErrorDiagnostic(err))
+		cause := err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			cause = errors.Join(cause, ctxErr)
 		}
-		return youtubeDownloadError(item, "ytdlp_output", nil, err)
+		return youtubeDownloadError(item, "ytdlp_run", nil, cause)
 	}
 	return nil
 }
 
-func youtubeDownloadError(item youtubeImportItem, stage string, format *youtube.Format, err error) error {
+func runYTDLPDownload(ctx context.Context, binaryName string, args []string, destinationPath string, limit int64) (resultErr error) {
+	output, err := os.OpenFile(destinationPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+	if err != nil {
+		return sanitizeYouTubeFilesystemError("create downloaded audio file", err)
+	}
+	removeOutput := true
+	closed := false
+	defer func() {
+		if !closed {
+			if err := output.Close(); err != nil {
+				resultErr = errors.Join(resultErr, newYouTubeCleanupError("close incomplete downloaded audio file", sanitizeYouTubeFilesystemError("close downloaded audio file", err)))
+			}
+		}
+		if removeOutput {
+			resultErr = errors.Join(resultErr, removeYouTubeFile(destinationPath, "remove incomplete downloaded audio file"))
+		}
+	}()
+
+	bounded := &boundedYouTubeAudioWriter{destination: output, remaining: limit}
+	cmd := exec.CommandContext(ctx, binaryName, args...)
+	cmd.Stdout = bounded
+	if err := cmd.Run(); err != nil {
+		if bounded.overflow {
+			return errYouTubeAudioTooLarge
+		}
+		return err
+	}
+	if bounded.overflow {
+		return errYouTubeAudioTooLarge
+	}
+	info, err := output.Stat()
+	if err != nil {
+		return sanitizeYouTubeFilesystemError("inspect downloaded audio file", err)
+	}
+	if info.Size() == 0 {
+		return errors.New("yt-dlp produced empty output file")
+	}
+	if info.Size() > limit {
+		return errYouTubeAudioTooLarge
+	}
+	closeErr := output.Close()
+	closed = true
+	if closeErr != nil {
+		return sanitizeYouTubeFilesystemError("close downloaded audio file", closeErr)
+	}
+	removeOutput = false
+	return nil
+}
+
+func youtubeDownloadError(_ youtubeImportItem, stage string, format *youtube.Format, err error) error {
 	formatDetails := "none"
 	if format != nil {
-		formatDetails = fmt.Sprintf("itag=%d mime=%q bitrate=%d channels=%d", format.ItagNo, format.MimeType, format.Bitrate, format.AudioChannels)
+		formatDetails = fmt.Sprintf("itag=%d bitrate=%d channels=%d", format.ItagNo, format.Bitrate, format.AudioChannels)
 	}
 	log.Printf(
-		"youtube download failed stage=%s video_id=%q source_url=%q provider=%q format={%s} err=%v",
+		"youtube download failed stage=%s format={%s} diagnostic=%s",
 		stage,
-		item.VideoID,
-		item.SourceURL,
-		item.LinkProvider,
 		formatDetails,
-		err,
+		youtubeErrorDiagnostic(err),
 	)
-	return fmt.Errorf("%w: %s", errYouTubeDownloadFailed, stage)
+	cause, _ := sanitizeYouTubeCause(err)
+	return youtubeStageError(errYouTubeDownloadFailed, stage, cause)
 }
 
 func selectYouTubeDownloadFormat(formats youtube.FormatList) *youtube.Format {
@@ -869,20 +1963,22 @@ func selectYouTubeDownloadFormat(formats youtube.FormatList) *youtube.Format {
 	return &audioFormats[0]
 }
 
-func (g *liveYouTubeImportGateway) scanPlaylist(ctx context.Context, playlistURL, originalURL, linkProvider string, cutoff *time.Time) ([]youtubeImportItem, error) {
-	playlist, err := g.client.GetPlaylistContext(ctx, playlistURL)
+func (g *liveYouTubeImportGateway) scanPlaylist(ctx context.Context, client *youtube.Client, playlistURL, originalURL, linkProvider string, cutoff *time.Time) ([]youtubeImportItem, error) {
+	playlist, err := client.GetPlaylistContext(ctx, playlistURL)
 	if err != nil {
 		return nil, err
 	}
 	items := make([]youtubeImportItem, 0, len(playlist.Videos))
 	seen := make(map[string]struct{}, len(playlist.Videos))
+	entryFailures := make([]error, 0)
 	for _, entry := range playlist.Videos {
 		item := youtubeImportItem{}
-		video, err := g.client.VideoFromPlaylistEntryContext(ctx, entry)
+		video, err := client.VideoFromPlaylistEntryContext(ctx, entry)
 		if err == nil {
 			item = buildYouTubeImportItem(video, buildYouTubeWatchURL(video.ID, linkProvider), originalURL, linkProvider, playlist.Title)
 			item = mergePlaylistEntryFallback(item, entry, originalURL, linkProvider, playlist.Title)
 		} else {
+			entryFailures = append(entryFailures, err)
 			item = buildYouTubeImportItemFromPlaylistEntry(entry, originalURL, linkProvider, playlist.Title)
 		}
 		if !isImportableYouTubeVideo(item) || !passesYouTubeCutoff(item, cutoff) {
@@ -895,23 +1991,34 @@ func (g *liveYouTubeImportGateway) scanPlaylist(ctx context.Context, playlistURL
 		items = append(items, item)
 	}
 	if len(items) == 0 {
+		if len(entryFailures) > 0 {
+			return nil, combineYouTubeScanErrors(append(entryFailures, errYouTubeNoTracks)...)
+		}
 		return nil, errYouTubeNoTracks
+	}
+	if len(entryFailures) > 0 {
+		addYouTubeBreadcrumb(ctx, "scan", "playlist entries used fallback metadata", len(entryFailures))
 	}
 	return items, nil
 }
 
-func (g *liveYouTubeImportGateway) scanArtist(ctx context.Context, artistURL string, cutoff *time.Time, cookiesPath string) ([]youtubeImportItem, error) {
-	items, err := g.scanArtistWithYTDLP(ctx, artistURL, cutoff, cookiesPath)
-	if err == nil && len(items) > 0 {
-		return items, nil
+func (g *liveYouTubeImportGateway) scanArtist(ctx context.Context, client *youtube.Client, artistURL string, cutoff *time.Time, cookiesPath string) ([]youtubeImportItem, error) {
+	ytdlpItems, ytdlpErr := g.scanArtistWithYTDLP(ctx, client, artistURL, cutoff, cookiesPath)
+	if ytdlpErr == nil && len(ytdlpItems) > 0 {
+		return ytdlpItems, nil
 	}
-	if err != nil {
-		log.Printf("youtube artist scan yt-dlp fallback source_url=%q err=%v", artistURL, err)
+	if ytdlpErr != nil {
+		log.Printf("youtube artist scan switching to HTML fallback diagnostic=%s", youtubeErrorDiagnostic(ytdlpErr))
 	}
-	return g.scanArtistByHTML(ctx, artistURL, cutoff)
+	htmlItems, htmlErr := g.scanArtistByHTML(ctx, client, artistURL, cutoff)
+	if htmlErr == nil && len(htmlItems) > 0 {
+		addYouTubeBreadcrumb(ctx, "scan", "artist HTML fallback succeeded", 1)
+		return htmlItems, nil
+	}
+	return nil, combineYouTubeScanErrors(ytdlpErr, htmlErr)
 }
 
-func (g *liveYouTubeImportGateway) scanArtistWithYTDLP(ctx context.Context, artistURL string, cutoff *time.Time, cookiesPath string) ([]youtubeImportItem, error) {
+func (g *liveYouTubeImportGateway) scanArtistWithYTDLP(ctx context.Context, client *youtube.Client, artistURL string, cutoff *time.Time, cookiesPath string) ([]youtubeImportItem, error) {
 	data, err := g.dumpFlatPlaylistJSON(ctx, artistURL, cookiesPath)
 	if err != nil {
 		return nil, err
@@ -930,10 +2037,11 @@ func (g *liveYouTubeImportGateway) scanArtistWithYTDLP(ctx context.Context, arti
 	defaultAuthor := firstNonEmpty(dump.Channel, dump.Uploader, dump.Title)
 	items := make([]youtubeImportItem, 0, len(entries))
 	seen := make(map[string]struct{}, len(entries))
+	enrichmentFailures := make([]error, 0)
 	for _, entry := range entries {
 		item := buildYouTubeImportItemFromYTDLPEntry(entry, artistURL, linkProvider, defaultAuthor)
 		if cutoff != nil {
-			video, videoErr := g.client.GetVideoContext(ctx, item.VideoID)
+			video, videoErr := client.GetVideoContext(ctx, item.VideoID)
 			if videoErr == nil {
 				item = mergeYTDLPEntryFallback(
 					buildYouTubeImportItem(video, buildYouTubeWatchURL(video.ID, linkProvider), artistURL, linkProvider, ""),
@@ -942,6 +2050,8 @@ func (g *liveYouTubeImportGateway) scanArtistWithYTDLP(ctx context.Context, arti
 					linkProvider,
 					defaultAuthor,
 				)
+			} else {
+				enrichmentFailures = append(enrichmentFailures, videoErr)
 			}
 		}
 		if !isImportableYouTubeVideo(item) || !passesYouTubeCutoff(item, cutoff) {
@@ -955,7 +2065,13 @@ func (g *liveYouTubeImportGateway) scanArtistWithYTDLP(ctx context.Context, arti
 	}
 	sortYouTubeImportItems(items)
 	if len(items) == 0 {
+		if len(enrichmentFailures) > 0 {
+			return nil, combineYouTubeScanErrors(append(enrichmentFailures, errYouTubeNoTracks)...)
+		}
 		return nil, errYouTubeNoTracks
+	}
+	if len(enrichmentFailures) > 0 {
+		addYouTubeBreadcrumb(ctx, "scan", "artist entries used flat metadata", len(enrichmentFailures))
 	}
 	return items, nil
 }
@@ -988,7 +2104,7 @@ func (g *liveYouTubeImportGateway) scanTrackWithYTDLP(ctx context.Context, canon
 	return item, nil
 }
 
-func (g *liveYouTubeImportGateway) scanArtistByHTML(ctx context.Context, artistURL string, cutoff *time.Time) ([]youtubeImportItem, error) {
+func (g *liveYouTubeImportGateway) scanArtistByHTML(ctx context.Context, client *youtube.Client, artistURL string, cutoff *time.Time) ([]youtubeImportItem, error) {
 	body, err := g.fetchHTML(ctx, artistURL)
 	if err != nil {
 		return nil, err
@@ -998,13 +2114,15 @@ func (g *liveYouTubeImportGateway) scanArtistByHTML(ctx context.Context, artistU
 	videoIDs := extractMatches(body, youtubeVideoIDPattern)
 	items := make([]youtubeImportItem, 0)
 	seen := make(map[string]struct{})
+	scanFailures := make([]error, 0)
 
 	for _, playlistID := range playlistIDs {
 		if strings.HasPrefix(playlistID, "RD") {
 			continue
 		}
-		playlistItems, err := g.scanPlaylist(ctx, "https://www.youtube.com/playlist?list="+playlistID, artistURL, "youtube_music", cutoff)
+		playlistItems, err := g.scanPlaylist(ctx, client, "https://www.youtube.com/playlist?list="+playlistID, artistURL, "youtube_music", cutoff)
 		if err != nil {
+			scanFailures = append(scanFailures, err)
 			continue
 		}
 		for _, item := range playlistItems {
@@ -1021,8 +2139,9 @@ func (g *liveYouTubeImportGateway) scanArtistByHTML(ctx context.Context, artistU
 			if _, ok := seen[videoID]; ok {
 				continue
 			}
-			video, err := g.client.GetVideoContext(ctx, videoID)
+			video, err := client.GetVideoContext(ctx, videoID)
 			if err != nil {
+				scanFailures = append(scanFailures, err)
 				continue
 			}
 			item := buildYouTubeImportItem(video, buildYouTubeWatchURL(video.ID, "youtube_music"), artistURL, "youtube_music", "")
@@ -1037,7 +2156,13 @@ func (g *liveYouTubeImportGateway) scanArtistByHTML(ctx context.Context, artistU
 	sortYouTubeImportItems(items)
 
 	if len(items) == 0 {
+		if len(scanFailures) > 0 {
+			return nil, combineYouTubeScanErrors(append(scanFailures, errYouTubeNoTracks)...)
+		}
 		return nil, errYouTubeNoTracks
+	}
+	if len(scanFailures) > 0 {
+		addYouTubeBreadcrumb(ctx, "scan", "artist HTML scan partially recovered", len(scanFailures))
 	}
 	return items, nil
 }
@@ -1056,17 +2181,27 @@ func (g *liveYouTubeImportGateway) dumpYTDLPJSON(ctx context.Context, rawURL str
 		binaryName = "yt-dlp"
 	}
 	if _, err := exec.LookPath(binaryName); err != nil {
-		return nil, err
+		cause, _ := sanitizeYouTubeCause(err)
+		return nil, youtubeStageError(errYouTubeDependency, "yt-dlp lookup", cause)
 	}
 	args = append([]string{}, args...)
-	if resolvedCookiesPath, ok := g.resolveCookiesPath(cookiesPath); ok {
+	resolvedCookiesPath, hasCookies, err := g.resolveCookiesPath(cookiesPath)
+	if err != nil {
+		return nil, err
+	}
+	if hasCookies {
 		args = append(args, "--cookies", resolvedCookiesPath)
 	}
 	args = append(args, rawURL)
-	cmd := exec.CommandContext(ctx, binaryName, args...)
-	output, err := cmd.CombinedOutput()
+	output, err := runYouTubeCommandWithOutputLimit(ctx, binaryName, args, maxYouTubeYTDLPJSONBytes)
 	if err != nil {
-		log.Printf("yt-dlp %s failed source_url=%q err=%v output=%s", label, rawURL, err, strings.TrimSpace(string(output)))
+		if errors.Is(err, errYouTubeResponseTooLarge) {
+			return nil, youtubeStageError(errYouTubeUpstreamFailed, "yt-dlp json response", err)
+		}
+		log.Printf("yt-dlp failed operation=%q diagnostic=%s", label, youtubeErrorDiagnostic(err))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = errors.Join(err, ctxErr)
+		}
 		return nil, err
 	}
 	jsonPayload := trimJSONOutput(output)
@@ -1089,7 +2224,7 @@ func trimJSONOutput(output []byte) []byte {
 	return []byte(trimmed[start : end+1])
 }
 
-func (g *liveYouTubeImportGateway) fetchHTML(ctx context.Context, rawURL string) (string, error) {
+func (g *liveYouTubeImportGateway) fetchHTML(ctx context.Context, rawURL string) (result string, resultErr error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", errYouTubeInvalidURL
@@ -1099,15 +2234,15 @@ func (g *liveYouTubeImportGateway) fetchHTML(ctx context.Context, rawURL string)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("close youtube response body: %w", err))
+		}
+	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", errYouTubeInvalidURL
+		return "", youtube.ErrUnexpectedStatusCode(resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	return string(body), nil
+	return readYouTubeHTML(resp.Body, maxYouTubeArtistHTMLBytes)
 }
 
 func buildYouTubeImportItem(video *youtube.Video, sourceURL, originalURL, linkProvider, albumTitle string) youtubeImportItem {
@@ -1452,6 +2587,13 @@ func (s *trackStore) getTrackAlbumOrder(trackID int64) (int, bool) {
 }
 
 func (s *trackStore) findTrackBySourceMetadata(target sourceMetadata) (track, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.findTrackBySourceMetadataLocked(target)
+}
+
+func (s *trackStore) findTrackBySourceMetadataLocked(target sourceMetadata) (track, bool) {
 	targetProvider, ok := target["provider"].(string)
 	if !ok || strings.TrimSpace(targetProvider) == "" {
 		return track{}, false
@@ -1464,9 +2606,6 @@ func (s *trackStore) findTrackBySourceMetadata(target sourceMetadata) (track, bo
 	if err != nil {
 		return track{}, false
 	}
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	for _, item := range s.tracks {
 		for _, metadata := range item.SourceMetadata {
@@ -1488,6 +2627,70 @@ func (s *trackStore) findTrackBySourceMetadata(target sourceMetadata) (track, bo
 		}
 	}
 	return track{}, false
+}
+
+func (s *trackStore) createTrackIfSourceAbsent(req upsertTrackRequest, target sourceMetadata, publishAudio func() error) (track, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.findTrackBySourceMetadataLocked(target); exists {
+		return track{}, errYouTubeCurrentConflict
+	}
+	if _, ok := s.albums[req.AlbumID]; !ok {
+		return track{}, fmt.Errorf("%w: albumId %d does not exist", errInvalidTrack, req.AlbumID)
+	}
+
+	albumsSnapshot := cloneAlbumsMap(s.albums)
+	tracksSnapshot := cloneTracksMap(s.tracks)
+	nextTrackIDSnapshot := s.nextTrackID
+	restore := func() {
+		s.albums = albumsSnapshot
+		s.tracks = tracksSnapshot
+		s.nextTrackID = nextTrackIDSnapshot
+	}
+
+	created := track{
+		ID:             s.nextTrackID,
+		Name:           strings.TrimSpace(req.Name),
+		AuthorIDs:      normalizeAuthorIDs(req.AuthorIDs),
+		AlbumID:        req.AlbumID,
+		AudioFilePath:  normalizeAudioFilePath(req.AudioFilePath),
+		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
+		SourceMetadata: normalizeSourceMetadata(req.SourceMetadata),
+		CreatedAt:      time.Now().UTC(),
+	}
+	if err := s.validateTrackLocked(created); err != nil {
+		return track{}, err
+	}
+	albumOrder, err := normalizeAlbumOrder(req.AlbumOrder, len(s.albums[req.AlbumID].TrackIDs), true)
+	if err != nil {
+		return track{}, fmt.Errorf("%w: %v", errInvalidTrack, err)
+	}
+
+	s.nextTrackID++
+	s.tracks[created.ID] = created
+	targetAlbum := s.albums[req.AlbumID]
+	insertTrackIntoAlbumLocked(&targetAlbum, created.ID, albumOrder)
+	s.albums[req.AlbumID] = targetAlbum
+	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
+		restore()
+		return track{}, err
+	}
+	if err := s.persistLocked(); err != nil {
+		restore()
+		return track{}, err
+	}
+	if publishAudio != nil {
+		if err := publishAudio(); err != nil {
+			restore()
+			rollbackErr := s.persistLocked()
+			if rollbackErr != nil {
+				rollbackErr = fmt.Errorf("rollback track after audio publish failure: %w", rollbackErr)
+			}
+			return track{}, errors.Join(err, rollbackErr)
+		}
+	}
+	return cloneTrack(s.tracks[created.ID]), nil
 }
 
 func (s *trackStore) attachTrackImportMetadata(trackID int64, infos []additionalInfo, metadata []sourceMetadata) (track, bool, error) {
@@ -1512,6 +2715,33 @@ func (s *trackStore) attachTrackImportMetadata(trackID int64, infos []additional
 		return track{}, true, err
 	}
 	return s.tracks[trackID], true, nil
+}
+
+func (s *trackStore) attachTrackImportMetadataIfSourceAbsent(trackID int64, infos []additionalInfo, metadata []sourceMetadata, target sourceMetadata) (track, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current, ok := s.tracks[trackID]
+	if !ok {
+		return track{}, false, nil
+	}
+	if _, exists := s.findTrackBySourceMetadataLocked(target); exists {
+		return track{}, true, errYouTubeCurrentConflict
+	}
+
+	tracksSnapshot := cloneTracksMap(s.tracks)
+	updated := cloneTrack(current)
+	updated.AdditionalInfo = mergeAdditionalInfoItems(updated.AdditionalInfo, infos)
+	updated.SourceMetadata = mergeSourceMetadataItems(updated.SourceMetadata, metadata)
+	if err := s.validateTrackLocked(updated); err != nil {
+		return track{}, true, err
+	}
+	s.tracks[trackID] = updated
+	if err := s.persistLocked(); err != nil {
+		s.tracks = tracksSnapshot
+		return track{}, true, err
+	}
+	return cloneTrack(s.tracks[trackID]), true, nil
 }
 
 func mergeAdditionalInfoItems(existing, additions []additionalInfo) []additionalInfo {
@@ -1655,40 +2885,78 @@ func (s *trackStore) youtubeImportSuggestions(item youtubeImportItem) []youtubeI
 
 func youtubeCookiesStatusHandler(store *youtubeCookieStore) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, store.Status())
+		status, err := store.status()
+		if err != nil {
+			writeSentryHTTPError(w, r, sanitizeYouTubeCapturedError(err), "internal server error", http.StatusInternalServerError, "youtube", "cookies.status")
+			return
+		}
+		writeJSON(w, http.StatusOK, status)
 	})
 }
 
 func youtubeCookiesUploadHandler(store *youtubeCookieStore) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, maxSongUploadSize)
-		if err := r.ParseMultipartForm(maxSongUploadSize); err != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, maxYouTubeCookiesUploadBytes)
+		if err := r.ParseMultipartForm(maxYouTubeCookiesBytes); err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				http.Error(w, errYouTubeCookiesTooLarge.Error(), http.StatusRequestEntityTooLarge)
+				return
+			}
+			var pathErr *os.PathError
+			if errors.As(err, &pathErr) {
+				writeSentryHTTPError(w, r, sanitizeYouTubeFilesystemError("parse cookies upload", err), "internal server error", http.StatusInternalServerError, "youtube", "cookies.upload")
+				return
+			}
 			http.Error(w, "invalid multipart form", http.StatusBadRequest)
 			return
 		}
+		defer func() {
+			if r.MultipartForm == nil {
+				return
+			}
+			if err := r.MultipartForm.RemoveAll(); err != nil {
+				captureSentryError(r.Context(), sanitizeYouTubeFilesystemError("remove multipart temporary files", err), "youtube", "cookies.upload.cleanup")
+			}
+		}()
 		file, _, err := r.FormFile("file")
 		if err != nil {
 			http.Error(w, "file is required", http.StatusBadRequest)
 			return
 		}
-		defer file.Close()
-		if err := store.Replace(file); err != nil {
-			switch err.Error() {
-			case "uploaded file is empty", "youtube cookies file is not configured":
-				http.Error(w, err.Error(), http.StatusBadRequest)
-			default:
-				http.Error(w, "failed to store youtube cookies", http.StatusInternalServerError)
+		defer func() {
+			if err := file.Close(); err != nil {
+				captureSentryError(r.Context(), sanitizeYouTubeFilesystemError("close uploaded cookies file", err), "youtube", "cookies.upload.cleanup")
 			}
+		}()
+		if err := store.Replace(file); err != nil {
+			if errors.Is(err, errYouTubeCookiesTooLarge) {
+				if hasYouTubeCleanupError(err) {
+					captureSentryError(r.Context(), sanitizeYouTubeCapturedError(err), "youtube", "cookies.upload.cleanup")
+				}
+				http.Error(w, errYouTubeCookiesTooLarge.Error(), http.StatusRequestEntityTooLarge)
+				return
+			}
+			if (errors.Is(err, errYouTubeCookiesEmpty) || errors.Is(err, errYouTubeCookiesNotSet)) && !errors.Is(err, errYouTubeStorageFailed) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			writeSentryHTTPError(w, r, sanitizeYouTubeCapturedError(err), "internal server error", http.StatusInternalServerError, "youtube", "cookies.upload")
 			return
 		}
-		writeJSON(w, http.StatusCreated, store.Status())
+		status, err := store.status()
+		if err != nil {
+			writeSentryHTTPError(w, r, sanitizeYouTubeCapturedError(err), "internal server error", http.StatusInternalServerError, "youtube", "cookies.upload")
+			return
+		}
+		writeJSON(w, http.StatusCreated, status)
 	})
 }
 
 func youtubeCookiesDeleteHandler(store *youtubeCookieStore) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := store.Delete(); err != nil {
-			http.Error(w, "failed to delete youtube cookies", http.StatusInternalServerError)
+			writeSentryHTTPError(w, r, sanitizeYouTubeCapturedError(err), "internal server error", http.StatusInternalServerError, "youtube", "cookies.delete")
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -1705,7 +2973,7 @@ func youtubeStartImportHandler(service *youtubeImportService) http.Handler {
 
 		var req youtubeStartImportRequest
 		if err := decodeJSON(r, &req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 		session, err := service.StartSession(
@@ -1717,7 +2985,7 @@ func youtubeStartImportHandler(service *youtubeImportService) http.Handler {
 			req.YouTubeCookies,
 		)
 		if err != nil {
-			writeYouTubeImportError(w, err)
+			writeYouTubeImportError(w, r, err, "import.start")
 			return
 		}
 		writeJSON(w, http.StatusCreated, session)
@@ -1733,7 +3001,7 @@ func youtubeCurrentImportHandler(service *youtubeImportService) http.Handler {
 		}
 		session, err := service.CurrentSession(userID)
 		if err != nil {
-			writeYouTubeImportError(w, err)
+			writeYouTubeImportError(w, r, err, "import.current")
 			return
 		}
 		writeJSON(w, http.StatusOK, session)
@@ -1747,9 +3015,9 @@ func youtubeSkipImportHandler(service *youtubeImportService) http.Handler {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
-		session, err := service.SkipCurrent(userID)
+		session, err := service.skipCurrent(r.Context(), userID)
 		if err != nil {
-			writeYouTubeImportError(w, err)
+			writeYouTubeImportError(w, r, err, "import.skip")
 			return
 		}
 		writeJSON(w, http.StatusOK, session)
@@ -1765,12 +3033,12 @@ func youtubeAddImportHandler(service *youtubeImportService) http.Handler {
 		}
 		var req youtubeAddCurrentRequest
 		if err := decodeJSON(r, &req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 		session, trackItem, err := service.AddCurrent(r.Context(), userID, req)
 		if err != nil {
-			writeYouTubeImportError(w, err)
+			writeYouTubeImportError(w, r, err, "import.add")
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -1787,29 +3055,52 @@ func youtubeCancelImportHandler(service *youtubeImportService) http.Handler {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
-		if err := service.CancelSession(userID); err != nil {
-			writeYouTubeImportError(w, err)
+		if err := service.cancelSession(r.Context(), userID); err != nil {
+			writeYouTubeImportError(w, r, err, "import.cancel")
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 }
 
-func writeYouTubeImportError(w http.ResponseWriter, err error) {
+func writeYouTubeImportError(w http.ResponseWriter, r *http.Request, err error, operation string) {
+	captureErr := sanitizeYouTubeCapturedError(err)
+	if hasYouTubeCleanupError(err) {
+		captureSentryError(r.Context(), captureErr, "youtube", operation)
+	}
 	switch {
-	case errors.Is(err, errYouTubeInvalidURL), errors.Is(err, errYouTubeNoTracks), errors.Is(err, errYouTubeUnsupportedMode):
-		http.Error(w, err.Error(), http.StatusBadRequest)
-	case errors.Is(err, errYouTubeSessionActive), errors.Is(err, errYouTubeCurrentConflict):
+	case errors.Is(err, context.Canceled):
+		http.Error(w, "request canceled", http.StatusRequestTimeout)
+	case errors.Is(err, errYouTubeShuttingDown):
+		markSentryErrorHandled(r.Context())
+		http.Error(w, errYouTubeShuttingDown.Error(), http.StatusServiceUnavailable)
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, errYouTubeUpstreamTimeout):
+		writeSentryHTTPError(w, r, captureErr, "youtube request timed out", http.StatusGatewayTimeout, "youtube", operation)
+	case errors.Is(err, errYouTubeDependency):
+		writeSentryHTTPError(w, r, captureErr, "internal server error", http.StatusInternalServerError, "youtube", operation)
+	case errors.Is(err, errYouTubeStorageFailed):
+		writeSentryHTTPError(w, r, captureErr, "internal server error", http.StatusInternalServerError, "youtube", operation)
+	case errors.Is(err, errYouTubeUpstreamFailed):
+		writeSentryHTTPError(w, r, captureErr, "youtube is temporarily unavailable", http.StatusBadGateway, "youtube", operation)
+	case errors.Is(err, errYouTubeAudioTooLarge), errors.Is(err, errYouTubeCookiesTooLarge):
+		http.Error(w, "youtube import exceeds the maximum allowed size", http.StatusRequestEntityTooLarge)
+	case errors.Is(err, errYouTubeDownloadFailed):
+		writeSentryHTTPError(w, r, captureErr, errYouTubeDownloadFailed.Error(), http.StatusBadGateway, "youtube", operation)
+	case errors.Is(err, errYouTubeTranscodeFailed):
+		writeSentryHTTPError(w, r, captureErr, errYouTubeTranscodeFailed.Error(), http.StatusInternalServerError, "youtube", operation)
+	case errors.Is(err, errYouTubeInvalidURL):
+		http.Error(w, errYouTubeInvalidURL.Error(), http.StatusBadRequest)
+	case errors.Is(err, errYouTubeNoTracks):
+		http.Error(w, errYouTubeNoTracks.Error(), http.StatusBadRequest)
+	case errors.Is(err, errYouTubeUnsupportedMode):
+		http.Error(w, errYouTubeUnsupportedMode.Error(), http.StatusBadRequest)
+	case errors.Is(err, errYouTubeSessionActive), errors.Is(err, errYouTubeCurrentConflict), errors.Is(err, errYouTubeSessionChanged):
 		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.Is(err, errYouTubeSessionNotFound), errors.Is(err, errTrackNotFound), errors.Is(err, errYouTubeCurrentNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
 	case errors.Is(err, errInvalidTrack):
 		http.Error(w, err.Error(), http.StatusBadRequest)
-	case errors.Is(err, errYouTubeDownloadFailed):
-		http.Error(w, errYouTubeDownloadFailed.Error(), http.StatusInternalServerError)
-	case errors.Is(err, errYouTubeTranscodeFailed):
-		http.Error(w, errYouTubeTranscodeFailed.Error(), http.StatusInternalServerError)
 	default:
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeSentryHTTPError(w, r, captureErr, "internal server error", http.StatusInternalServerError, "youtube", operation)
 	}
 }

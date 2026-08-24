@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/getsentry/sentry-go"
 )
 
 const (
@@ -175,7 +177,7 @@ func newLRCLIBProvider(baseURL string, httpClient *http.Client) *lrclibProvider 
 func (p *lrclibProvider) Search(ctx context.Context, req lyricsSearchRequest) ([]lyricsProviderRecord, error) {
 	endpoint, err := url.Parse(p.baseURL + "/api/search")
 	if err != nil {
-		return nil, fmt.Errorf("%w: invalid LRCLIB base URL", errLyricsProvider)
+		return nil, fmt.Errorf("%w: invalid LRCLIB base URL: %w", errLyricsProvider, lyricsProviderURLCause(err))
 	}
 	query := endpoint.Query()
 	query.Set("track_name", req.TrackName)
@@ -187,18 +189,24 @@ func (p *lrclibProvider) Search(ctx context.Context, req lyricsSearchRequest) ([
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("%w: build LRCLIB request: %v", errLyricsProvider, err)
+		return nil, fmt.Errorf("%w: build LRCLIB request: %w", errLyricsProvider, lyricsProviderURLCause(err))
 	}
 	httpReq.Header.Set("User-Agent", p.userAgent)
 
+	httpReq, span := withLyricsProviderSpan(httpReq, "lrclib", "GET lrclib.search")
 	resp, err := p.httpClient.Do(httpReq)
+	defer finishLyricsProviderSpan(span, resp, err)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || isNetworkTimeout(err) {
-			log.Printf("LRCLIB search timed out: %v", err)
-			return nil, fmt.Errorf("%w: %v", errLyricsProviderTimeout, err)
+		cause := lyricsProviderURLCause(err)
+		if errors.Is(cause, context.Canceled) {
+			return nil, fmt.Errorf("%w: LRCLIB request canceled: %w", errLyricsProvider, cause)
 		}
-		log.Printf("LRCLIB search request failed: %v", err)
-		return nil, fmt.Errorf("%w: %v", errLyricsProvider, err)
+		if errors.Is(cause, context.DeadlineExceeded) || isNetworkTimeout(cause) {
+			log.Printf("LRCLIB search timed out: %s", safeOperationalError(cause))
+			return nil, fmt.Errorf("%w: %w", errLyricsProviderTimeout, cause)
+		}
+		log.Printf("LRCLIB search request failed: %s", safeOperationalError(cause))
+		return nil, fmt.Errorf("%w: LRCLIB request failed: %w", errLyricsProvider, cause)
 	}
 	defer resp.Body.Close()
 
@@ -209,20 +217,32 @@ func (p *lrclibProvider) Search(ctx context.Context, req lyricsSearchRequest) ([
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxLRCLIBResponseSize+1))
 	if err != nil {
-		log.Printf("failed to read LRCLIB search response: %v", err)
-		return nil, fmt.Errorf("%w: read LRCLIB response", errLyricsProvider)
+		if span != nil {
+			span.Status = sentry.SpanStatusDataLoss
+		}
+		log.Printf("failed to read LRCLIB search response: %s", safeOperationalError(err))
+		return nil, fmt.Errorf("%w: read LRCLIB response: %w", errLyricsProvider, err)
 	}
 	if len(body) > maxLRCLIBResponseSize {
+		if span != nil {
+			span.Status = sentry.SpanStatusResourceExhausted
+		}
 		log.Printf("LRCLIB search response exceeded %d bytes", maxLRCLIBResponseSize)
 		return nil, fmt.Errorf("%w: LRCLIB response too large", errLyricsProvider)
 	}
 
 	var transportRecords []lrclibSearchRecord
 	if err := json.Unmarshal(body, &transportRecords); err != nil {
-		log.Printf("failed to decode LRCLIB search response: %v", err)
-		return nil, fmt.Errorf("%w: invalid LRCLIB JSON", errLyricsProvider)
+		if span != nil {
+			span.Status = sentry.SpanStatusDataLoss
+		}
+		log.Printf("failed to decode LRCLIB search response: %s", safeOperationalError(err))
+		return nil, fmt.Errorf("%w: invalid LRCLIB JSON: %w", errLyricsProvider, err)
 	}
 	if transportRecords == nil {
+		if span != nil {
+			span.Status = sentry.SpanStatusDataLoss
+		}
 		log.Printf("failed to decode LRCLIB search response: expected a JSON array")
 		return nil, fmt.Errorf("%w: invalid LRCLIB response shape", errLyricsProvider)
 	}
@@ -266,16 +286,20 @@ func lyricsSearchHandler(store *trackStore, service *lyricsSearchService) http.H
 
 		req, err := decodeLyricsSearchRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 		items, err := service.Search(r.Context(), req)
 		if err != nil {
-			if errors.Is(err, errLyricsProviderTimeout) {
-				http.Error(w, "lyrics provider timed out", http.StatusGatewayTimeout)
-				return
+			switch {
+			case errors.Is(err, context.Canceled):
+				markSentryErrorHandled(r.Context())
+				http.Error(w, "request canceled", http.StatusRequestTimeout)
+			case errors.Is(err, errLyricsProviderTimeout):
+				writeSentryHTTPError(w, r, err, "lyrics provider timed out", http.StatusGatewayTimeout, "lrclib", "search_lyrics")
+			default:
+				writeSentryHTTPError(w, r, err, "lyrics provider request failed", http.StatusBadGateway, "lrclib", "search_lyrics")
 			}
-			http.Error(w, "lyrics provider request failed", http.StatusBadGateway)
 			return
 		}
 		writeJSON(w, http.StatusOK, lyricsSearchResponse{Items: items})
@@ -334,7 +358,7 @@ func mapLyricsProviderRecord(record lyricsProviderRecord) (lyricsSearchCandidate
 		if err == nil {
 			syncedLines = parsed
 		} else {
-			log.Printf("LRCLIB record %d contains unusable synced lyrics: %v", record.ID, err)
+			log.Printf("LRCLIB result contains unusable synced lyrics: %s", safeOperationalError(err))
 		}
 	}
 	if plainText == nil && len(syncedLines) == 0 && !record.Instrumental {
@@ -353,6 +377,45 @@ func mapLyricsProviderRecord(record lyricsProviderRecord) (lyricsSearchCandidate
 		PlainText:    plainText,
 		SyncedLines:  syncedLines,
 	}, true
+}
+
+func withLyricsProviderSpan(req *http.Request, component, description string) (*http.Request, *sentry.Span) {
+	parent := sentry.SpanFromContext(req.Context())
+	if parent == nil {
+		return req, nil
+	}
+	span := parent.StartChild("http.client", sentry.WithDescription(description))
+	span.SetTag("component", component)
+	return req.WithContext(span.Context()), span
+}
+
+func finishLyricsProviderSpan(span *sentry.Span, resp *http.Response, err error) {
+	if span == nil {
+		return
+	}
+	if span.Status == sentry.SpanStatusUndefined {
+		switch {
+		case errors.Is(err, context.Canceled):
+			span.Status = sentry.SpanStatusCanceled
+		case errors.Is(err, context.DeadlineExceeded):
+			span.Status = sentry.SpanStatusDeadlineExceeded
+		case err != nil:
+			span.Status = sentry.SpanStatusInternalError
+		case resp != nil:
+			span.Status = sentry.HTTPtoSpanStatus(resp.StatusCode)
+		default:
+			span.Status = sentry.SpanStatusUnknown
+		}
+	}
+	span.Finish()
+}
+
+func lyricsProviderURLCause(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err
+	}
+	return err
 }
 
 func usableLyricsText(value *string) *string {

@@ -181,8 +181,14 @@ func TestYouTubeImportAddCurrentCreateDownloadsAndCreatesTrack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDir(%s) error = %v", songsDir, err)
 	}
-	if len(files) != 1 {
-		t.Fatalf("songs files = %#v", files)
+	regularFiles := 0
+	for _, file := range files {
+		if !file.IsDir() {
+			regularFiles++
+		}
+	}
+	if regularFiles != 1 {
+		t.Fatalf("regular songs files = %d entries=%#v, want 1", regularFiles, files)
 	}
 }
 
@@ -437,6 +443,41 @@ func TestYouTubeCookiesUploadHandlerStoresFile(t *testing.T) {
 	}
 }
 
+func TestYouTubeCookiesUploadHandlerRejectsOversizedFile(t *testing.T) {
+	root := t.TempDir()
+	configuredPath := filepath.Join(root, "youtube-cookies.txt")
+	store := newYouTubeCookieStore(configuredPath)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	fileWriter, err := writer.CreateFormFile("file", "cookies.txt")
+	if err != nil {
+		t.Fatalf("CreateFormFile() error = %v", err)
+	}
+	if _, err := fileWriter.Write(make([]byte, maxYouTubeCookiesBytes+1)); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/youtube/cookies", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+
+	youtubeCookiesUploadHandler(store).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusRequestEntityTooLarge, rec.Body.String())
+	}
+	if _, err := os.Stat(configuredPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("configured cookies stat error = %v, want no oversized file", err)
+	}
+	if _, err := os.Stat(configuredPath + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary cookies stat error = %v, want cleanup", err)
+	}
+}
+
 func TestLiveYouTubeImportGatewayDownloadAudioUsesYTDLPWhenCookiesPresent(t *testing.T) {
 	root := t.TempDir()
 	cookiesPath := filepath.Join(root, "youtube-cookies.txt")
@@ -445,7 +486,7 @@ func TestLiveYouTubeImportGatewayDownloadAudioUsesYTDLPWhenCookiesPresent(t *tes
 	}
 
 	binaryPath := filepath.Join(root, "fake-yt-dlp.sh")
-	script := "#!/bin/sh\nOUT=\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then\n    shift\n    OUT=\"$1\"\n  fi\n  shift\ndone\nprintf 'audio' > \"$OUT\"\n"
+	script := "#!/bin/sh\nprintf 'audio'\n"
 	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(%s) error = %v", binaryPath, err)
 	}
@@ -526,7 +567,7 @@ func TestLiveYouTubeImportGatewayScanArtistUsesYTDLPDump(t *testing.T) {
 		YTDLPBinary:    binaryPath,
 	}, newYouTubeCookieStore(""))
 
-	items, err := gateway.scanArtist(context.Background(), "https://music.youtube.com/channel/example", nil, "")
+	items, err := gateway.scanArtist(context.Background(), gateway.newClient(), "https://music.youtube.com/channel/example", nil, "")
 	if err != nil {
 		t.Fatalf("scanArtist() error = %v", err)
 	}

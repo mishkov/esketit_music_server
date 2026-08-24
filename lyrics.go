@@ -58,7 +58,7 @@ func getTrackLyricsHandler(store *trackStore) http.HandlerFunc {
 			case errors.Is(err, errTrackNotFound), errors.Is(err, errLyricsNotFound):
 				http.NotFound(w, r)
 			default:
-				http.Error(w, "failed to fetch lyrics", http.StatusInternalServerError)
+				writeSentryHTTPError(w, r, err, "failed to fetch lyrics", http.StatusInternalServerError, "lyrics", "fetch")
 			}
 			return
 		}
@@ -77,7 +77,7 @@ func putTrackLyricsHandler(store *trackStore) http.HandlerFunc {
 
 		req, err := decodeUpsertLyricsRequest(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRequestDecodeError(w, err)
 			return
 		}
 
@@ -89,7 +89,7 @@ func putTrackLyricsHandler(store *trackStore) http.HandlerFunc {
 			case errors.Is(err, errInvalidLyricsPayload):
 				http.Error(w, err.Error(), http.StatusBadRequest)
 			default:
-				http.Error(w, "failed to save lyrics", http.StatusInternalServerError)
+				writeSentryHTTPError(w, r, err, "failed to save lyrics", http.StatusInternalServerError, "lyrics", "save")
 			}
 			return
 		}
@@ -115,7 +115,7 @@ func deleteTrackLyricsHandler(store *trackStore) http.HandlerFunc {
 			case errors.Is(err, errTrackNotFound), errors.Is(err, errLyricsNotFound):
 				http.NotFound(w, r)
 			default:
-				http.Error(w, "failed to delete lyrics", http.StatusInternalServerError)
+				writeSentryHTTPError(w, r, err, "failed to delete lyrics", http.StatusInternalServerError, "lyrics", "delete")
 			}
 			return
 		}
@@ -205,7 +205,7 @@ func (s *trackStore) upsertLyrics(trackID int64, req upsertLyricsRequest) (lyric
 		s.lyricsByTrack = snapshot
 		s.nextLyricsID = nextLyricsIDSnapshot
 		s.nextLyricsLineID = nextLyricsLineIDSnapshot
-		return lyrics{}, false, err
+		return lyrics{}, false, fmt.Errorf("persist lyrics: %w", err)
 	}
 
 	return cloneLyrics(item), !hadPrevious, nil
@@ -218,8 +218,7 @@ func (s *trackStore) deleteLyrics(trackID int64) error {
 	if _, ok := s.tracks[trackID]; !ok {
 		return errTrackNotFound
 	}
-	item, ok := s.lyricsByTrack[trackID]
-	if !ok {
+	if _, ok := s.lyricsByTrack[trackID]; !ok {
 		return errLyricsNotFound
 	}
 
@@ -227,10 +226,9 @@ func (s *trackStore) deleteLyrics(trackID int64) error {
 	delete(s.lyricsByTrack, trackID)
 	if err := s.persistLocked(); err != nil {
 		s.lyricsByTrack = snapshot
-		return err
+		return fmt.Errorf("persist lyrics deletion: %w", err)
 	}
 
-	_ = item
 	return nil
 }
 
