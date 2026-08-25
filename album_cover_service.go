@@ -82,6 +82,7 @@ type albumCoverSuggestion struct {
 	Width         int    `json:"width"`
 	Height        int    `json:"height"`
 	SourcePageURL string `json:"sourcePageUrl"`
+	Source        string `json:"source,omitempty"`
 }
 
 type albumCoverSuggestionsResponse struct {
@@ -132,64 +133,13 @@ type albumCoverService struct {
 }
 
 func newAlbumCoverServiceFromEnv(albumCoversDir string) *albumCoverService {
+	searchProvider, searchUnavailableMessage := loadAlbumCoverSearchConfigurationFromEnv()
 	return &albumCoverService{
 		albumCoversDir:           albumCoversDir,
-		searchProvider:           loadAlbumCoverSearchProviderFromEnv(),
-		searchUnavailableMessage: loadAlbumCoverSearchUnavailableMessage(),
+		searchProvider:           searchProvider,
+		searchUnavailableMessage: searchUnavailableMessage,
 		remoteFetcher:            newSSRFProtectedRemoteImageFetcher(maxAlbumCoverImportSizeBytes, albumCoverImportTimeout),
 	}
-}
-
-func loadAlbumCoverSearchProviderFromEnv() albumCoverSearchProvider {
-	provider := strings.TrimSpace(os.Getenv("ALBUM_COVER_SEARCH_PROVIDER"))
-	spotifyClientID := strings.TrimSpace(os.Getenv("SPOTIFY_CLIENT_ID"))
-	spotifyClientSecret := strings.TrimSpace(os.Getenv("SPOTIFY_CLIENT_SECRET"))
-	if provider == "" && spotifyClientID != "" && spotifyClientSecret != "" {
-		provider = "spotify"
-	}
-
-	switch strings.ToLower(provider) {
-	case "spotify":
-		if spotifyClientID == "" || spotifyClientSecret == "" {
-			return nil
-		}
-		apiBaseURL := strings.TrimSpace(os.Getenv("SPOTIFY_API_BASE_URL"))
-		if apiBaseURL == "" {
-			apiBaseURL = "https://api.spotify.com/v1"
-		}
-		tokenURL := strings.TrimSpace(os.Getenv("SPOTIFY_TOKEN_URL"))
-		if tokenURL == "" {
-			tokenURL = "https://accounts.spotify.com/api/token"
-		}
-		return &spotifyAlbumCoverSearchProvider{
-			clientID:     spotifyClientID,
-			clientSecret: spotifyClientSecret,
-			apiBaseURL:   apiBaseURL,
-			tokenURL:     tokenURL,
-			client: &http.Client{
-				Timeout: albumCoverSearchTimeout,
-			},
-		}
-	default:
-		return nil
-	}
-}
-
-func loadAlbumCoverSearchUnavailableMessage() string {
-	provider := strings.TrimSpace(os.Getenv("ALBUM_COVER_SEARCH_PROVIDER"))
-	if provider == "" && strings.TrimSpace(os.Getenv("SPOTIFY_CLIENT_ID")) != "" && strings.TrimSpace(os.Getenv("SPOTIFY_CLIENT_SECRET")) != "" {
-		provider = "spotify"
-	}
-	if provider == "" {
-		return "album cover suggestions are unavailable: set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET"
-	}
-	if !strings.EqualFold(provider, "spotify") {
-		return fmt.Sprintf("album cover suggestions are unavailable: unsupported provider %q", provider)
-	}
-	if strings.TrimSpace(os.Getenv("SPOTIFY_CLIENT_ID")) == "" || strings.TrimSpace(os.Getenv("SPOTIFY_CLIENT_SECRET")) == "" {
-		return "album cover suggestions are unavailable: SPOTIFY_CLIENT_ID or SPOTIFY_CLIENT_SECRET is not configured"
-	}
-	return errAlbumCoverSuggestionsUnavailable.Error()
 }
 
 type spotifyAlbumCoverSearchProvider struct {
@@ -775,7 +725,7 @@ func albumCoverSuggestionsHandler(service *albumCoverService) http.HandlerFunc {
 				http.Error(w, err.Error(), http.StatusNotImplemented)
 				return
 			}
-			if errors.Is(err, context.Canceled) {
+			if errors.Is(r.Context().Err(), context.Canceled) || albumCoverSearchFailuresOnlyMatch(err, context.Canceled) {
 				markSentryErrorHandled(r.Context())
 				http.Error(w, "request canceled", http.StatusRequestTimeout)
 				return
@@ -783,11 +733,11 @@ func albumCoverSuggestionsHandler(service *albumCoverService) http.HandlerFunc {
 			log.Printf("album cover suggestions failed: %s", safeOperationalError(err))
 			status := http.StatusBadGateway
 			message := "failed to fetch album cover suggestions"
-			if errors.Is(err, context.DeadlineExceeded) {
+			if albumCoverSearchFailuresOnlyMatch(err, context.DeadlineExceeded) {
 				status = http.StatusGatewayTimeout
 				message = "album cover provider timed out"
 			}
-			writeSentryHTTPError(w, r, err, message, status, "spotify", "search_album_covers")
+			writeSentryHTTPError(w, r, err, message, status, "album_cover_search", "search_album_covers")
 			return
 		}
 

@@ -335,7 +335,10 @@ paths:
       summary: Search album cover suggestions
       description: |
         Search for remotely hosted album cover candidates using the configured image-search
-        provider. Returns only results with image URLs and positive dimensions.
+        providers. When multiple providers are enabled, `limit` caps the combined response,
+        not each provider's contribution. If one provider fails, suggestions from another
+        successful provider are still returned. Items may identify their provider through the
+        optional `source` field. Returns only results with image URLs and positive dimensions.
       security:
         - bearerAuth: []
       parameters:
@@ -356,7 +359,9 @@ paths:
             default: 20
       responses:
         '200':
-          description: Album cover suggestions
+          description: |
+            Album cover suggestions. This response can contain results from only a subset of
+            the configured providers when another provider fails.
           content:
             application/json:
               schema:
@@ -368,13 +373,19 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
         '501':
-          description: Search provider is not configured
+          description: No usable search provider is configured
           content:
             text/plain:
               schema:
                 $ref: '#/components/schemas/PlainError'
         '502':
-          description: Search provider request failed
+          description: All configured search providers failed
+          content:
+            text/plain:
+              schema:
+                $ref: '#/components/schemas/PlainError'
+        '504':
+          description: All configured search providers timed out
           content:
             text/plain:
               schema:
@@ -2277,6 +2288,10 @@ components:
         sourcePageUrl:
           type: string
           format: uri
+        source:
+          type: string
+          description: Identifier of the provider that returned this candidate, when available.
+          example: deezer
       required: [thumbnailUrl, imageUrl, width, height, sourcePageUrl]
 
     AlbumCoverImportRequest:
