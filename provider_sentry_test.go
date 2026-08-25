@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -78,9 +79,114 @@ func TestAlbumCoverSuggestionsSentryClassification(t *testing.T) {
 				t.Fatalf("captured events = %d, want %d", len(events), test.wantEvents)
 			}
 			if test.wantEvents == 1 {
-				assertProviderSentryEvent(t, events[0], "spotify", test.wantOperation, test.wantStatus)
+				assertProviderSentryEvent(t, events[0], "album_cover_search", test.wantOperation, test.wantStatus)
 				if strings.Contains(rec.Body.String(), test.err.Error()) {
 					t.Fatalf("response exposed provider error: %q", rec.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestAlbumCoverSuggestionsAggregateSentryClassification(t *testing.T) {
+	tests := []struct {
+		name          string
+		spotifyItems  []albumCoverSuggestion
+		spotifyErr    error
+		deezerItems   []albumCoverSuggestion
+		deezerErr     error
+		wantStatus    int
+		wantEvents    int
+		wantSource    string
+		wantOperation string
+	}{
+		{
+			name:          "partial provider failure returns successful fallback",
+			spotifyErr:    errors.New("spotify transport failed"),
+			deezerItems:   albumCoverSuggestionsForTest("deezer", 1),
+			wantStatus:    http.StatusOK,
+			wantSource:    "deezer",
+			wantOperation: "search_album_covers",
+		},
+		{
+			name:          "all ordinary failures are captured once",
+			spotifyErr:    errors.New("spotify transport failed"),
+			deezerErr:     errors.New("deezer transport failed"),
+			wantStatus:    http.StatusBadGateway,
+			wantEvents:    1,
+			wantOperation: "search_album_covers",
+		},
+		{
+			name:          "all deadline failures are captured as timeout",
+			spotifyErr:    fmt.Errorf("spotify timeout: %w", context.DeadlineExceeded),
+			deezerErr:     fmt.Errorf("deezer timeout: %w", context.DeadlineExceeded),
+			wantStatus:    http.StatusGatewayTimeout,
+			wantEvents:    1,
+			wantOperation: "search_album_covers",
+		},
+		{
+			name:          "mixed deadline and ordinary failures are bad gateway",
+			spotifyErr:    fmt.Errorf("spotify timeout: %w", context.DeadlineExceeded),
+			deezerErr:     errors.New("deezer transport failed"),
+			wantStatus:    http.StatusBadGateway,
+			wantEvents:    1,
+			wantOperation: "search_album_covers",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &albumCoverService{
+				searchProvider: newMultiAlbumCoverSearchProvider([]albumCoverSearchSource{
+					{
+						name: "spotify",
+						provider: albumCoverSearchProviderFunc(func(context.Context, string, int) ([]albumCoverSuggestion, error) {
+							return test.spotifyItems, test.spotifyErr
+						}),
+					},
+					{
+						name: "deezer",
+						provider: albumCoverSearchProviderFunc(func(context.Context, string, int) ([]albumCoverSuggestion, error) {
+							return test.deezerItems, test.deezerErr
+						}),
+					},
+				}),
+			}
+
+			rec, transport := serveProviderSentryRequest(
+				t,
+				albumCoverSuggestionsHandler(service),
+				http.MethodGet,
+				"/api/album-covers/suggestions?query=cover",
+				nil,
+			)
+
+			if rec.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, test.wantStatus, rec.Body.String())
+			}
+			events := transport.Events()
+			if len(events) != test.wantEvents {
+				t.Fatalf("captured events = %d, want %d", len(events), test.wantEvents)
+			}
+			if test.wantEvents == 1 {
+				assertProviderSentryEvent(t, events[0], "album_cover_search", test.wantOperation, test.wantStatus)
+				for _, providerErr := range []error{test.spotifyErr, test.deezerErr} {
+					if providerErr != nil && strings.Contains(rec.Body.String(), providerErr.Error()) {
+						t.Fatalf("response exposed provider error: %q", rec.Body.String())
+					}
+				}
+			}
+
+			if test.wantSource != "" {
+				var response albumCoverSuggestionsResponse
+				if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+					t.Fatalf("Decode() error = %v", err)
+				}
+				if len(response.Items) != 1 {
+					t.Fatalf("len(response.Items) = %d, want 1", len(response.Items))
+				}
+				if got := response.Items[0].Source; got != test.wantSource {
+					t.Fatalf("response.Items[0].Source = %q, want %q", got, test.wantSource)
 				}
 			}
 		})
