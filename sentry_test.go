@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"runtime/debug"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -205,6 +207,90 @@ func TestExplicitServerErrorIsCapturedOnlyOnce(t *testing.T) {
 	}
 	if got := events[0].Tags["operation"]; got != "tracks.list" {
 		t.Errorf("operation tag = %q, want tracks.list", got)
+	}
+}
+
+func TestUploadDiskFullErrorReturnsInsufficientStorageAndReportsToSentry(t *testing.T) {
+	hub, transport := newSentryTestHub(t)
+	handler := buildHTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeUploadError(w, r, uploadError{
+			message: "failed to save uploaded file",
+			cause: fmt.Errorf("copy uploaded media: %w", &os.PathError{
+				Op:   "write",
+				Path: "/private/media/secret.mp3",
+				Err:  syscall.ENOSPC,
+			}),
+		}, "songs.upload")
+	}), logModeErrorOnly, true)
+	req := httptest.NewRequest(http.MethodPost, "/api/songs", nil)
+	req = req.WithContext(sentry.SetHubOnContext(req.Context(), hub))
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if got, want := rec.Code, http.StatusInsufficientStorage; got != want {
+		t.Fatalf("status = %d, want %d; body=%s", got, want, rec.Body.String())
+	}
+	if got, want := rec.Body.String(), insufficientStoragePublicMessage+"\n"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+	events := transport.Events()
+	if len(events) != 1 {
+		t.Fatalf("captured events = %d, want 1", len(events))
+	}
+	if got, want := events[0].Tags["http.status_code"], "507"; got != want {
+		t.Errorf("http.status_code tag = %q, want %q", got, want)
+	}
+	if got, want := events[0].Tags["error.kind"], "insufficient_storage"; got != want {
+		t.Errorf("error.kind tag = %q, want %q", got, want)
+	}
+	if got, want := events[0].Tags["operation"], "songs.upload"; got != want {
+		t.Errorf("operation tag = %q, want %q", got, want)
+	}
+	if len(events[0].Exception) == 0 {
+		t.Fatal("captured exception is empty")
+	}
+	foundDiskFullCause := false
+	for _, exception := range events[0].Exception {
+		if strings.Contains(exception.Value, "no space left on device") {
+			foundDiskFullCause = true
+		}
+		if strings.Contains(exception.Value, "/private/media/secret.mp3") {
+			t.Errorf("captured exception leaked filesystem path: %q", exception.Value)
+		}
+	}
+	if !foundDiskFullCause {
+		t.Errorf("captured exception = %#v, want disk-full cause", events[0].Exception)
+	}
+}
+
+func TestIsInsufficientStorageErrorRecognizesSQLiteFull(t *testing.T) {
+	db, err := sql.Open("sqlite", t.TempDir()+"/full.sqlite")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("db.Close() error = %v", err)
+		}
+	})
+	if _, err := db.Exec(`CREATE TABLE payloads (payload BLOB NOT NULL)`); err != nil {
+		t.Fatalf("create table error = %v", err)
+	}
+	var pageCount int
+	if err := db.QueryRow(`PRAGMA page_count`).Scan(&pageCount); err != nil {
+		t.Fatalf("read page count error = %v", err)
+	}
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA max_page_count = %d`, pageCount)); err != nil {
+		t.Fatalf("set max page count error = %v", err)
+	}
+
+	_, fullErr := db.Exec(`INSERT INTO payloads (payload) VALUES (zeroblob(1048576))`)
+	if fullErr == nil {
+		t.Fatal("insert error = nil, want SQLITE_FULL")
+	}
+	if !isInsufficientStorageError(fmt.Errorf("persist database: %w", fullErr)) {
+		t.Fatalf("isInsufficientStorageError(%v) = false, want true", fullErr)
 	}
 }
 

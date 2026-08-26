@@ -16,13 +16,19 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/getsentry/sentry-go"
 	sentryhttp "github.com/getsentry/sentry-go/http"
+	"modernc.org/sqlite"
 )
 
-const sentryFlushTimeout = 2 * time.Second
+const (
+	sentryFlushTimeout               = 2 * time.Second
+	insufficientStoragePublicMessage = "server does not have enough storage space to complete the request"
+	sqliteFullResultCode             = 13
+)
 
 var (
 	sentryURLTextPattern         = regexp.MustCompile(`(?i)https?://[^\s"'<>]+`)
@@ -449,17 +455,36 @@ func writeSentryHTTPError(
 	component string,
 	operation string,
 ) {
+	tags := map[string]string{
+		"component":        component,
+		"operation":        operation,
+		"http.status_code": strconv.Itoa(status),
+	}
+	if isInsufficientStorageError(err) {
+		status = http.StatusInsufficientStorage
+		publicMessage = insufficientStoragePublicMessage
+		tags["http.status_code"] = strconv.Itoa(status)
+		tags["error.kind"] = "insufficient_storage"
+	}
 	if status >= http.StatusInternalServerError {
-		captureSentryErrorWithTags(r.Context(), err, map[string]string{
-			"component":        component,
-			"operation":        operation,
-			"http.status_code": strconv.Itoa(status),
-		})
+		captureSentryErrorWithTags(r.Context(), err, tags)
 	}
 	if publicMessage == "" {
 		publicMessage = http.StatusText(status)
 	}
 	http.Error(w, publicMessage, status)
+}
+
+func isInsufficientStorageError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT) {
+		return true
+	}
+
+	var sqliteErr *sqlite.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == sqliteFullResultCode
 }
 
 func writeSentryInternalError(
