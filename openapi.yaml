@@ -520,15 +520,32 @@ paths:
     get:
       tags: [Authors]
       summary: List authors
+      description: |
+        Returns every author. By default, authors are ordered by their total
+        listened time during the rolling 30-day window captured by the latest
+        nightly popularity snapshot. Authors with equal listened time are ordered
+        by ID ascending.
+      parameters:
+        - in: query
+          name: sort
+          schema:
+            type: string
+            enum: [popularity, id]
+            default: popularity
+          description: Use `popularity` for the cached 30-day ranking or `id` for ID ascending.
       responses:
         '200':
-          description: Author list sorted by ID asc
+          description: Complete author list in the requested order
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: '#/components/schemas/Author'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
     post:
       tags: [Authors]
       summary: Create author
