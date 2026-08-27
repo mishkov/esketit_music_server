@@ -708,6 +708,20 @@ func run() (runErr error) {
 		}
 	}()
 	store.songsDir = songsDir
+	authorPopularityLocation, err := loadAuthorPopularityLocationFromEnv()
+	if err != nil {
+		return err
+	}
+	popularAuthors, err := store.refreshAuthorPopularity(context.Background(), time.Now())
+	if err != nil {
+		return fmt.Errorf("initialize author popularity: %w", err)
+	}
+	log.Printf(
+		"author popularity initialized authors=%d window_days=%d timezone=%s",
+		len(popularAuthors),
+		int(authorPopularityWindow/(24*time.Hour)),
+		authorPopularityLocation,
+	)
 
 	auth := newAuthManager([]byte(authSecret), defaultAccessTokenTTL, defaultRefreshTokenTTL)
 	logMode := resolveLogMode(os.Getenv("LOG_MODE"))
@@ -817,6 +831,7 @@ func run() (runErr error) {
 	handler := buildHTTPHandler(mux, logMode, sentryEnabled)
 	shutdownContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
+	go runAuthorPopularityScheduler(shutdownContext, store, authorPopularityLocation)
 	server := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
@@ -1638,10 +1653,20 @@ func (s *trackStore) initSQLiteSchema() error {
 			platform TEXT NOT NULL,
 			app_version TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS author_popularity_snapshot (
+			author_id INTEGER PRIMARY KEY,
+			ranking_position INTEGER NOT NULL UNIQUE,
+			listened_ms INTEGER NOT NULL,
+			calculated_at TEXT NOT NULL,
+			window_started_at TEXT NOT NULL,
+			window_ended_at TEXT NOT NULL
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_analytics_events_user_received ON analytics_events (user_id, received_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_analytics_events_client_received ON analytics_events (client_id, received_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_analytics_events_type_received ON analytics_events (event_type, received_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_analytics_events_track_received ON analytics_events (track_id, received_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_analytics_events_client_session_time ON analytics_events (client_id, session_id, client_time, id)`,
+		`CREATE INDEX IF NOT EXISTS idx_analytics_events_client_time ON analytics_events (client_time)`,
 	}
 
 	for _, statement := range statements {
@@ -3162,18 +3187,56 @@ func (s *trackStore) reorderPlaylistTracks(userID, playlistID int64, trackIDs []
 	return true, nil
 }
 
-func (s *trackStore) listAuthors() []author {
+func (s *trackStore) listAuthors(filter authorListFilter) ([]author, error) {
+	var rankedAuthorIDs []int64
+	if filter.Sort == authorPopularitySort {
+		rows, err := s.db.Query(`SELECT author_id FROM author_popularity_snapshot ORDER BY ranking_position`)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var authorID int64
+			if err := rows.Scan(&authorID); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			rankedAuthorIDs = append(rankedAuthorIDs, authorID)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	items := make([]author, 0, len(s.authors))
-	for _, a := range s.authors {
-		items = append(items, a)
+	seen := make(map[int64]struct{}, len(rankedAuthorIDs))
+	for _, authorID := range rankedAuthorIDs {
+		authorItem, exists := s.authors[authorID]
+		if !exists {
+			continue
+		}
+		items = append(items, cloneAuthor(authorItem))
+		seen[authorID] = struct{}{}
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].ID < items[j].ID
+
+	unranked := make([]author, 0, len(s.authors)-len(items))
+	for authorID, authorItem := range s.authors {
+		if _, exists := seen[authorID]; exists {
+			continue
+		}
+		unranked = append(unranked, cloneAuthor(authorItem))
+	}
+	sort.Slice(unranked, func(i, j int) bool {
+		return unranked[i].ID < unranked[j].ID
 	})
-	return items
+	items = append(items, unranked...)
+	return items, nil
 }
 
 func (s *trackStore) search(userID int64, filter searchListFilter) paginatedSearchResults {
@@ -5318,7 +5381,17 @@ func analyticsEventsHandler(store *trackStore, auth *authManager) http.HandlerFu
 
 func listAuthorsHandler(store *trackStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, store.listAuthors())
+		filter, err := parseAuthorListFilter(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		items, err := store.listAuthors(filter)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to list authors", "database", "authors.list")
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
 	}
 }
 
@@ -7201,6 +7274,19 @@ func parsePlaylistListFilter(values url.Values) (playlistListFilter, error) {
 	}
 	if filter.Visibility != "" && normalizePlaylistVisibility(filter.Visibility) == "" {
 		return playlistListFilter{}, errors.New("visibility must be one of private, public, shared")
+	}
+	return filter, nil
+}
+
+func parseAuthorListFilter(values url.Values) (authorListFilter, error) {
+	filter := authorListFilter{Sort: authorPopularitySort}
+	if rawSort := strings.ToLower(strings.TrimSpace(values.Get("sort"))); rawSort != "" {
+		switch rawSort {
+		case authorPopularitySort, authorIDSort:
+			filter.Sort = rawSort
+		default:
+			return authorListFilter{}, errors.New("sort must be one of popularity, id")
+		}
 	}
 	return filter, nil
 }
