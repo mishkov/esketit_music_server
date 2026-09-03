@@ -673,10 +673,16 @@ func TestWriteYouTubeImportErrorMapsUpstreamFailures(t *testing.T) {
 		wantBody   string
 	}{
 		{
-			name:       "rate limited",
+			name:       "upstream rate limited",
 			err:        classifyYouTubeScanError(youtube.ErrUnexpectedStatusCode(http.StatusTooManyRequests)),
 			wantStatus: http.StatusBadGateway,
 			wantBody:   "youtube is temporarily unavailable\n",
+		},
+		{
+			name:       "classified yt-dlp rate limit",
+			err:        errYouTubeRateLimited,
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "youtube is rate limiting requests\n",
 		},
 		{
 			name:       "timeout",
@@ -706,6 +712,9 @@ func TestWriteYouTubeImportErrorMapsUpstreamFailures(t *testing.T) {
 			}
 			if rec.Body.String() != test.wantBody {
 				t.Fatalf("body = %q, want %q", rec.Body.String(), test.wantBody)
+			}
+			if test.wantStatus == http.StatusServiceUnavailable && rec.Header().Get("Retry-After") != "30" {
+				t.Fatalf("Retry-After = %q, want 30", rec.Header().Get("Retry-After"))
 			}
 			if events := transport.Events(); len(events) != 1 {
 				t.Fatalf("captured events = %d, want 1", len(events))
