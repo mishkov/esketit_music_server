@@ -683,6 +683,14 @@ func run() (runErr error) {
 	if ytdlpBinary == "" {
 		ytdlpBinary = "yt-dlp"
 	}
+	ytdlpJSRuntime := strings.TrimSpace(os.Getenv("YTDLP_JS_RUNTIME"))
+	if ytdlpJSRuntime == "" {
+		ytdlpJSRuntime = "deno"
+	}
+	ytdlpRemoteComponents := strings.TrimSpace(os.Getenv("YTDLP_REMOTE_COMPONENTS"))
+	if ytdlpRemoteComponents == "" {
+		ytdlpRemoteComponents = "ejs:github"
+	}
 	ffmpegBinary := strings.TrimSpace(os.Getenv("FFMPEG_BINARY"))
 	if ffmpegBinary == "" {
 		ffmpegBinary = "ffmpeg"
@@ -696,6 +704,20 @@ func run() (runErr error) {
 	authSecret := os.Getenv("AUTH_SECRET")
 	if len(authSecret) < 32 {
 		return errors.New("AUTH_SECRET must be set and contain at least 32 characters")
+	}
+	youtubeCookieStore := newYouTubeCookieStore(youtubeCookiesFile)
+	youtubeImportConfig := youtubeImportConfig{
+		ImportTempDir:         youtubeImportTempDir,
+		RequestTimeout:        2 * time.Minute,
+		DownloadTimeout:       15 * time.Minute,
+		YTDLPBinary:           ytdlpBinary,
+		YTDLPJSRuntime:        ytdlpJSRuntime,
+		YTDLPRemoteComponents: ytdlpRemoteComponents,
+		FFmpegBinary:          ffmpegBinary,
+	}
+	youtubeImportGateway := newLiveYouTubeImportGateway(youtubeImportConfig, youtubeCookieStore)
+	if err := youtubeImportGateway.ValidateDependencies(context.Background()); err != nil {
+		return fmt.Errorf("validate youtube import dependencies: %w", err)
 	}
 
 	store, err := newTrackStore(tracksDBPath)
@@ -738,15 +760,6 @@ func run() (runErr error) {
 			runErr = errors.Join(runErr, fmt.Errorf("close telegram import service: %w", err))
 		}
 	}()
-	youtubeCookieStore := newYouTubeCookieStore(youtubeCookiesFile)
-	youtubeImportConfig := youtubeImportConfig{
-		ImportTempDir:   youtubeImportTempDir,
-		RequestTimeout:  2 * time.Minute,
-		DownloadTimeout: 15 * time.Minute,
-		YTDLPBinary:     ytdlpBinary,
-		FFmpegBinary:    ffmpegBinary,
-	}
-	youtubeImportGateway := newLiveYouTubeImportGateway(youtubeImportConfig, youtubeCookieStore)
 	youtubeImport := newYouTubeImportService(youtubeImportConfig, youtubeImportGateway, store, songsDir)
 	defer func() {
 		if err := youtubeImport.Close(); err != nil {

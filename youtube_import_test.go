@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,75 @@ func (f *fakeYouTubeGateway) DownloadAudio(_ context.Context, _ youtubeImportIte
 		return err
 	}
 	return os.WriteFile(destinationPath, f.downloadData, 0o644)
+}
+
+type updatingYouTubeGateway struct {
+	fakeYouTubeGateway
+	updateErr error
+	calls     []string
+}
+
+func (g *updatingYouTubeGateway) UpdateDownloader(context.Context) error {
+	g.calls = append(g.calls, "update")
+	return g.updateErr
+}
+
+func (g *updatingYouTubeGateway) Scan(ctx context.Context, rawURL string, cutoff *time.Time, cookiesPath string) ([]youtubeImportItem, youtubeImportScanSource, error) {
+	g.calls = append(g.calls, "scan")
+	return g.fakeYouTubeGateway.Scan(ctx, rawURL, cutoff, cookiesPath)
+}
+
+func TestYouTubeImportStartUpdatesDownloaderBeforeScan(t *testing.T) {
+	gateway := &updatingYouTubeGateway{fakeYouTubeGateway: fakeYouTubeGateway{
+		scanSource: youtubeImportScanSource{
+			SourceType:   youtubeImportSourceTrack,
+			CanonicalURL: "https://www.youtube.com/watch?v=video-1",
+		},
+		scanItems: []youtubeImportItem{{
+			VideoID:           "video-1",
+			SourceURL:         "https://www.youtube.com/watch?v=video-1",
+			OriginalSourceURL: "https://www.youtube.com/watch?v=video-1",
+			LinkProvider:      "youtube",
+			ParsedTitle:       "Track",
+			ParsedAuthorNames: []string{"Artist"},
+		}},
+	}}
+	service, _, _, _ := newYouTubeImportTestService(t, gateway)
+
+	if _, err := service.StartSession(context.Background(), 1, gateway.scanItems[0].SourceURL, nil, false, ""); err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	if got := strings.Join(gateway.calls, ","); got != "update,scan" {
+		t.Fatalf("gateway calls = %q, want update,scan", got)
+	}
+}
+
+func TestYouTubeImportStartContinuesWhenDownloaderUpdateFails(t *testing.T) {
+	gateway := &updatingYouTubeGateway{
+		fakeYouTubeGateway: fakeYouTubeGateway{
+			scanSource: youtubeImportScanSource{
+				SourceType:   youtubeImportSourceTrack,
+				CanonicalURL: "https://www.youtube.com/watch?v=video-1",
+			},
+			scanItems: []youtubeImportItem{{
+				VideoID:           "video-1",
+				SourceURL:         "https://www.youtube.com/watch?v=video-1",
+				OriginalSourceURL: "https://www.youtube.com/watch?v=video-1",
+				LinkProvider:      "youtube",
+				ParsedTitle:       "Track",
+				ParsedAuthorNames: []string{"Artist"},
+			}},
+		},
+		updateErr: errors.New("self-update is unavailable"),
+	}
+	service, _, _, _ := newYouTubeImportTestService(t, gateway)
+
+	if _, err := service.StartSession(context.Background(), 1, gateway.scanItems[0].SourceURL, nil, false, ""); err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	if got := strings.Join(gateway.calls, ","); got != "update,scan" {
+		t.Fatalf("gateway calls = %q, want update,scan", got)
+	}
 }
 
 func TestYouTubeImportSessionConflictAndSkip(t *testing.T) {
@@ -514,6 +584,193 @@ func TestLiveYouTubeImportGatewayDownloadAudioUsesYTDLPWhenCookiesPresent(t *tes
 	}
 	if string(data) != "audio" {
 		t.Fatalf("downloaded data = %q, want audio", string(data))
+	}
+}
+
+func TestLiveYouTubeImportGatewayUpdatesYTDLP(t *testing.T) {
+	root := t.TempDir()
+	argsPath := filepath.Join(root, "args.txt")
+	binaryPath := filepath.Join(root, "fake-yt-dlp.sh")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + argsPath + "'\n"
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", binaryPath, err)
+	}
+
+	gateway := newLiveYouTubeImportGateway(youtubeImportConfig{
+		RequestTimeout: time.Second,
+		YTDLPBinary:    binaryPath,
+	}, newYouTubeCookieStore(""))
+	if err := gateway.UpdateDownloader(context.Background()); err != nil {
+		t.Fatalf("UpdateDownloader() error = %v", err)
+	}
+
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", argsPath, err)
+	}
+	if got := strings.Fields(string(args)); !slices.Equal(got, []string{"--ignore-config", "--update"}) {
+		t.Fatalf("yt-dlp update args = %#v, want deterministic update flags", got)
+	}
+}
+
+func TestLiveYouTubeImportGatewayDownloadFallsBackToYTDLPWithoutCookies(t *testing.T) {
+	root := t.TempDir()
+	argsPath := filepath.Join(root, "args.txt")
+	binaryPath := filepath.Join(root, "fake-yt-dlp.sh")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + argsPath + "'\nprintf 'fallback-audio'\n"
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", binaryPath, err)
+	}
+
+	gateway := newLiveYouTubeImportGateway(youtubeImportConfig{
+		DownloadTimeout: time.Second,
+		YTDLPBinary:     binaryPath,
+	}, newYouTubeCookieStore(""))
+	gateway.httpClient = &http.Client{Transport: youtubeRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("native client unavailable")
+	})}
+	targetPath := filepath.Join(root, "downloaded-audio.bin")
+	err := gateway.DownloadAudio(context.Background(), youtubeImportItem{
+		VideoID:      "video-1",
+		SourceURL:    "https://www.youtube.com/watch?v=video-1",
+		LinkProvider: "youtube",
+	}, targetPath, "")
+	if err != nil {
+		t.Fatalf("DownloadAudio() error = %v", err)
+	}
+	data, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", targetPath, err)
+	}
+	if string(data) != "fallback-audio" {
+		t.Fatalf("downloaded data = %q, want fallback-audio", data)
+	}
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", argsPath, err)
+	}
+	args := strings.Fields(string(argsData))
+	if !containsString(args, "--ignore-config") || containsString(args, "--cookies") {
+		t.Fatalf("yt-dlp fallback args = %#v, want deterministic cookie-free invocation", args)
+	}
+}
+
+func TestLiveYouTubeImportGatewayPlaylistFallsBackToYTDLP(t *testing.T) {
+	root := t.TempDir()
+	argsPath := filepath.Join(root, "args.txt")
+	binaryPath := filepath.Join(root, "fake-yt-dlp.sh")
+	dumpJSON := `{"title":"Fallback Playlist","channel":"Artist","entries":[{"id":"video-1","title":"Fallback Track","channel":"Artist","duration":180,"timestamp":1714079251}]}`
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + argsPath + "'\ncat <<'EOF'\n" + dumpJSON + "\nEOF\n"
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", binaryPath, err)
+	}
+
+	gateway := newLiveYouTubeImportGateway(youtubeImportConfig{
+		RequestTimeout: time.Second,
+		YTDLPBinary:    binaryPath,
+	}, newYouTubeCookieStore(""))
+	gateway.httpClient = &http.Client{Transport: youtubeRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("native playlist scan unavailable")
+	})}
+	items, source, err := gateway.Scan(context.Background(), "https://www.youtube.com/playlist?list=PL1234567890", nil, "")
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if source.SourceType != youtubeImportSourcePlaylist || len(items) != 1 {
+		t.Fatalf("Scan() source=%#v items=%#v", source, items)
+	}
+	if items[0].ParsedTitle != "Fallback Track" || items[0].ParsedAlbumTitle != "Fallback Playlist" {
+		t.Fatalf("fallback item = %#v", items[0])
+	}
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", argsPath, err)
+	}
+	args := strings.Fields(string(argsData))
+	for _, expected := range []string{"--ignore-config", "--yes-playlist", "--skip-download", "--dump-single-json"} {
+		if !containsString(args, expected) {
+			t.Fatalf("yt-dlp playlist args = %#v, want %s", args, expected)
+		}
+	}
+}
+
+func TestLiveYouTubeImportGatewayValidatesDependencies(t *testing.T) {
+	root := t.TempDir()
+	ytdlpPath := filepath.Join(root, "yt-dlp")
+	ytdlpArgsPath := filepath.Join(root, "yt-dlp-args.txt")
+	ffmpegPath := filepath.Join(root, "ffmpeg")
+	denoPath := filepath.Join(root, "deno")
+	for path, script := range map[string]string{
+		ytdlpPath:  "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + ytdlpArgsPath + "'\nprintf '2026.01.01\\n'\n",
+		ffmpegPath: "#!/bin/sh\nprintf 'ffmpeg version 8.0\\n'\n",
+		denoPath:   "#!/bin/sh\nprintf 'deno 2.3.1 (stable)\\n'\n",
+	} {
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, err)
+		}
+	}
+
+	gateway := newLiveYouTubeImportGateway(youtubeImportConfig{
+		YTDLPBinary:           ytdlpPath,
+		FFmpegBinary:          ffmpegPath,
+		YTDLPJSRuntime:        "deno:" + denoPath,
+		YTDLPRemoteComponents: "ejs:github",
+	}, newYouTubeCookieStore(""))
+	if err := gateway.ValidateDependencies(context.Background()); err != nil {
+		t.Fatalf("ValidateDependencies() error = %v", err)
+	}
+	if gateway.cfg.YTDLPJSRuntime != "deno:"+denoPath {
+		t.Fatalf("resolved JS runtime = %q", gateway.cfg.YTDLPJSRuntime)
+	}
+	argsData, err := os.ReadFile(ytdlpArgsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", ytdlpArgsPath, err)
+	}
+	args := strings.Fields(string(argsData))
+	for _, expected := range []string{"--ignore-config", "--js-runtimes", "deno:" + denoPath, "--remote-components", "ejs:github", "--version"} {
+		if !containsString(args, expected) {
+			t.Fatalf("yt-dlp preflight args = %#v, want %s", args, expected)
+		}
+	}
+}
+
+func TestValidateYouTubeJSRuntimeRejectsOldDeno(t *testing.T) {
+	denoPath := filepath.Join(t.TempDir(), "deno")
+	if err := os.WriteFile(denoPath, []byte("#!/bin/sh\nprintf 'deno 2.2.9 (stable)\\n'\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", denoPath, err)
+	}
+	_, err := validateYouTubeJSRuntime(context.Background(), "deno:"+denoPath)
+	if !errors.Is(err, errYouTubeDependency) || !strings.Contains(err.Error(), "Deno 2.3.0") {
+		t.Fatalf("validateYouTubeJSRuntime() error = %v, want minimum-version dependency error", err)
+	}
+}
+
+func TestYouTubeCommandFailureClassifiesBoundedStderr(t *testing.T) {
+	binaryPath := filepath.Join(t.TempDir(), "fake-yt-dlp.sh")
+	script := "#!/bin/sh\nprintf 'ERROR: HTTP Error 429: Too Many Requests' >&2\nexit 1\n"
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", binaryPath, err)
+	}
+
+	_, err := runYouTubeCommandWithOutputLimit(context.Background(), binaryPath, nil, 8)
+	if !errors.Is(err, errYouTubeRateLimited) {
+		t.Fatalf("command error = %v, want rate-limit classification", err)
+	}
+	if strings.Contains(err.Error(), "Too Many Requests") {
+		t.Fatalf("command error leaked raw stderr: %v", err)
+	}
+}
+
+func TestBoundedYouTubeDiagnosticKeepsErrorTail(t *testing.T) {
+	diagnostic := newBoundedYouTubeDiagnostic(32)
+	_, _ = diagnostic.Write([]byte(strings.Repeat("warning ", 20)))
+	_, _ = diagnostic.Write([]byte("HTTP Error 429"))
+	if !diagnostic.overflow || len(diagnostic.data) != 32 {
+		t.Fatalf("diagnostic overflow=%t length=%d, want bounded overflow", diagnostic.overflow, len(diagnostic.data))
+	}
+	err := classifyYouTubeCommandError(errors.New("exit status 1"), diagnostic.data, diagnostic.overflow)
+	if !errors.Is(err, errYouTubeRateLimited) {
+		t.Fatalf("tail classification error = %v, want rate limited", err)
 	}
 }
 

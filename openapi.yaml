@@ -2025,8 +2025,16 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
         '500':
           $ref: '#/components/responses/InternalServerError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
 
   /api/youtube/import-sessions/current:
     get:
@@ -2120,8 +2128,16 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
         '500':
           $ref: '#/components/responses/InternalServerError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
 
   /api/youtube/cookies/status:
     get:
@@ -2257,8 +2273,20 @@ components:
         text/plain:
           schema:
             $ref: '#/components/schemas/PlainError'
+    PayloadTooLarge:
+      description: Request or imported media exceeds the configured size limit
+      content:
+        text/plain:
+          schema:
+            $ref: '#/components/schemas/PlainError'
     GatewayTimeout:
       description: Upstream provider request timed out
+      content:
+        text/plain:
+          schema:
+            $ref: '#/components/schemas/PlainError'
+    ServiceUnavailable:
+      description: Upstream provider is temporarily rate limiting requests
       content:
         text/plain:
           schema:
