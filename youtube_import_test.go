@@ -427,6 +427,184 @@ func TestYouTubeImportSuggestionsIncludeExactSourceMatch(t *testing.T) {
 	}
 }
 
+func TestParseYouTubeTitleAndAuthor(t *testing.T) {
+	tests := []struct {
+		name       string
+		rawTitle   string
+		publisher  string
+		wantTitle  string
+		wantAuthor string
+	}{
+		{
+			name:       "ASCII hyphen",
+			rawTitle:   "Artist - Track",
+			publisher:  "Publisher",
+			wantTitle:  "Track",
+			wantAuthor: "Artist",
+		},
+		{
+			name:       "en dash",
+			rawTitle:   "Artist – Track",
+			publisher:  "Publisher",
+			wantTitle:  "Track",
+			wantAuthor: "Artist",
+		},
+		{
+			name:       "no supported dash",
+			rawTitle:   "  Track  ",
+			publisher:  "  Publisher  ",
+			wantTitle:  "Track",
+			wantAuthor: "Publisher",
+		},
+		{
+			name:       "hyphenated artist selects second dash",
+			rawTitle:   "Jay-Z - Song",
+			publisher:  "Publisher",
+			wantTitle:  "Song",
+			wantAuthor: "Jay-Z",
+		},
+		{
+			name:       "two separators select second dash",
+			rawTitle:   "A - B - Song",
+			publisher:  "Publisher",
+			wantTitle:  "Song",
+			wantAuthor: "A - B",
+		},
+		{
+			name:       "three separators select middle dash",
+			rawTitle:   "A - B - C - Song",
+			publisher:  "Publisher",
+			wantTitle:  "C - Song",
+			wantAuthor: "A - B",
+		},
+		{
+			name:       "four mixed separators select third dash",
+			rawTitle:   "A - B – C - D – Song",
+			publisher:  "Publisher",
+			wantTitle:  "D – Song",
+			wantAuthor: "A - B – C",
+		},
+		{
+			name:       "leading separator falls back",
+			rawTitle:   "  - Track  ",
+			publisher:  "Publisher",
+			wantTitle:  "- Track",
+			wantAuthor: "Publisher",
+		},
+		{
+			name:       "trailing separator falls back",
+			rawTitle:   "  Artist –  ",
+			publisher:  "Publisher",
+			wantTitle:  "Artist –",
+			wantAuthor: "Publisher",
+		},
+		{
+			name:       "consecutive separators with empty side fall back",
+			rawTitle:   "  -–  ",
+			publisher:  "Publisher",
+			wantTitle:  "-–",
+			wantAuthor: "Publisher",
+		},
+		{
+			name:       "em dash",
+			rawTitle:   "Artist — Track",
+			publisher:  "Publisher",
+			wantTitle:  "Track",
+			wantAuthor: "Artist",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gotTitle, gotAuthor := parseYouTubeTitleAndAuthor(test.rawTitle, test.publisher)
+			if gotTitle != test.wantTitle || gotAuthor != test.wantAuthor {
+				t.Fatalf("parseYouTubeTitleAndAuthor(%q, %q) = (%q, %q), want (%q, %q)", test.rawTitle, test.publisher, gotTitle, gotAuthor, test.wantTitle, test.wantAuthor)
+			}
+		})
+	}
+}
+
+func TestYouTubeImportItemBuildersStoreParsedTitleAndAuthor(t *testing.T) {
+	tests := []struct {
+		name       string
+		item       youtubeImportItem
+		wantTitle  string
+		wantAuthor string
+	}{
+		{
+			name: "native video",
+			item: buildYouTubeImportItem(&youtube.Video{
+				ID:     "native-video",
+				Title:  "Native Artist - Native Track",
+				Author: "Native Publisher",
+			}, "https://www.youtube.com/watch?v=native-video", "https://www.youtube.com/watch?v=native-video", "youtube", ""),
+			wantTitle:  "Native Track",
+			wantAuthor: "Native Artist",
+		},
+		{
+			name: "playlist entry",
+			item: buildYouTubeImportItemFromPlaylistEntry(&youtube.PlaylistEntry{
+				ID:     "playlist-video",
+				Title:  "Playlist Artist – Playlist Track",
+				Author: "Playlist Publisher",
+			}, "https://www.youtube.com/playlist?list=playlist", "youtube", "Playlist"),
+			wantTitle:  "Playlist Track",
+			wantAuthor: "Playlist Artist",
+		},
+		{
+			name: "yt-dlp entry",
+			item: buildYouTubeImportItemFromYTDLPEntry(ytdlpFlatPlaylistEntry{
+				ID:      "ytdlp-video",
+				Title:   "yt-dlp Artist — yt-dlp Track",
+				Channel: "yt-dlp Publisher",
+			}, "https://www.youtube.com/watch?v=ytdlp-video", "youtube", "Default Publisher"),
+			wantTitle:  "yt-dlp Track",
+			wantAuthor: "yt-dlp Artist",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if test.item.ParsedTitle != test.wantTitle {
+				t.Fatalf("ParsedTitle = %q, want %q", test.item.ParsedTitle, test.wantTitle)
+			}
+			wantAuthors := []string{test.wantAuthor}
+			if !slices.Equal(test.item.ParsedAuthorNames, wantAuthors) {
+				t.Fatalf("ParsedAuthorNames = %#v, want %#v", test.item.ParsedAuthorNames, wantAuthors)
+			}
+		})
+	}
+}
+
+func TestBuildYouTubeImportItemFromYTDLPEntryPublisherFallbackPrecedence(t *testing.T) {
+	tests := []struct {
+		name          string
+		channel       string
+		uploader      string
+		defaultAuthor string
+		wantAuthor    string
+	}{
+		{name: "channel", channel: "Channel", uploader: "Uploader", defaultAuthor: "Default", wantAuthor: "Channel"},
+		{name: "uploader", uploader: "Uploader", defaultAuthor: "Default", wantAuthor: "Uploader"},
+		{name: "default author", defaultAuthor: "Default", wantAuthor: "Default"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			item := buildYouTubeImportItemFromYTDLPEntry(ytdlpFlatPlaylistEntry{
+				ID:       "video",
+				Title:    "Track",
+				Channel:  test.channel,
+				Uploader: test.uploader,
+			}, "https://www.youtube.com/watch?v=video", "youtube", test.defaultAuthor)
+			wantAuthors := []string{test.wantAuthor}
+			if !slices.Equal(item.ParsedAuthorNames, wantAuthors) {
+				t.Fatalf("ParsedAuthorNames = %#v, want %#v", item.ParsedAuthorNames, wantAuthors)
+			}
+		})
+	}
+}
+
 func TestMergePlaylistEntryFallbackFillsMissingVideoFields(t *testing.T) {
 	entry := &youtube.PlaylistEntry{
 		ID:       "video-123",
@@ -880,7 +1058,7 @@ func TestLiveYouTubeImportGatewayScanTrackUsesYTDLPCookies(t *testing.T) {
 	if item.SourceURL != "https://www.youtube.com/watch?v=4c94WwxWm78" {
 		t.Fatalf("scanTrackWithYTDLP() source url = %q", item.SourceURL)
 	}
-	if item.ParsedTitle != "Max Korzh - Official audio" {
+	if item.ParsedTitle != "Official audio" {
 		t.Fatalf("scanTrackWithYTDLP() title = %q", item.ParsedTitle)
 	}
 	if len(item.ParsedAuthorNames) != 1 || item.ParsedAuthorNames[0] != "Max Korzh" {

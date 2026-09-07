@@ -2625,14 +2625,43 @@ func (g *liveYouTubeImportGateway) fetchHTML(ctx context.Context, rawURL string)
 	return readYouTubeHTML(resp.Body, maxYouTubeArtistHTMLBytes)
 }
 
+func parseYouTubeTitleAndAuthor(rawTitle, publisher string) (string, string) {
+	title := strings.TrimSpace(rawTitle)
+	fallbackAuthor := strings.TrimSpace(publisher)
+
+	type separatorPosition struct {
+		offset int
+		width  int
+	}
+	separators := make([]separatorPosition, 0)
+	for offset, current := range title {
+		switch current {
+		case '-', '–', '—':
+			separators = append(separators, separatorPosition{offset: offset, width: len(string(current))})
+		}
+	}
+	if len(separators) == 0 {
+		return title, fallbackAuthor
+	}
+
+	separator := separators[len(separators)/2]
+	author := strings.TrimSpace(title[:separator.offset])
+	parsedTitle := strings.TrimSpace(title[separator.offset+separator.width:])
+	if author == "" || parsedTitle == "" {
+		return title, fallbackAuthor
+	}
+	return parsedTitle, author
+}
+
 func buildYouTubeImportItem(video *youtube.Video, sourceURL, originalURL, linkProvider, albumTitle string) youtubeImportItem {
+	parsedTitle, parsedAuthor := parseYouTubeTitleAndAuthor(video.Title, video.Author)
 	item := youtubeImportItem{
 		VideoID:           video.ID,
 		SourceURL:         sourceURL,
 		OriginalSourceURL: originalURL,
 		LinkProvider:      linkProvider,
-		ParsedTitle:       strings.TrimSpace(video.Title),
-		ParsedAuthorNames: normalizeNames([]string{video.Author}),
+		ParsedTitle:       parsedTitle,
+		ParsedAuthorNames: normalizeNames([]string{parsedAuthor}),
 		ParsedAlbumTitle:  strings.TrimSpace(albumTitle),
 		DurationSeconds:   int(video.Duration.Seconds()),
 	}
@@ -2647,13 +2676,14 @@ func buildYouTubeImportItem(video *youtube.Video, sourceURL, originalURL, linkPr
 }
 
 func buildYouTubeImportItemFromPlaylistEntry(entry *youtube.PlaylistEntry, originalURL, linkProvider, albumTitle string) youtubeImportItem {
+	parsedTitle, parsedAuthor := parseYouTubeTitleAndAuthor(entry.Title, entry.Author)
 	item := youtubeImportItem{
 		VideoID:           strings.TrimSpace(entry.ID),
 		SourceURL:         buildYouTubeWatchURL(strings.TrimSpace(entry.ID), linkProvider),
 		OriginalSourceURL: originalURL,
 		LinkProvider:      linkProvider,
-		ParsedTitle:       strings.TrimSpace(entry.Title),
-		ParsedAuthorNames: normalizeNames([]string{entry.Author}),
+		ParsedTitle:       parsedTitle,
+		ParsedAuthorNames: normalizeNames([]string{parsedAuthor}),
 		ParsedAlbumTitle:  strings.TrimSpace(albumTitle),
 		DurationSeconds:   int(entry.Duration.Seconds()),
 	}
@@ -2696,14 +2726,15 @@ func mergePlaylistEntryFallback(item youtubeImportItem, entry *youtube.PlaylistE
 }
 
 func buildYouTubeImportItemFromYTDLPEntry(entry ytdlpFlatPlaylistEntry, originalURL, linkProvider, defaultAuthor string) youtubeImportItem {
-	author := strings.TrimSpace(firstNonEmpty(entry.Channel, entry.Uploader, defaultAuthor))
+	publisher := firstNonEmpty(entry.Channel, entry.Uploader, defaultAuthor)
+	parsedTitle, parsedAuthor := parseYouTubeTitleAndAuthor(entry.Title, publisher)
 	videoID := strings.TrimSpace(entry.ID)
 	item := youtubeImportItem{
 		VideoID:           videoID,
 		OriginalSourceURL: originalURL,
 		LinkProvider:      linkProvider,
-		ParsedTitle:       strings.TrimSpace(entry.Title),
-		ParsedAuthorNames: normalizeNames([]string{author}),
+		ParsedTitle:       parsedTitle,
+		ParsedAuthorNames: normalizeNames([]string{parsedAuthor}),
 		DurationSeconds:   int(entry.Duration),
 	}
 	if videoID != "" {
