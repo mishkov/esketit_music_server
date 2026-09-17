@@ -3054,9 +3054,12 @@ func (s *trackStore) createTrackIfSourceAbsent(req upsertTrackRequest, target so
 	albumsSnapshot := cloneAlbumsMap(s.albums)
 	tracksSnapshot := cloneTracksMap(s.tracks)
 	nextTrackIDSnapshot := s.nextTrackID
-	restore := func() {
+	restoreCatalog := func() {
 		s.albums = albumsSnapshot
 		s.tracks = tracksSnapshot
+	}
+	restoreBeforeCommit := func() {
+		restoreCatalog()
 		s.nextTrackID = nextTrackIDSnapshot
 	}
 
@@ -3084,17 +3087,21 @@ func (s *trackStore) createTrackIfSourceAbsent(req upsertTrackRequest, target so
 	insertTrackIntoAlbumLocked(&targetAlbum, created.ID, albumOrder)
 	s.albums[req.AlbumID] = targetAlbum
 	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
-		restore()
+		restoreBeforeCommit()
 		return track{}, err
 	}
-	if err := s.persistLocked(); err != nil {
-		restore()
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{
+		metadataExpected: map[string]int64{"next_track_id": nextTrackIDSnapshot}, catalog: true,
+	}); err != nil {
+		restoreBeforeCommit()
 		return track{}, err
 	}
 	if publishAudio != nil {
 		if err := publishAudio(); err != nil {
-			restore()
-			rollbackErr := s.persistLocked()
+			// The database commit reserved the ID. Compensate the catalog rows,
+			// but deliberately keep the counter advanced so IDs are never reused.
+			restoreCatalog()
+			rollbackErr := s.commitDomainChangesLocked(context.Background(), domainWriteScope{catalog: true})
 			if rollbackErr != nil {
 				rollbackErr = fmt.Errorf("rollback track after audio publish failure: %w", rollbackErr)
 			}
@@ -3121,7 +3128,7 @@ func (s *trackStore) attachTrackImportMetadata(trackID int64, infos []additional
 		return track{}, true, err
 	}
 	s.tracks[trackID] = updated
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{catalog: true}); err != nil {
 		s.tracks = tracksSnapshot
 		return track{}, true, err
 	}
@@ -3148,7 +3155,7 @@ func (s *trackStore) attachTrackImportMetadataIfSourceAbsent(trackID int64, info
 		return track{}, true, err
 	}
 	s.tracks[trackID] = updated
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{catalog: true}); err != nil {
 		s.tracks = tracksSnapshot
 		return track{}, true, err
 	}

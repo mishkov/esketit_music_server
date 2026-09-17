@@ -368,54 +368,20 @@ type playlistResponse struct {
 	ShareToken     string `json:"shareToken,omitempty"`
 }
 
-type dbFile struct {
-	NextTrackID      int64            `json:"nextTrackId"`
-	NextAlbumID      int64            `json:"nextAlbumId"`
-	NextAuthorID     int64            `json:"nextAuthorId"`
-	NextUserID       int64            `json:"nextUserId"`
-	NextPlaylistID   int64            `json:"nextPlaylistId"`
-	NextLyricsID     int64            `json:"nextLyricsId"`
-	NextLyricsLineID int64            `json:"nextLyricsLineId"`
-	Tracks           []track          `json:"tracks"`
-	Albums           []album          `json:"albums"`
-	Authors          []author         `json:"authors"`
-	Users            []user           `json:"users"`
-	Sessions         []refreshSession `json:"sessions"`
-	Playlists        []playlist       `json:"playlists"`
-	Lyrics           []lyrics         `json:"lyrics"`
-}
-
-type diskDBFile struct {
-	NextTrackID      int64             `json:"nextTrackId"`
-	NextAlbumID      int64             `json:"nextAlbumId"`
-	NextAuthorID     int64             `json:"nextAuthorId"`
-	NextUserID       int64             `json:"nextUserId"`
-	NextPlaylistID   int64             `json:"nextPlaylistId"`
-	NextLyricsID     int64             `json:"nextLyricsId"`
-	NextLyricsLineID int64             `json:"nextLyricsLineId"`
-	NextID           int64             `json:"nextId"`
-	Tracks           []json.RawMessage `json:"tracks"`
-	Albums           []album           `json:"albums"`
-	Authors          []author          `json:"authors"`
-	Users            []user            `json:"users"`
-	Sessions         []refreshSession  `json:"sessions"`
-	Playlists        []playlist        `json:"playlists"`
-	Lyrics           []lyrics          `json:"lyrics"`
-}
-
-type legacyTrack struct {
-	ID             int64    `json:"id"`
-	Name           string   `json:"name"`
-	Authors        []string `json:"authors"`
-	AlbumImagePath string   `json:"albumImagePath"`
-	AudioFilePath  string   `json:"audioFilePath"`
-}
-
 type trackStore struct {
-	mu               sync.RWMutex
-	path             string
-	songsDir         string
-	db               *sql.DB
+	mu                 sync.RWMutex
+	songsDir           string
+	db                 *sql.DB
+	unitOfWork         unitOfWork
+	userRepository     UserRepository
+	sessionRepository  RefreshSessionRepository
+	authorRepository   AuthorRepository
+	catalogRepository  CatalogRepository
+	playlistRepository PlaylistRepository
+	lyricsRepository   LyricsRepository
+	metadataRepository metadataRepository
+	// Compatibility read cache for existing handlers. Mutations hold mu through
+	// the SQL commit, so speculative changes cannot escape; failures restore it.
 	nextTrackID      int64
 	nextAlbumID      int64
 	nextAuthorID     int64
@@ -504,16 +470,6 @@ type paginatedSearchResults struct {
 	PageSize   int                `json:"pageSize"`
 	TotalItems int                `json:"totalItems"`
 	TotalPages int                `json:"totalPages"`
-}
-
-type legacyTrackV1 struct {
-	ID             int64            `json:"id"`
-	Name           string           `json:"name"`
-	AuthorIDs      []int64          `json:"authorIds"`
-	AlbumImagePath string           `json:"albumImagePath"`
-	AudioFilePath  string           `json:"audioFilePath"`
-	AdditionalInfo []additionalInfo `json:"additionalInfo"`
-	SourceMetadata []sourceMetadata `json:"sourceMetadata"`
 }
 
 type loggingResponseWriter struct {
@@ -1199,9 +1155,7 @@ func newAuthManager(secret []byte, accessTokenTTL, refreshTokenTTL time.Duration
 }
 
 func newTrackStore(path string) (*trackStore, error) {
-	sqlitePath := sqliteStorePath(path)
 	s := &trackStore{
-		path:             sqlitePath,
 		nextTrackID:      1,
 		nextAlbumID:      1,
 		nextAuthorID:     1,
@@ -1219,34 +1173,31 @@ func newTrackStore(path string) (*trackStore, error) {
 		lyricsByTrack:    make(map[int64]lyrics),
 	}
 
-	db, err := openSQLiteDB(sqlitePath)
+	db, err := openSQLiteDB(path)
 	if err != nil {
 		return nil, err
 	}
 	s.db = db
+	repositories := newDomainRepositories(db)
+	s.unitOfWork = &sqliteUnitOfWork{db: db}
+	s.userRepository = repositories.users
+	s.sessionRepository = repositories.sessions
+	s.authorRepository = repositories.authors
+	s.catalogRepository = repositories.catalog
+	s.playlistRepository = repositories.playlists
+	s.lyricsRepository = repositories.lyrics
+	s.metadataRepository = repositories.metadata
 
 	if err := s.initSQLiteSchema(); err != nil {
 		return nil, closeDatabaseAfterError(db, err)
 	}
 
-	hasData, err := s.loadSQLiteLocked()
-	if err != nil {
+	if err := s.loadSQLite(); err != nil {
 		return nil, closeDatabaseAfterError(db, err)
 	}
-	if !hasData {
-		imported, err := s.importLegacyJSONLocked(path, sqlitePath)
-		if err != nil {
-			return nil, closeDatabaseAfterError(db, err)
-		}
-		if !imported {
-			if err := s.persistLocked(); err != nil {
-				return nil, closeDatabaseAfterError(db, err)
-			}
-		}
-	} else if err := s.persistLocked(); err != nil {
-		return nil, closeDatabaseAfterError(db, err)
-	}
-	if err := s.ensureSystemPlaylistUniqueIndex(); err != nil {
+	// Persist normalization repairs and initialize missing ID counters through
+	// the same transactional repository boundary used by regular mutations.
+	if err := s.commitDomainChangesLocked(context.Background(), allDomainWrites); err != nil {
 		return nil, closeDatabaseAfterError(db, err)
 	}
 
@@ -1283,279 +1234,6 @@ func joinRowsCloseError(returnErr *error, rows *sql.Rows, operation string) {
 	}
 }
 
-func sqliteRowError(table string, id int64, operation string, err error) error {
-	if id > 0 {
-		return fmt.Errorf("SQLite %s row id %d: %s: %w", table, id, operation, err)
-	}
-	return fmt.Errorf("SQLite %s row: %s: %w", table, operation, err)
-}
-
-func (s *trackStore) importLegacyJSONLocked(jsonPath, sqlitePath string) (bool, error) {
-	if jsonPath == sqlitePath {
-		return false, nil
-	}
-	data, err := os.ReadFile(jsonPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-		return false, err
-	}
-
-	var file diskDBFile
-	if err := json.Unmarshal(data, &file); err != nil {
-		return false, fmt.Errorf("invalid tracks db format: %w", err)
-	}
-	if err := s.loadDiskDBFileLocked(file); err != nil {
-		return false, err
-	}
-	if err := s.persistLocked(); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (s *trackStore) loadDiskDBFileLocked(file diskDBFile) error {
-	s.nextTrackID = 1
-	s.nextAlbumID = 1
-	s.nextAuthorID = 1
-	s.nextUserID = 1
-	s.nextPlaylistID = 1
-	s.nextLyricsID = 1
-	s.nextLyricsLineID = 1
-	s.tracks = make(map[int64]track)
-	s.albums = make(map[int64]album)
-	s.authors = make(map[int64]author)
-	s.users = make(map[int64]user)
-	s.usersByEmail = make(map[string]int64)
-	s.refreshSession = make(map[string]refreshSession)
-	s.playlists = make(map[int64]playlist)
-	s.lyricsByTrack = make(map[int64]lyrics)
-
-	for _, a := range file.Authors {
-		a.CurrentName = strings.TrimSpace(a.CurrentName)
-		a.Photos = normalizePhotos(a.Photos)
-		if a.ID <= 0 || a.CurrentName == "" {
-			continue
-		}
-		s.authors[a.ID] = a
-		if a.ID >= s.nextAuthorID {
-			s.nextAuthorID = a.ID + 1
-		}
-	}
-
-	for _, albumItem := range file.Albums {
-		albumItem.Title = strings.TrimSpace(albumItem.Title)
-		albumItem.CoverImagePath = strings.TrimSpace(albumItem.CoverImagePath)
-		albumItem.AuthorIDs = normalizeAuthorIDs(albumItem.AuthorIDs)
-		albumItem.TrackIDs = normalizeTrackIDs(albumItem.TrackIDs)
-		albumItem.AdditionalInfo = normalizeAdditionalInfo(albumItem.AdditionalInfo)
-		if albumItem.ID <= 0 {
-			continue
-		}
-		s.albums[albumItem.ID] = albumItem
-		if albumItem.ID >= s.nextAlbumID {
-			s.nextAlbumID = albumItem.ID + 1
-		}
-	}
-
-	for _, rawTrack := range file.Tracks {
-		var t track
-		if err := json.Unmarshal(rawTrack, &t); err == nil {
-			t.Name = strings.TrimSpace(t.Name)
-			t.AuthorIDs = normalizeAuthorIDs(t.AuthorIDs)
-			t.AudioFilePath = normalizeAudioFilePath(t.AudioFilePath)
-			t.AdditionalInfo = normalizeAdditionalInfo(t.AdditionalInfo)
-			t.SourceMetadata = normalizeSourceMetadata(t.SourceMetadata)
-			if t.ID <= 0 || t.AlbumID <= 0 {
-				continue
-			}
-			s.tracks[t.ID] = t
-			if t.ID >= s.nextTrackID {
-				s.nextTrackID = t.ID + 1
-			}
-			continue
-		}
-
-		var previous legacyTrackV1
-		if err := json.Unmarshal(rawTrack, &previous); err == nil && previous.ID > 0 {
-			t = track{
-				ID:             previous.ID,
-				Name:           strings.TrimSpace(previous.Name),
-				AuthorIDs:      normalizeAuthorIDs(previous.AuthorIDs),
-				AudioFilePath:  normalizeAudioFilePath(previous.AudioFilePath),
-				AdditionalInfo: normalizeAdditionalInfo(previous.AdditionalInfo),
-				SourceMetadata: normalizeSourceMetadata(previous.SourceMetadata),
-			}
-			s.tracks[t.ID] = t
-			if t.ID >= s.nextTrackID {
-				s.nextTrackID = t.ID + 1
-			}
-			continue
-		}
-
-		var legacy legacyTrack
-		if err := json.Unmarshal(rawTrack, &legacy); err != nil {
-			continue
-		}
-		if legacy.ID <= 0 {
-			continue
-		}
-
-		authorIDs := make([]int64, 0, len(legacy.Authors))
-		for _, name := range normalizeNames(legacy.Authors) {
-			authorIDs = append(authorIDs, s.getOrCreateAuthorIDLocked(name))
-		}
-
-		t = track{
-			ID:            legacy.ID,
-			Name:          strings.TrimSpace(legacy.Name),
-			AuthorIDs:     normalizeAuthorIDs(authorIDs),
-			AudioFilePath: normalizeAudioFilePath(legacy.AudioFilePath),
-		}
-		s.tracks[t.ID] = t
-		if t.ID >= s.nextTrackID {
-			s.nextTrackID = t.ID + 1
-		}
-	}
-	s.backfillMissingTrackCreatedAtLocked(time.Now().UTC().Truncate(time.Second))
-
-	for _, u := range file.Users {
-		u.Email = normalizeEmail(u.Email)
-		u.Role = normalizeRole(u.Role)
-		if u.ID <= 0 || u.Email == "" || u.PasswordHash == "" || u.Role == "" {
-			continue
-		}
-		s.users[u.ID] = u
-		s.usersByEmail[u.Email] = u.ID
-		if u.ID >= s.nextUserID {
-			s.nextUserID = u.ID + 1
-		}
-	}
-
-	for _, playlistItem := range file.Playlists {
-		playlistItem.Name = strings.TrimSpace(playlistItem.Name)
-		playlistItem.Description = strings.TrimSpace(playlistItem.Description)
-		playlistItem.CoverImagePath = strings.TrimSpace(playlistItem.CoverImagePath)
-		playlistItem.Visibility = normalizePlaylistVisibility(playlistItem.Visibility)
-		playlistItem.ShareToken = strings.TrimSpace(playlistItem.ShareToken)
-		playlistItem.Kind = normalizePlaylistKind(playlistItem.Kind, playlistItem.System)
-		playlistItem.TrackItems = normalizePlaylistTrackItems(playlistItem.TrackItems)
-		if playlistItem.ID <= 0 || playlistItem.UserID <= 0 || playlistItem.Name == "" || playlistItem.Visibility == "" || playlistItem.Kind == "" {
-			continue
-		}
-		if err := s.normalizePlaylistSharingLocked(&playlistItem); err != nil {
-			return err
-		}
-		s.playlists[playlistItem.ID] = playlistItem
-		if playlistItem.ID >= s.nextPlaylistID {
-			s.nextPlaylistID = playlistItem.ID + 1
-		}
-	}
-
-	for _, lyricsItem := range file.Lyrics {
-		lyricsItem, ok := normalizeLyrics(lyricsItem)
-		if !ok {
-			continue
-		}
-		if _, exists := s.tracks[lyricsItem.TrackID]; !exists {
-			continue
-		}
-		s.lyricsByTrack[lyricsItem.TrackID] = lyricsItem
-		if lyricsItem.ID >= s.nextLyricsID {
-			s.nextLyricsID = lyricsItem.ID + 1
-		}
-		for _, line := range lyricsItem.Lines {
-			if line.ID >= s.nextLyricsLineID {
-				s.nextLyricsLineID = line.ID + 1
-			}
-		}
-	}
-
-	now := time.Now()
-	for _, session := range file.Sessions {
-		if session.ID == "" || session.UserID <= 0 || session.TokenHash == "" {
-			continue
-		}
-		if session.ExpiresAt.Before(now) {
-			continue
-		}
-		if _, ok := s.users[session.UserID]; !ok {
-			continue
-		}
-		s.refreshSession[session.ID] = session
-	}
-
-	if file.NextTrackID > s.nextTrackID {
-		s.nextTrackID = file.NextTrackID
-	}
-	if file.NextAlbumID > s.nextAlbumID {
-		s.nextAlbumID = file.NextAlbumID
-	}
-	if file.NextID > s.nextTrackID {
-		s.nextTrackID = file.NextID
-	}
-	if file.NextAuthorID > s.nextAuthorID {
-		s.nextAuthorID = file.NextAuthorID
-	}
-	if file.NextUserID > s.nextUserID {
-		s.nextUserID = file.NextUserID
-	}
-	if file.NextPlaylistID > s.nextPlaylistID {
-		s.nextPlaylistID = file.NextPlaylistID
-	}
-	if file.NextLyricsID > s.nextLyricsID {
-		s.nextLyricsID = file.NextLyricsID
-	}
-	if file.NextLyricsLineID > s.nextLyricsLineID {
-		s.nextLyricsLineID = file.NextLyricsLineID
-	}
-	if s.nextTrackID < 1 {
-		s.nextTrackID = 1
-	}
-	if s.nextAlbumID < 1 {
-		s.nextAlbumID = 1
-	}
-	if s.nextAuthorID < 1 {
-		s.nextAuthorID = 1
-	}
-	if s.nextUserID < 1 {
-		s.nextUserID = 1
-	}
-	if s.nextPlaylistID < 1 {
-		s.nextPlaylistID = 1
-	}
-	if s.nextLyricsID < 1 {
-		s.nextLyricsID = 1
-	}
-	if s.nextLyricsLineID < 1 {
-		s.nextLyricsLineID = 1
-	}
-
-	if err := s.migrateLegacyAlbumsLocked(); err != nil {
-		return err
-	}
-	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
-		return err
-	}
-	s.deduplicateSystemPlaylistsLocked()
-	if err := s.ensureSystemPlaylistsLocked(); err != nil {
-		return err
-	}
-	if err := s.validateLyricsStateLocked(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func sqliteStorePath(path string) string {
-	if strings.EqualFold(filepath.Ext(path), ".json") {
-		return strings.TrimSuffix(path, filepath.Ext(path)) + ".sqlite"
-	}
-	return path
-}
-
 func openSQLiteDB(path string) (*sql.DB, error) {
 	dir := filepath.Dir(path)
 	if dir != "." {
@@ -1564,7 +1242,18 @@ func openSQLiteDB(path string) (*sql.DB, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", path)
+	dsn := path
+	if path != ":memory:" {
+		dsn = (&url.URL{Scheme: "file", Path: path}).String()
+	}
+	separator := "?"
+	if strings.Contains(dsn, "?") {
+		separator = "&"
+	}
+	// modernc.org/sqlite applies every _pragma parameter to every connection.
+	// This is stronger than issuing PRAGMA foreign_keys on one pooled handle.
+	dsn += separator + "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -1579,256 +1268,150 @@ func openSQLiteDB(path string) (*sql.DB, error) {
 }
 
 func (s *trackStore) initSQLiteSchema() error {
-	statements := []string{
-		`CREATE TABLE IF NOT EXISTS store_metadata (
-			key TEXT PRIMARY KEY,
-			value INTEGER NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS authors (
-			id INTEGER PRIMARY KEY,
-			current_name TEXT NOT NULL,
-			photos_json TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS albums (
-			id INTEGER PRIMARY KEY,
-			title TEXT NOT NULL,
-			cover_image_path TEXT NOT NULL,
-			author_ids_json TEXT NOT NULL,
-			release_date TEXT NOT NULL,
-			is_published INTEGER NOT NULL,
-			track_ids_json TEXT NOT NULL,
-			additional_info_json TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS tracks (
-			id INTEGER PRIMARY KEY,
-			name TEXT NOT NULL,
-			author_ids_json TEXT NOT NULL,
-			album_id INTEGER NOT NULL,
-			audio_file_path TEXT NOT NULL,
-			additional_info_json TEXT NOT NULL,
-			source_metadata_json TEXT NOT NULL,
-			created_at TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS users (
-			id INTEGER PRIMARY KEY,
-			email TEXT NOT NULL UNIQUE,
-			role TEXT NOT NULL,
-			password_hash TEXT NOT NULL,
-			created_at TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS refresh_sessions (
-			id TEXT PRIMARY KEY,
-			user_id INTEGER NOT NULL,
-			token_hash TEXT NOT NULL,
-			created_at TEXT NOT NULL,
-			expires_at TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS playlists (
-			id INTEGER PRIMARY KEY,
-			user_id INTEGER NOT NULL,
-			name TEXT NOT NULL,
-			description TEXT NOT NULL,
-			cover_image_path TEXT NOT NULL,
-			visibility TEXT NOT NULL,
-			share_token TEXT NOT NULL,
-			track_items_json TEXT NOT NULL,
-			system INTEGER NOT NULL,
-			kind TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS lyrics (
-			id INTEGER PRIMARY KEY,
-			track_id INTEGER NOT NULL UNIQUE,
-			type TEXT NOT NULL,
-			plain_text TEXT,
-			language_code TEXT,
-			source TEXT,
-			is_verified INTEGER NOT NULL,
-			updated_at TEXT NOT NULL,
-			created_at TEXT NOT NULL,
-			lines_json TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS analytics_events (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			event_id TEXT NOT NULL UNIQUE,
-			user_id INTEGER,
-			client_id TEXT NOT NULL,
-			session_id TEXT NOT NULL,
-			event_type TEXT NOT NULL,
-			track_id INTEGER,
-			playlist_id INTEGER,
-			album_id INTEGER,
-			position_ms INTEGER,
-			duration_ms INTEGER,
-			search_query TEXT,
-			metadata_json TEXT NOT NULL,
-			client_time TEXT NOT NULL,
-			received_at TEXT NOT NULL,
-			platform TEXT NOT NULL,
-			app_version TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS author_popularity_snapshot (
-			author_id INTEGER PRIMARY KEY,
-			ranking_position INTEGER NOT NULL UNIQUE,
-			listened_ms INTEGER NOT NULL,
-			calculated_at TEXT NOT NULL,
-			window_started_at TEXT NOT NULL,
-			window_ended_at TEXT NOT NULL
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_analytics_events_user_received ON analytics_events (user_id, received_at)`,
-		`CREATE INDEX IF NOT EXISTS idx_analytics_events_client_received ON analytics_events (client_id, received_at)`,
-		`CREATE INDEX IF NOT EXISTS idx_analytics_events_type_received ON analytics_events (event_type, received_at)`,
-		`CREATE INDEX IF NOT EXISTS idx_analytics_events_track_received ON analytics_events (track_id, received_at)`,
-		`CREATE INDEX IF NOT EXISTS idx_analytics_events_client_session_time ON analytics_events (client_id, session_id, client_time, id)`,
-		`CREATE INDEX IF NOT EXISTS idx_analytics_events_client_time ON analytics_events (client_time)`,
-	}
-
-	for _, statement := range statements {
-		if _, err := s.db.Exec(statement); err != nil {
-			return err
-		}
-	}
-	if err := s.ensureTrackCreatedAtColumn(); err != nil {
-		return err
-	}
-	return nil
+	return runSQLiteMigrations(context.Background(), s.db, defaultSchemaMigrations())
 }
 
-func (s *trackStore) ensureTrackCreatedAtColumn() (returnErr error) {
-	rows, err := s.db.Query(`PRAGMA table_info(tracks)`)
+func (s *trackStore) loadSQLite() error {
+	ctx := context.Background()
+	metadata, err := s.metadataRepository.LoadNextIDs(ctx)
 	if err != nil {
 		return err
 	}
-	defer joinRowsCloseError(&returnErr, rows, "inspect tracks schema")
-
-	hasCreatedAt := false
-	for rows.Next() {
-		var cid int
-		var name, columnType string
-		var notNull int
-		var defaultValue any
-		var pk int
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
-			return err
-		}
-		if name == "created_at" {
-			hasCreatedAt = true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if hasCreatedAt {
-		return nil
-	}
-
-	tx, err := s.db.Begin()
+	authors, err := s.authorRepository.List(ctx)
 	if err != nil {
 		return err
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			joinRollbackError(&returnErr, tx, "migrate track creation timestamps")
-		}
-	}()
-
-	if _, err := tx.Exec(`ALTER TABLE tracks ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`); err != nil {
-		return err
-	}
-
-	idRows, err := tx.Query(`SELECT id FROM tracks ORDER BY id DESC`)
+	albums, err := s.catalogRepository.ListAlbums(ctx)
 	if err != nil {
 		return err
 	}
-	trackIDs := []int64{}
-	for idRows.Next() {
-		var id int64
-		if err := idRows.Scan(&id); err != nil {
-			if closeErr := idRows.Close(); closeErr != nil {
-				return errors.Join(err, fmt.Errorf("close track migration rows: %w", closeErr))
-			}
-			return err
-		}
-		trackIDs = append(trackIDs, id)
-	}
-	if err := idRows.Err(); err != nil {
-		if closeErr := idRows.Close(); closeErr != nil {
-			return errors.Join(err, fmt.Errorf("close track migration rows: %w", closeErr))
-		}
-		return err
-	}
-	if err := idRows.Close(); err != nil {
-		return err
-	}
-
-	migrationTime := time.Now().UTC().Truncate(time.Second)
-	for index, id := range trackIDs {
-		createdAt := migrationTime.Add(-time.Duration(index) * time.Second)
-		if _, err := tx.Exec(`UPDATE tracks SET created_at = ? WHERE id = ?`, formatSQLiteTime(createdAt), id); err != nil {
-			return err
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	return nil
-}
-
-func (s *trackStore) ensureSystemPlaylistUniqueIndex() error {
-	_, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_user_system_kind
-		ON playlists (user_id, kind)
-		WHERE kind IN ('favorites', 'dislikes')`)
-	return err
-}
-
-func (s *trackStore) loadSQLiteLocked() (bool, error) {
-	hasData, err := s.sqliteHasData()
+	tracks, err := s.catalogRepository.ListTracks(ctx)
 	if err != nil {
-		return false, err
+		return err
 	}
-	if !hasData {
-		return false, nil
+	users, err := s.userRepository.List(ctx)
+	if err != nil {
+		return err
+	}
+	sessions, err := s.sessionRepository.List(ctx)
+	if err != nil {
+		return err
+	}
+	playlists, err := s.playlistRepository.List(ctx)
+	if err != nil {
+		return err
+	}
+	lyricsItems, err := s.lyricsRepository.List(ctx)
+	if err != nil {
+		return err
+	}
+	if err := validateSQLiteState(authors, albums, tracks, users, sessions, playlists, lyricsItems); err != nil {
+		return err
 	}
 
-	file := diskDBFile{}
-	if err := s.loadSQLiteMetadata(&file); err != nil {
-		return false, err
+	for _, item := range authors {
+		item.CurrentName = strings.TrimSpace(item.CurrentName)
+		item.Photos = normalizePhotos(item.Photos)
+		s.authors[item.ID] = item
+		s.nextAuthorID = maxNextID(s.nextAuthorID, item.ID)
 	}
-	if err := s.loadSQLiteAuthors(&file); err != nil {
-		return false, err
+	for _, item := range albums {
+		item.Title = strings.TrimSpace(item.Title)
+		item.CoverImagePath = strings.TrimSpace(item.CoverImagePath)
+		item.AuthorIDs = normalizeAuthorIDs(item.AuthorIDs)
+		item.TrackIDs = normalizeTrackIDs(item.TrackIDs)
+		item.AdditionalInfo = normalizeAdditionalInfo(item.AdditionalInfo)
+		s.albums[item.ID] = item
+		s.nextAlbumID = maxNextID(s.nextAlbumID, item.ID)
 	}
-	if err := s.loadSQLiteAlbums(&file); err != nil {
-		return false, err
+	for _, item := range tracks {
+		item.Name = strings.TrimSpace(item.Name)
+		item.AuthorIDs = normalizeAuthorIDs(item.AuthorIDs)
+		item.AudioFilePath = normalizeAudioFilePath(item.AudioFilePath)
+		item.AdditionalInfo = normalizeAdditionalInfo(item.AdditionalInfo)
+		item.SourceMetadata = normalizeSourceMetadata(item.SourceMetadata)
+		s.tracks[item.ID] = item
+		s.nextTrackID = maxNextID(s.nextTrackID, item.ID)
 	}
-	if err := s.loadSQLiteTracks(&file); err != nil {
-		return false, err
+	for _, item := range users {
+		item.Email = normalizeEmail(item.Email)
+		item.Role = normalizeRole(item.Role)
+		s.users[item.ID] = item
+		s.usersByEmail[item.Email] = item.ID
+		s.nextUserID = maxNextID(s.nextUserID, item.ID)
 	}
-	if err := s.loadSQLiteUsers(&file); err != nil {
-		return false, err
+	for _, item := range playlists {
+		item.Name = strings.TrimSpace(item.Name)
+		item.Description = strings.TrimSpace(item.Description)
+		item.CoverImagePath = strings.TrimSpace(item.CoverImagePath)
+		item.Visibility = normalizePlaylistVisibility(item.Visibility)
+		item.ShareToken = strings.TrimSpace(item.ShareToken)
+		item.Kind = normalizePlaylistKind(item.Kind, item.System)
+		item.TrackItems = normalizePlaylistTrackItems(item.TrackItems)
+		if err := s.normalizePlaylistSharingLocked(&item); err != nil {
+			return err
+		}
+		s.playlists[item.ID] = item
+		s.nextPlaylistID = maxNextID(s.nextPlaylistID, item.ID)
 	}
-	if err := s.loadSQLiteSessions(&file); err != nil {
-		return false, err
+	for _, item := range lyricsItems {
+		item, _ = normalizeLyrics(item)
+		s.lyricsByTrack[item.TrackID] = item
+		s.nextLyricsID = maxNextID(s.nextLyricsID, item.ID)
+		for _, line := range item.Lines {
+			s.nextLyricsLineID = maxNextID(s.nextLyricsLineID, line.ID)
+		}
 	}
-	if err := s.loadSQLitePlaylists(&file); err != nil {
-		return false, err
+	now := time.Now()
+	for _, item := range sessions {
+		if !item.ExpiresAt.Before(now) {
+			s.refreshSession[item.ID] = item
+		}
 	}
-	if err := s.loadSQLiteLyrics(&file); err != nil {
-		return false, err
+
+	s.nextTrackID = maxInt64(s.nextTrackID, metadata["next_track_id"])
+	s.nextAlbumID = maxInt64(s.nextAlbumID, metadata["next_album_id"])
+	s.nextAuthorID = maxInt64(s.nextAuthorID, metadata["next_author_id"])
+	s.nextUserID = maxInt64(s.nextUserID, metadata["next_user_id"])
+	s.nextPlaylistID = maxInt64(s.nextPlaylistID, metadata["next_playlist_id"])
+	s.nextLyricsID = maxInt64(s.nextLyricsID, metadata["next_lyrics_id"])
+	s.nextLyricsLineID = maxInt64(s.nextLyricsLineID, metadata["next_lyrics_line_id"])
+
+	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
+		return err
 	}
-	if err := validateSQLiteDiskDBFile(file); err != nil {
-		return false, err
+	s.deduplicateSystemPlaylistsLocked()
+	if err := s.ensureSystemPlaylistsLocked(); err != nil {
+		return err
 	}
-	if err := s.loadDiskDBFileLocked(file); err != nil {
-		return false, err
-	}
-	return true, nil
+	return s.validateLyricsStateLocked()
 }
 
-func validateSQLiteDiskDBFile(file diskDBFile) error {
-	authorIDs := make(map[int64]struct{}, len(file.Authors))
-	for _, item := range file.Authors {
+func maxNextID(current, existingID int64) int64 {
+	if existingID >= current {
+		return existingID + 1
+	}
+	return current
+}
+
+func maxInt64(left, right int64) int64 {
+	if right > left {
+		return right
+	}
+	return left
+}
+
+func validateSQLiteState(
+	authors []author,
+	albums []album,
+	trackItems []track,
+	users []user,
+	sessions []refreshSession,
+	playlists []playlist,
+	lyricsItems []lyrics,
+) error {
+	authorIDs := make(map[int64]struct{}, len(authors))
+	for _, item := range authors {
 		item.CurrentName = strings.TrimSpace(item.CurrentName)
 		item.Photos = normalizePhotos(item.Photos)
 		if item.ID <= 0 {
@@ -1840,8 +1423,8 @@ func validateSQLiteDiskDBFile(file diskDBFile) error {
 		authorIDs[item.ID] = struct{}{}
 	}
 
-	albumIDs := make(map[int64]struct{}, len(file.Albums))
-	for _, item := range file.Albums {
+	albumIDs := make(map[int64]struct{}, len(albums))
+	for _, item := range albums {
 		if item.ID <= 0 {
 			return fmt.Errorf("invalid SQLite albums row id %d: id must be positive", item.ID)
 		}
@@ -1864,12 +1447,8 @@ func validateSQLiteDiskDBFile(file diskDBFile) error {
 		albumIDs[item.ID] = struct{}{}
 	}
 
-	tracks := make(map[int64]track, len(file.Tracks))
-	for rowIndex, raw := range file.Tracks {
-		var item track
-		if err := json.Unmarshal(raw, &item); err != nil {
-			return fmt.Errorf("invalid SQLite tracks row %d: decode row: %w", rowIndex+1, err)
-		}
+	tracks := make(map[int64]track, len(trackItems))
+	for _, item := range trackItems {
 		if item.ID <= 0 {
 			return fmt.Errorf("invalid SQLite tracks row id %d: id must be positive", item.ID)
 		}
@@ -1903,7 +1482,7 @@ func validateSQLiteDiskDBFile(file diskDBFile) error {
 		}
 		tracks[item.ID] = item
 	}
-	for _, item := range file.Albums {
+	for _, item := range albums {
 		for _, trackID := range item.TrackIDs {
 			trackItem, ok := tracks[trackID]
 			if !ok {
@@ -1915,9 +1494,9 @@ func validateSQLiteDiskDBFile(file diskDBFile) error {
 		}
 	}
 
-	userIDs := make(map[int64]struct{}, len(file.Users))
-	emails := make(map[string]int64, len(file.Users))
-	for _, item := range file.Users {
+	userIDs := make(map[int64]struct{}, len(users))
+	emails := make(map[string]int64, len(users))
+	for _, item := range users {
 		email := normalizeEmail(item.Email)
 		role := normalizeRole(item.Role)
 		if item.ID <= 0 || email == "" || item.PasswordHash == "" || role == "" || item.CreatedAt.IsZero() {
@@ -1930,7 +1509,7 @@ func validateSQLiteDiskDBFile(file diskDBFile) error {
 		userIDs[item.ID] = struct{}{}
 	}
 
-	for _, item := range file.Playlists {
+	for _, item := range playlists {
 		item.Name = strings.TrimSpace(item.Name)
 		item.Description = strings.TrimSpace(item.Description)
 		item.Visibility = normalizePlaylistVisibility(item.Visibility)
@@ -1947,7 +1526,7 @@ func validateSQLiteDiskDBFile(file diskDBFile) error {
 		}
 	}
 
-	for _, item := range file.Lyrics {
+	for _, item := range lyricsItems {
 		normalized, ok := normalizeLyrics(item)
 		if !ok {
 			return fmt.Errorf("invalid SQLite lyrics row id %d: lyrics fields are invalid", item.ID)
@@ -1957,286 +1536,13 @@ func validateSQLiteDiskDBFile(file diskDBFile) error {
 		}
 	}
 
-	for _, item := range file.Sessions {
+	for _, item := range sessions {
 		if item.ID == "" || item.UserID <= 0 || item.TokenHash == "" || item.CreatedAt.IsZero() || item.ExpiresAt.IsZero() {
 			return fmt.Errorf("invalid SQLite refresh_sessions row for user id %d: required session fields are invalid", item.UserID)
 		}
 		if _, ok := userIDs[item.UserID]; !ok {
 			return fmt.Errorf("invalid SQLite refresh_sessions row for user id %d: user does not exist", item.UserID)
 		}
-	}
-	return nil
-}
-
-func (s *trackStore) sqliteHasData() (bool, error) {
-	tables := []string{"store_metadata", "authors", "albums", "tracks", "users", "refresh_sessions", "playlists", "lyrics"}
-	for _, table := range tables {
-		var count int
-		if err := s.db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
-			return false, err
-		}
-		if count > 0 {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func (s *trackStore) loadSQLiteMetadata(file *diskDBFile) (returnErr error) {
-	rows, err := s.db.Query(`SELECT key, value FROM store_metadata`)
-	if err != nil {
-		return err
-	}
-	defer joinRowsCloseError(&returnErr, rows, "load store metadata")
-
-	for rows.Next() {
-		var key string
-		var value int64
-		if err := rows.Scan(&key, &value); err != nil {
-			return fmt.Errorf("SQLite store_metadata row: scan: %w", err)
-		}
-		switch key {
-		case "next_track_id":
-			file.NextTrackID = value
-		case "next_album_id":
-			file.NextAlbumID = value
-		case "next_author_id":
-			file.NextAuthorID = value
-		case "next_user_id":
-			file.NextUserID = value
-		case "next_playlist_id":
-			file.NextPlaylistID = value
-		case "next_lyrics_id":
-			file.NextLyricsID = value
-		case "next_lyrics_line_id":
-			file.NextLyricsLineID = value
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("SQLite store_metadata rows: iterate: %w", err)
-	}
-	return nil
-}
-
-func (s *trackStore) loadSQLiteAuthors(file *diskDBFile) (returnErr error) {
-	rows, err := s.db.Query(`SELECT id, current_name, photos_json FROM authors ORDER BY id`)
-	if err != nil {
-		return err
-	}
-	defer joinRowsCloseError(&returnErr, rows, "load authors")
-
-	for rows.Next() {
-		var item author
-		var photosJSON string
-		if err := rows.Scan(&item.ID, &item.CurrentName, &photosJSON); err != nil {
-			return sqliteRowError("authors", item.ID, "scan", err)
-		}
-		if err := unmarshalJSONColumn(photosJSON, &item.Photos); err != nil {
-			return sqliteRowError("authors", item.ID, "decode photos_json", err)
-		}
-		file.Authors = append(file.Authors, item)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("SQLite authors rows: iterate: %w", err)
-	}
-	return nil
-}
-
-func (s *trackStore) loadSQLiteAlbums(file *diskDBFile) (returnErr error) {
-	rows, err := s.db.Query(`SELECT id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json FROM albums ORDER BY id`)
-	if err != nil {
-		return err
-	}
-	defer joinRowsCloseError(&returnErr, rows, "load albums")
-
-	for rows.Next() {
-		var item album
-		var authorIDsJSON, releaseDate, trackIDsJSON, additionalInfoJSON string
-		var isPublished int
-		if err := rows.Scan(&item.ID, &item.Title, &item.CoverImagePath, &authorIDsJSON, &releaseDate, &isPublished, &trackIDsJSON, &additionalInfoJSON); err != nil {
-			return sqliteRowError("albums", item.ID, "scan", err)
-		}
-		if err := unmarshalJSONColumn(authorIDsJSON, &item.AuthorIDs); err != nil {
-			return sqliteRowError("albums", item.ID, "decode author_ids_json", err)
-		}
-		if err := unmarshalJSONColumn(trackIDsJSON, &item.TrackIDs); err != nil {
-			return sqliteRowError("albums", item.ID, "decode track_ids_json", err)
-		}
-		if err := unmarshalJSONColumn(additionalInfoJSON, &item.AdditionalInfo); err != nil {
-			return sqliteRowError("albums", item.ID, "decode additional_info_json", err)
-		}
-		parsed, err := parseSQLiteTime(releaseDate)
-		if err != nil {
-			return sqliteRowError("albums", item.ID, "parse release_date", err)
-		}
-		item.ReleaseDate = parsed
-		item.IsPublished = isPublished != 0
-		file.Albums = append(file.Albums, item)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("SQLite albums rows: iterate: %w", err)
-	}
-	return nil
-}
-
-func (s *trackStore) loadSQLiteTracks(file *diskDBFile) (returnErr error) {
-	rows, err := s.db.Query(`SELECT id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at FROM tracks ORDER BY id`)
-	if err != nil {
-		return err
-	}
-	defer joinRowsCloseError(&returnErr, rows, "load tracks")
-
-	for rows.Next() {
-		var item track
-		var authorIDsJSON, additionalInfoJSON, sourceMetadataJSON, createdAt string
-		if err := rows.Scan(&item.ID, &item.Name, &authorIDsJSON, &item.AlbumID, &item.AudioFilePath, &additionalInfoJSON, &sourceMetadataJSON, &createdAt); err != nil {
-			return sqliteRowError("tracks", item.ID, "scan", err)
-		}
-		if err := unmarshalJSONColumn(authorIDsJSON, &item.AuthorIDs); err != nil {
-			return sqliteRowError("tracks", item.ID, "decode author_ids_json", err)
-		}
-		if err := unmarshalJSONColumn(additionalInfoJSON, &item.AdditionalInfo); err != nil {
-			return sqliteRowError("tracks", item.ID, "decode additional_info_json", err)
-		}
-		if err := unmarshalJSONColumn(sourceMetadataJSON, &item.SourceMetadata); err != nil {
-			return sqliteRowError("tracks", item.ID, "decode source_metadata_json", err)
-		}
-		parsedCreatedAt, err := parseSQLiteTime(createdAt)
-		if err != nil {
-			return sqliteRowError("tracks", item.ID, "parse created_at", err)
-		}
-		item.CreatedAt = parsedCreatedAt
-		raw, err := json.Marshal(item)
-		if err != nil {
-			return sqliteRowError("tracks", item.ID, "encode loaded row", err)
-		}
-		file.Tracks = append(file.Tracks, raw)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("SQLite tracks rows: iterate: %w", err)
-	}
-	return nil
-}
-
-func (s *trackStore) loadSQLiteUsers(file *diskDBFile) (returnErr error) {
-	rows, err := s.db.Query(`SELECT id, email, role, password_hash, created_at FROM users ORDER BY id`)
-	if err != nil {
-		return err
-	}
-	defer joinRowsCloseError(&returnErr, rows, "load users")
-
-	for rows.Next() {
-		var item user
-		var createdAt string
-		if err := rows.Scan(&item.ID, &item.Email, &item.Role, &item.PasswordHash, &createdAt); err != nil {
-			return sqliteRowError("users", item.ID, "scan", err)
-		}
-		parsed, err := parseSQLiteTime(createdAt)
-		if err != nil {
-			return sqliteRowError("users", item.ID, "parse created_at", err)
-		}
-		item.CreatedAt = parsed
-		file.Users = append(file.Users, item)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("SQLite users rows: iterate: %w", err)
-	}
-	return nil
-}
-
-func (s *trackStore) loadSQLiteSessions(file *diskDBFile) (returnErr error) {
-	rows, err := s.db.Query(`SELECT id, user_id, token_hash, created_at, expires_at FROM refresh_sessions ORDER BY user_id, created_at`)
-	if err != nil {
-		return err
-	}
-	defer joinRowsCloseError(&returnErr, rows, "load refresh sessions")
-
-	for rows.Next() {
-		var item refreshSession
-		var createdAt, expiresAt string
-		if err := rows.Scan(&item.ID, &item.UserID, &item.TokenHash, &createdAt, &expiresAt); err != nil {
-			return fmt.Errorf("SQLite refresh_sessions row: scan: %w", err)
-		}
-		parsedCreatedAt, err := parseSQLiteTime(createdAt)
-		if err != nil {
-			return fmt.Errorf("SQLite refresh_sessions row for user id %d: parse created_at: %w", item.UserID, err)
-		}
-		parsedExpiresAt, err := parseSQLiteTime(expiresAt)
-		if err != nil {
-			return fmt.Errorf("SQLite refresh_sessions row for user id %d: parse expires_at: %w", item.UserID, err)
-		}
-		item.CreatedAt = parsedCreatedAt
-		item.ExpiresAt = parsedExpiresAt
-		file.Sessions = append(file.Sessions, item)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("SQLite refresh_sessions rows: iterate: %w", err)
-	}
-	return nil
-}
-
-func (s *trackStore) loadSQLitePlaylists(file *diskDBFile) (returnErr error) {
-	rows, err := s.db.Query(`SELECT id, user_id, name, description, cover_image_path, visibility, share_token, track_items_json, system, kind FROM playlists ORDER BY user_id, id`)
-	if err != nil {
-		return err
-	}
-	defer joinRowsCloseError(&returnErr, rows, "load playlists")
-
-	for rows.Next() {
-		var item playlist
-		var trackItemsJSON string
-		var system int
-		if err := rows.Scan(&item.ID, &item.UserID, &item.Name, &item.Description, &item.CoverImagePath, &item.Visibility, &item.ShareToken, &trackItemsJSON, &system, &item.Kind); err != nil {
-			return sqliteRowError("playlists", item.ID, "scan", err)
-		}
-		if err := unmarshalJSONColumn(trackItemsJSON, &item.TrackItems); err != nil {
-			return sqliteRowError("playlists", item.ID, "decode track_items_json", err)
-		}
-		item.System = system != 0
-		file.Playlists = append(file.Playlists, item)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("SQLite playlists rows: iterate: %w", err)
-	}
-	return nil
-}
-
-func (s *trackStore) loadSQLiteLyrics(file *diskDBFile) (returnErr error) {
-	rows, err := s.db.Query(`SELECT id, track_id, type, plain_text, language_code, source, is_verified, updated_at, created_at, lines_json FROM lyrics ORDER BY track_id`)
-	if err != nil {
-		return err
-	}
-	defer joinRowsCloseError(&returnErr, rows, "load lyrics")
-
-	for rows.Next() {
-		var item lyrics
-		var plainText, languageCode, source sql.NullString
-		var updatedAt, createdAt, linesJSON string
-		var isVerified int
-		if err := rows.Scan(&item.ID, &item.TrackID, &item.Type, &plainText, &languageCode, &source, &isVerified, &updatedAt, &createdAt, &linesJSON); err != nil {
-			return sqliteRowError("lyrics", item.ID, "scan", err)
-		}
-		item.PlainText = nullStringPointer(plainText)
-		item.LanguageCode = nullStringPointer(languageCode)
-		item.Source = nullStringPointer(source)
-		item.IsVerified = isVerified != 0
-		parsedUpdatedAt, err := parseSQLiteTime(updatedAt)
-		if err != nil {
-			return sqliteRowError("lyrics", item.ID, "parse updated_at", err)
-		}
-		parsedCreatedAt, err := parseSQLiteTime(createdAt)
-		if err != nil {
-			return sqliteRowError("lyrics", item.ID, "parse created_at", err)
-		}
-		item.UpdatedAt = parsedUpdatedAt
-		item.CreatedAt = parsedCreatedAt
-		if err := unmarshalJSONColumn(linesJSON, &item.Lines); err != nil {
-			return sqliteRowError("lyrics", item.ID, "decode lines_json", err)
-		}
-		file.Lyrics = append(file.Lyrics, item)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("SQLite lyrics rows: iterate: %w", err)
 	}
 	return nil
 }
@@ -2381,7 +1687,9 @@ func (s *trackStore) createAlbum(req upsertAlbumRequest) (album, error) {
 		s.nextAlbumID = nextAlbumIDSnapshot
 		return album{}, err
 	}
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{
+		metadataExpected: map[string]int64{"next_album_id": nextAlbumIDSnapshot}, catalog: true,
+	}); err != nil {
 		s.albums = albumsSnapshot
 		s.tracks = tracksSnapshot
 		s.nextAlbumID = nextAlbumIDSnapshot
@@ -2428,7 +1736,7 @@ func (s *trackStore) updateAlbum(id int64, req upsertAlbumRequest) (album, bool,
 		s.tracks = tracksSnapshot
 		return album{}, true, err
 	}
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{catalog: true}); err != nil {
 		s.albums = albumsSnapshot
 		s.tracks = tracksSnapshot
 		return album{}, true, err
@@ -2448,7 +1756,7 @@ func (s *trackStore) deleteAlbum(id int64) (bool, error) {
 		return false, errAlbumInUse
 	}
 	delete(s.albums, id)
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{catalog: true}); err != nil {
 		s.albums[id] = a
 		return false, err
 	}
@@ -2497,7 +1805,9 @@ func (s *trackStore) create(req upsertTrackRequest) (track, error) {
 		s.nextTrackID = nextTrackIDSnapshot
 		return track{}, err
 	}
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{
+		metadataExpected: map[string]int64{"next_track_id": nextTrackIDSnapshot}, catalog: true,
+	}); err != nil {
 		s.albums = albumsSnapshot
 		s.tracks = tracksSnapshot
 		s.nextTrackID = nextTrackIDSnapshot
@@ -2557,7 +1867,7 @@ func (s *trackStore) update(id int64, req upsertTrackRequest) (track, bool, erro
 		s.tracks = tracksSnapshot
 		return track{}, true, err
 	}
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{catalog: true}); err != nil {
 		s.albums = albumsSnapshot
 		s.tracks = tracksSnapshot
 		return track{}, true, err
@@ -2592,7 +1902,7 @@ func (s *trackStore) delete(id int64) (bool, error) {
 		s.lyricsByTrack = lyricsSnapshot
 		return false, err
 	}
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{catalog: true, playlists: true, lyrics: true}); err != nil {
 		s.albums = albumsSnapshot
 		s.tracks = tracksSnapshot
 		s.playlists = playlistsSnapshot
@@ -2698,7 +2008,9 @@ func (s *trackStore) createPlaylist(userID int64, req upsertPlaylistRequest) (pl
 
 	s.nextPlaylistID++
 	s.playlists[p.ID] = p
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{
+		metadataExpected: map[string]int64{"next_playlist_id": p.ID}, playlists: true,
+	}); err != nil {
 		delete(s.playlists, p.ID)
 		s.nextPlaylistID--
 		return playlistResponse{}, err
@@ -2731,7 +2043,7 @@ func (s *trackStore) updatePlaylist(userID, playlistID int64, req upsertPlaylist
 	}
 
 	s.playlists[playlistID] = updated
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
 		s.playlists[playlistID] = current
 		return playlistResponse{}, true, err
 	}
@@ -2767,7 +2079,7 @@ func (s *trackStore) updatePlaylistCoverImage(userID, playlistID int64, coverIma
 	updated := current
 	updated.CoverImagePath = strings.TrimSpace(coverImagePath)
 	s.playlists[playlistID] = updated
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
 		s.playlists[playlistID] = current
 		return playlistResponse{}, true, err
 	}
@@ -2786,7 +2098,7 @@ func (s *trackStore) deletePlaylist(userID, playlistID int64) (bool, error) {
 		return false, errSystemPlaylistImmutable
 	}
 	delete(s.playlists, playlistID)
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
 		s.playlists[playlistID] = current
 		return false, err
 	}
@@ -2939,7 +2251,7 @@ func (s *trackStore) addTrackToPlaylists(userID, trackID int64, playlistIDs []in
 		p.TrackItems = appendPlaylistTrack(p.TrackItems, playlistTrack{TrackID: trackID})
 		s.playlists[playlistID] = p
 	}
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
 		s.playlists = playlistsSnapshot
 		return err
 	}
@@ -2964,7 +2276,7 @@ func (s *trackStore) removeTrackFromPlaylist(userID, playlistID, trackID int64) 
 	}
 	p.TrackItems = updated
 	s.playlists[playlistID] = p
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
 		s.playlists[playlistID] = original
 		return false, err
 	}
@@ -3013,7 +2325,7 @@ func (s *trackStore) setTrackPreference(userID, trackID int64, kind string, enab
 		}
 	}
 
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
 		s.playlists = playlistsSnapshot
 		return err
 	}
@@ -3193,7 +2505,7 @@ func (s *trackStore) reorderPlaylistTracks(userID, playlistID int64, trackIDs []
 	currentPlaylist := clonePlaylist(p)
 	p.TrackItems = reorderPlaylistTrackItems(p.TrackItems, trackIDs)
 	s.playlists[playlistID] = p
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
 		s.playlists[playlistID] = currentPlaylist
 		return true, err
 	}
@@ -3378,7 +2690,9 @@ func (s *trackStore) createAuthor(req upsertAuthorRequest) (author, error) {
 
 	s.nextAuthorID++
 	s.authors[a.ID] = a
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{
+		metadataExpected: map[string]int64{"next_author_id": a.ID}, authors: true,
+	}); err != nil {
 		delete(s.authors, a.ID)
 		s.nextAuthorID--
 		return author{}, err
@@ -3484,7 +2798,7 @@ func (s *trackStore) updateAuthor(id int64, req upsertAuthorRequest) (author, bo
 	}
 
 	s.authors[id] = a
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{authors: true}); err != nil {
 		s.authors[id] = current
 		return author{}, true, err
 	}
@@ -3508,7 +2822,7 @@ func (s *trackStore) deleteAuthor(id int64) (bool, error) {
 	}
 
 	delete(s.authors, id)
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{authors: true}); err != nil {
 		s.authors[id] = current
 		return false, err
 	}
@@ -3545,7 +2859,12 @@ func (s *trackStore) createUser(email, passwordHash string) (user, error) {
 	dislikesPlaylist := s.newDislikesPlaylistLocked(u.ID)
 	s.playlists[favoritesPlaylist.ID] = favoritesPlaylist
 	s.playlists[dislikesPlaylist.ID] = dislikesPlaylist
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{
+		metadataExpected: map[string]int64{
+			"next_user_id": u.ID, "next_playlist_id": nextPlaylistIDSnapshot,
+		},
+		users: true, playlists: true,
+	}); err != nil {
 		delete(s.users, u.ID)
 		delete(s.usersByEmail, email)
 		delete(s.playlists, favoritesPlaylist.ID)
@@ -3610,7 +2929,7 @@ func (s *trackStore) createRefreshSession(userID int64, expiresAt time.Time) (re
 	}
 
 	s.refreshSession[session.ID] = session
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{sessions: true}); err != nil {
 		s.refreshSession = sessionsSnapshot
 		return refreshSession{}, "", err
 	}
@@ -3634,7 +2953,7 @@ func (s *trackStore) rotateRefreshSession(rawToken string, expiresAt time.Time) 
 	u, ok := s.users[session.UserID]
 	if !ok {
 		delete(s.refreshSession, session.ID)
-		if err := s.persistLocked(); err != nil {
+		if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{sessions: true}); err != nil {
 			s.refreshSession = sessionsSnapshot
 			return user{}, refreshSession{}, "", fmt.Errorf("remove refresh session for missing user: %w", err)
 		}
@@ -3664,7 +2983,7 @@ func (s *trackStore) rotateRefreshSession(rawToken string, expiresAt time.Time) 
 	}
 
 	s.refreshSession[newSession.ID] = newSession
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{sessions: true}); err != nil {
 		s.refreshSession = sessionsSnapshot
 		return user{}, refreshSession{}, "", err
 	}
@@ -3681,7 +3000,7 @@ func (s *trackStore) deleteRefreshSession(rawToken string) (bool, error) {
 		return false, nil
 	}
 	delete(s.refreshSession, session.ID)
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{sessions: true}); err != nil {
 		s.refreshSession[session.ID] = session
 		return false, err
 	}
@@ -3704,285 +3023,6 @@ func (s *trackStore) removeExpiredSessionsLocked(now time.Time) {
 			delete(s.refreshSession, id)
 		}
 	}
-}
-
-func (s *trackStore) getOrCreateAuthorIDLocked(name string) int64 {
-	normalized := strings.ToLower(strings.TrimSpace(name))
-	for id, a := range s.authors {
-		if strings.ToLower(a.CurrentName) == normalized {
-			return id
-		}
-	}
-
-	id := s.nextAuthorID
-	s.nextAuthorID++
-	s.authors[id] = author{
-		ID:          id,
-		CurrentName: strings.TrimSpace(name),
-		Photos:      []string{},
-	}
-	return id
-}
-
-func (s *trackStore) backfillMissingTrackCreatedAtLocked(baseTime time.Time) {
-	ids := make([]int64, 0, len(s.tracks))
-	for id, item := range s.tracks {
-		if item.CreatedAt.IsZero() {
-			ids = append(ids, id)
-		}
-	}
-	sort.Slice(ids, func(i, j int) bool {
-		return ids[i] > ids[j]
-	})
-
-	baseTime = baseTime.UTC().Truncate(time.Second)
-	for index, id := range ids {
-		item := s.tracks[id]
-		item.CreatedAt = baseTime.Add(-time.Duration(index) * time.Second)
-		s.tracks[id] = item
-	}
-}
-
-func (s *trackStore) persistLocked() (returnErr error) {
-	if s.db == nil {
-		return errors.New("sqlite database is not initialized")
-	}
-
-	trackItems := make([]track, 0, len(s.tracks))
-	for _, t := range s.tracks {
-		trackItems = append(trackItems, t)
-	}
-	sort.Slice(trackItems, func(i, j int) bool {
-		return trackItems[i].ID < trackItems[j].ID
-	})
-
-	albumItems := make([]album, 0, len(s.albums))
-	for _, a := range s.albums {
-		albumItems = append(albumItems, a)
-	}
-	sort.Slice(albumItems, func(i, j int) bool {
-		return albumItems[i].ID < albumItems[j].ID
-	})
-
-	authorItems := make([]author, 0, len(s.authors))
-	for _, a := range s.authors {
-		authorItems = append(authorItems, a)
-	}
-	sort.Slice(authorItems, func(i, j int) bool {
-		return authorItems[i].ID < authorItems[j].ID
-	})
-
-	userItems := make([]user, 0, len(s.users))
-	for _, u := range s.users {
-		userItems = append(userItems, u)
-	}
-	sort.Slice(userItems, func(i, j int) bool {
-		return userItems[i].ID < userItems[j].ID
-	})
-
-	sessionItems := make([]refreshSession, 0, len(s.refreshSession))
-	for _, session := range s.refreshSession {
-		sessionItems = append(sessionItems, session)
-	}
-	sort.Slice(sessionItems, func(i, j int) bool {
-		if sessionItems[i].UserID == sessionItems[j].UserID {
-			return sessionItems[i].CreatedAt.Before(sessionItems[j].CreatedAt)
-		}
-		return sessionItems[i].UserID < sessionItems[j].UserID
-	})
-
-	playlistItems := make([]playlist, 0, len(s.playlists))
-	for _, p := range s.playlists {
-		playlistItems = append(playlistItems, clonePlaylist(p))
-	}
-	sort.Slice(playlistItems, func(i, j int) bool {
-		if playlistItems[i].UserID == playlistItems[j].UserID {
-			return playlistItems[i].ID < playlistItems[j].ID
-		}
-		return playlistItems[i].UserID < playlistItems[j].UserID
-	})
-
-	lyricsItems := make([]lyrics, 0, len(s.lyricsByTrack))
-	for _, item := range s.lyricsByTrack {
-		lyricsItems = append(lyricsItems, cloneLyrics(item))
-	}
-	sort.Slice(lyricsItems, func(i, j int) bool {
-		return lyricsItems[i].TrackID < lyricsItems[j].TrackID
-	})
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			joinRollbackError(&returnErr, tx, "persist track store")
-		}
-	}()
-
-	for _, table := range []string{"store_metadata", "authors", "albums", "tracks", "users", "refresh_sessions", "playlists", "lyrics"} {
-		if _, err := tx.Exec("DELETE FROM " + table); err != nil {
-			return err
-		}
-	}
-
-	metadata := map[string]int64{
-		"next_track_id":       s.nextTrackID,
-		"next_album_id":       s.nextAlbumID,
-		"next_author_id":      s.nextAuthorID,
-		"next_user_id":        s.nextUserID,
-		"next_playlist_id":    s.nextPlaylistID,
-		"next_lyrics_id":      s.nextLyricsID,
-		"next_lyrics_line_id": s.nextLyricsLineID,
-	}
-	for key, value := range metadata {
-		if _, err := tx.Exec(`INSERT INTO store_metadata (key, value) VALUES (?, ?)`, key, value); err != nil {
-			return err
-		}
-	}
-
-	for _, a := range authorItems {
-		photosJSON, err := marshalJSONColumn(a.Photos)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`INSERT INTO authors (id, current_name, photos_json) VALUES (?, ?, ?)`, a.ID, a.CurrentName, photosJSON); err != nil {
-			return err
-		}
-	}
-
-	for _, a := range albumItems {
-		authorIDsJSON, err := marshalJSONColumn(a.AuthorIDs)
-		if err != nil {
-			return err
-		}
-		trackIDsJSON, err := marshalJSONColumn(a.TrackIDs)
-		if err != nil {
-			return err
-		}
-		additionalInfoJSON, err := marshalJSONColumn(a.AdditionalInfo)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(
-			`INSERT INTO albums (id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			a.ID,
-			a.Title,
-			a.CoverImagePath,
-			authorIDsJSON,
-			formatSQLiteTime(a.ReleaseDate),
-			boolToSQLiteInt(a.IsPublished),
-			trackIDsJSON,
-			additionalInfoJSON,
-		); err != nil {
-			return err
-		}
-	}
-
-	for _, t := range trackItems {
-		authorIDsJSON, err := marshalJSONColumn(t.AuthorIDs)
-		if err != nil {
-			return err
-		}
-		additionalInfoJSON, err := marshalJSONColumn(t.AdditionalInfo)
-		if err != nil {
-			return err
-		}
-		sourceMetadataJSON, err := marshalJSONColumn(t.SourceMetadata)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(
-			`INSERT INTO tracks (id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			t.ID,
-			t.Name,
-			authorIDsJSON,
-			t.AlbumID,
-			t.AudioFilePath,
-			additionalInfoJSON,
-			sourceMetadataJSON,
-			formatSQLiteTime(t.CreatedAt),
-		); err != nil {
-			return err
-		}
-	}
-
-	for _, u := range userItems {
-		if _, err := tx.Exec(
-			`INSERT INTO users (id, email, role, password_hash, created_at) VALUES (?, ?, ?, ?, ?)`,
-			u.ID,
-			u.Email,
-			u.Role,
-			u.PasswordHash,
-			formatSQLiteTime(u.CreatedAt),
-		); err != nil {
-			return err
-		}
-	}
-
-	for _, session := range sessionItems {
-		if _, err := tx.Exec(
-			`INSERT INTO refresh_sessions (id, user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)`,
-			session.ID,
-			session.UserID,
-			session.TokenHash,
-			formatSQLiteTime(session.CreatedAt),
-			formatSQLiteTime(session.ExpiresAt),
-		); err != nil {
-			return err
-		}
-	}
-
-	for _, p := range playlistItems {
-		trackItemsJSON, err := marshalJSONColumn(p.TrackItems)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(
-			`INSERT INTO playlists (id, user_id, name, description, cover_image_path, visibility, share_token, track_items_json, system, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			p.ID,
-			p.UserID,
-			p.Name,
-			p.Description,
-			p.CoverImagePath,
-			p.Visibility,
-			p.ShareToken,
-			trackItemsJSON,
-			boolToSQLiteInt(p.System),
-			p.Kind,
-		); err != nil {
-			return err
-		}
-	}
-
-	for _, item := range lyricsItems {
-		linesJSON, err := marshalJSONColumn(item.Lines)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(
-			`INSERT INTO lyrics (id, track_id, type, plain_text, language_code, source, is_verified, updated_at, created_at, lines_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			item.ID,
-			item.TrackID,
-			item.Type,
-			sqlNullString(item.PlainText),
-			sqlNullString(item.LanguageCode),
-			sqlNullString(item.Source),
-			boolToSQLiteInt(item.IsVerified),
-			formatSQLiteTime(item.UpdatedAt),
-			formatSQLiteTime(item.CreatedAt),
-			linesJSON,
-		); err != nil {
-			return err
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	return nil
 }
 
 func marshalJSONColumn(v any) (string, error) {
@@ -6850,38 +5890,6 @@ func sourceMetadataIdentityKey(identity map[string]any) (string, error) {
 		return "", errors.New("identity must not be empty")
 	}
 	return string(encoded), nil
-}
-
-func (s *trackStore) migrateLegacyAlbumsLocked() error {
-	trackIDs := make([]int64, 0, len(s.tracks))
-	for id := range s.tracks {
-		trackIDs = append(trackIDs, id)
-	}
-	sort.Slice(trackIDs, func(i, j int) bool {
-		return trackIDs[i] < trackIDs[j]
-	})
-
-	for _, trackID := range trackIDs {
-		t := s.tracks[trackID]
-		if t.AlbumID > 0 {
-			continue
-		}
-		albumID := s.nextAlbumID
-		s.nextAlbumID++
-		s.albums[albumID] = album{
-			ID:             albumID,
-			Title:          "STUB ALBUM",
-			CoverImagePath: "",
-			AuthorIDs:      []int64{},
-			ReleaseDate:    time.Now().UTC(),
-			IsPublished:    false,
-			TrackIDs:       []int64{trackID},
-			AdditionalInfo: []additionalInfo{},
-		}
-		t.AlbumID = albumID
-		s.tracks[trackID] = t
-	}
-	return nil
 }
 
 func (s *trackStore) ensureSystemPlaylistsLocked() error {

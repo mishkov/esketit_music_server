@@ -1469,7 +1469,7 @@ func newTelegramImportTestService(t *testing.T, gateway telegramGateway) (*teleg
 	songsDir := filepath.Join(root, "songs")
 	tempRoot := filepath.Join(root, "telegram_import_tmp")
 	stateDir := filepath.Join(root, "telegram_state")
-	dbPath := filepath.Join(root, "tracks_db.json")
+	dbPath := filepath.Join(root, "tracks.db")
 
 	for _, dir := range []string{songsDir, tempRoot, stateDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
