@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -201,7 +202,17 @@ func (s *trackStore) upsertLyrics(trackID int64, req upsertLyricsRequest) (lyric
 	}
 
 	s.lyricsByTrack[trackID] = item
-	if err := s.persistLocked(); err != nil {
+	metadataExpected := make(map[string]int64, 2)
+	if s.nextLyricsID > nextLyricsIDSnapshot {
+		metadataExpected["next_lyrics_id"] = nextLyricsIDSnapshot
+	}
+	if s.nextLyricsLineID > nextLyricsLineIDSnapshot {
+		metadataExpected["next_lyrics_line_id"] = nextLyricsLineIDSnapshot
+	}
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{
+		metadataExpected: metadataExpected,
+		lyrics:           true,
+	}); err != nil {
 		s.lyricsByTrack = snapshot
 		s.nextLyricsID = nextLyricsIDSnapshot
 		s.nextLyricsLineID = nextLyricsLineIDSnapshot
@@ -224,7 +235,7 @@ func (s *trackStore) deleteLyrics(trackID int64) error {
 
 	snapshot := cloneLyricsMap(s.lyricsByTrack)
 	delete(s.lyricsByTrack, trackID)
-	if err := s.persistLocked(); err != nil {
+	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{lyrics: true}); err != nil {
 		s.lyricsByTrack = snapshot
 		return fmt.Errorf("persist lyrics deletion: %w", err)
 	}

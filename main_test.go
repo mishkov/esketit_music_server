@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -683,9 +684,9 @@ func TestNewTrackStoreBackfillsMissingDislikesPlaylist(t *testing.T) {
 		t.Fatal("missing initial dislikes playlist")
 	}
 	delete(store.playlists, dislikes.ID)
-	if err := store.persistLocked(); err != nil {
+	if err := store.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
 		store.mu.Unlock()
-		t.Fatalf("persistLocked() error = %v", err)
+		t.Fatalf("commitDomainChangesLocked() error = %v", err)
 	}
 	store.mu.Unlock()
 	if err := store.db.Close(); err != nil {
@@ -2358,48 +2359,61 @@ func TestAutoplayNextHandlerReturnsNotFoundForMissingTrackContext(t *testing.T) 
 	}
 }
 
-func TestNewTrackStoreNormalizesLegacyBareAudioFilePath(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "tracks_db.json")
-	file := diskDBFile{
-		NextTrackID:  2,
-		NextAlbumID:  2,
-		NextAuthorID: 2,
-		Tracks: []json.RawMessage{
-			json.RawMessage(`{"id":1,"name":"Legacy Track","authorIds":[1],"albumId":1,"audioFilePath":"Kino_-_Kamchatka_(SkySound.cc)-0HGJwR05.mp3","additionalInfo":[],"sourceMetadata":[]}`),
-		},
-		Albums: []album{
-			{
-				ID:             1,
-				Title:          "Album",
-				AuthorIDs:      []int64{1},
-				ReleaseDate:    time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
-				TrackIDs:       []int64{1},
-				AdditionalInfo: []additionalInfo{},
-			},
-		},
-		Authors: []author{
-			{ID: 1, CurrentName: "Author", Photos: []string{}},
-		},
-	}
-	data, err := json.Marshal(file)
-	if err != nil {
-		t.Fatalf("Marshal() error = %v", err)
-	}
-	if err := os.WriteFile(dbPath, data, 0o644); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
-
+func TestNewTrackStoreNormalizesStoredBareAudioFilePath(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "tracks.db")
 	store, err := newTrackStore(dbPath)
 	if err != nil {
 		t.Fatalf("newTrackStore() error = %v", err)
 	}
+	artist, albumItem := seedPlaylistTrackDependencies(t, store)
+	trackItem, err := store.create(upsertTrackRequest{
+		Name:          "Stored Track",
+		AuthorIDs:     []int64{artist.ID},
+		AlbumID:       albumItem.ID,
+		AudioFilePath: "/api/songs/original.mp3",
+	})
+	if err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+	if _, err := store.db.Exec(`UPDATE tracks SET audio_file_path = ? WHERE id = ?`,
+		"Kino_-_Kamchatka_(SkySound.cc)-0HGJwR05.mp3", trackItem.ID); err != nil {
+		t.Fatalf("update stored audio path: %v", err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
 
-	got, ok := store.getTrackResponse(1, 0)
+	store, err = newTrackStore(dbPath)
+	if err != nil {
+		t.Fatalf("newTrackStore() reload error = %v", err)
+	}
+	defer store.db.Close()
+
+	got, ok := store.getTrackResponse(trackItem.ID, 0)
 	if !ok {
 		t.Fatalf("getTrackResponse() ok = false, want true")
 	}
 	if got.AudioFilePath != "/api/songs/Kino_-_Kamchatka_%28SkySound.cc%29-0HGJwR05.mp3" {
 		t.Fatalf("got.AudioFilePath = %q", got.AudioFilePath)
+	}
+}
+
+func TestNewTrackStoreDoesNotImportJSONDatabase(t *testing.T) {
+	root := t.TempDir()
+	jsonPath := filepath.Join(root, "tracks_db.json")
+	if err := os.WriteFile(jsonPath, []byte(`{"tracks":[]}`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	store, err := newTrackStore(jsonPath)
+	if store != nil {
+		_ = store.db.Close()
+	}
+	if err == nil {
+		t.Fatal("newTrackStore() error = nil, want non-SQLite database rejection")
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "tracks_db.sqlite")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("automatic SQLite sidecar stat error = %v, want not-exist", statErr)
 	}
 }
 
@@ -2764,7 +2778,7 @@ func TestAutoplayReportsUnexpectedLocalSongStatFailure(t *testing.T) {
 func newTestTrackStore(t *testing.T) *trackStore {
 	t.Helper()
 
-	dbPath := filepath.Join(t.TempDir(), "tracks_db.json")
+	dbPath := filepath.Join(t.TempDir(), "tracks.db")
 	store, err := newTrackStore(dbPath)
 	if err != nil {
 		t.Fatalf("newTrackStore() error = %v", err)

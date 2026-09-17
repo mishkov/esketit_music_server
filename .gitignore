@@ -1,4 +1,7 @@
 tracks_db.json
+tracks.db
+tracks.db-shm
+tracks.db-wal
 tracks_db.sqlite
 tracks_db.sqlite-shm
 tracks_db.sqlite-wal

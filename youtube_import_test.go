@@ -1101,7 +1101,7 @@ func newYouTubeImportTestService(t *testing.T, gateway youtubeImportGateway) (*y
 	root := t.TempDir()
 	songsDir := filepath.Join(root, "songs")
 	tempRoot := filepath.Join(root, "youtube_import_tmp")
-	dbPath := filepath.Join(root, "tracks_db.json")
+	dbPath := filepath.Join(root, "tracks.db")
 
 	for _, dir := range []string{songsDir, tempRoot} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
