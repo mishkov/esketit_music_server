@@ -2308,6 +2308,7 @@ func (g *liveYouTubeImportGateway) scanPlaylist(ctx context.Context, client *you
 	if err != nil {
 		return nil, err
 	}
+	albumTitle := normalizeYouTubeMusicAlbumTitle(playlist.ID, playlist.Title)
 	items := make([]youtubeImportItem, 0, len(playlist.Videos))
 	seen := make(map[string]struct{}, len(playlist.Videos))
 	entryFailures := make([]error, 0)
@@ -2315,11 +2316,11 @@ func (g *liveYouTubeImportGateway) scanPlaylist(ctx context.Context, client *you
 		item := youtubeImportItem{}
 		video, err := client.VideoFromPlaylistEntryContext(ctx, entry)
 		if err == nil {
-			item = buildYouTubeImportItem(video, buildYouTubeWatchURL(video.ID, linkProvider), originalURL, linkProvider, playlist.Title)
-			item = mergePlaylistEntryFallback(item, entry, originalURL, linkProvider, playlist.Title)
+			item = buildYouTubeImportItem(video, buildYouTubeWatchURL(video.ID, linkProvider), originalURL, linkProvider, albumTitle)
+			item = mergePlaylistEntryFallback(item, entry, originalURL, linkProvider, albumTitle)
 		} else {
 			entryFailures = append(entryFailures, err)
-			item = buildYouTubeImportItemFromPlaylistEntry(entry, originalURL, linkProvider, playlist.Title)
+			item = buildYouTubeImportItemFromPlaylistEntry(entry, originalURL, linkProvider, albumTitle)
 		}
 		if !isImportableYouTubeVideo(item) || !passesYouTubeCutoff(item, cutoff) {
 			continue
@@ -2357,11 +2358,12 @@ func (g *liveYouTubeImportGateway) scanPlaylistWithYTDLP(ctx context.Context, pl
 	}
 
 	defaultAuthor := firstNonEmpty(dump.Channel, dump.Uploader)
+	albumTitle := normalizeYouTubeMusicAlbumTitle(youtubePlaylistIDFromURL(playlistURL), dump.Title)
 	items := make([]youtubeImportItem, 0, len(entries))
 	seen := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
 		item := buildYouTubeImportItemFromYTDLPEntry(entry, originalURL, linkProvider, defaultAuthor)
-		item.ParsedAlbumTitle = strings.TrimSpace(dump.Title)
+		item.ParsedAlbumTitle = albumTitle
 		if !isImportableYouTubeVideo(item) || !passesYouTubeCutoff(item, cutoff) {
 			continue
 		}
@@ -2651,6 +2653,33 @@ func parseYouTubeTitleAndAuthor(rawTitle, publisher string) (string, string) {
 		return title, fallbackAuthor
 	}
 	return parsedTitle, author
+}
+
+func normalizeYouTubeMusicAlbumTitle(playlistID, title string) string {
+	const (
+		youtubeMusicAlbumPlaylistPrefix = "OLAK5uy_"
+		youtubeMusicAlbumTitlePrefix    = "Album - "
+	)
+
+	trimmedTitle := strings.TrimSpace(title)
+	if !strings.HasPrefix(strings.TrimSpace(playlistID), youtubeMusicAlbumPlaylistPrefix) ||
+		!strings.HasPrefix(trimmedTitle, youtubeMusicAlbumTitlePrefix) {
+		return trimmedTitle
+	}
+
+	normalizedTitle := strings.TrimSpace(strings.TrimPrefix(trimmedTitle, youtubeMusicAlbumTitlePrefix))
+	if normalizedTitle == "" {
+		return trimmedTitle
+	}
+	return normalizedTitle
+}
+
+func youtubePlaylistIDFromURL(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(parsed.Query().Get("list"))
 }
 
 func buildYouTubeImportItem(video *youtube.Video, sourceURL, originalURL, linkProvider, albumTitle string) youtubeImportItem {
