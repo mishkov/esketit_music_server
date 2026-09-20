@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -524,6 +525,60 @@ func TestParseYouTubeTitleAndAuthor(t *testing.T) {
 	}
 }
 
+func TestNormalizeYouTubeMusicAlbumTitle(t *testing.T) {
+	tests := []struct {
+		name       string
+		playlistID string
+		title      string
+		want       string
+	}{
+		{
+			name:       "album playlist",
+			playlistID: "OLAK5uy_mBUtTPciMppnVrH0Yg6HYJlZ3dCg_JnTc",
+			title:      "Album - The Pale Emperor",
+			want:       "The Pale Emperor",
+		},
+		{
+			name:       "surrounding whitespace",
+			playlistID: "  OLAK5uy_mBUtTPciMppnVrH0Yg6HYJlZ3dCg_JnTc  ",
+			title:      "  Album -   The Pale Emperor  ",
+			want:       "The Pale Emperor",
+		},
+		{
+			name:       "ordinary playlist",
+			playlistID: "PL1234567890",
+			title:      "Album - Favorites",
+			want:       "Album - Favorites",
+		},
+		{
+			name:       "empty title",
+			playlistID: "OLAK5uy_empty",
+			title:      "   ",
+			want:       "",
+		},
+		{
+			name:       "prefix-only title",
+			playlistID: "OLAK5uy_prefix_only",
+			title:      "  Album -   ",
+			want:       "Album -",
+		},
+		{
+			name:       "unverified collection marker",
+			playlistID: "OLAK5uy_ep",
+			title:      "EP - A Short Release",
+			want:       "EP - A Short Release",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := normalizeYouTubeMusicAlbumTitle(test.playlistID, test.title); got != test.want {
+				t.Fatalf("normalizeYouTubeMusicAlbumTitle(%q, %q) = %q, want %q", test.playlistID, test.title, got, test.want)
+			}
+		})
+	}
+}
+
 func TestYouTubeImportItemBuildersStoreParsedTitleAndAuthor(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -837,7 +892,7 @@ func TestLiveYouTubeImportGatewayPlaylistFallsBackToYTDLP(t *testing.T) {
 	root := t.TempDir()
 	argsPath := filepath.Join(root, "args.txt")
 	binaryPath := filepath.Join(root, "fake-yt-dlp.sh")
-	dumpJSON := `{"title":"Fallback Playlist","channel":"Artist","entries":[{"id":"video-1","title":"Fallback Track","channel":"Artist","duration":180,"timestamp":1714079251}]}`
+	dumpJSON := `{"title":"Album - Favorites","channel":"Artist","entries":[{"id":"video-1","title":"Fallback Track","channel":"Artist","duration":180,"timestamp":1714079251}]}`
 	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + argsPath + "'\ncat <<'EOF'\n" + dumpJSON + "\nEOF\n"
 	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(%s) error = %v", binaryPath, err)
@@ -857,7 +912,7 @@ func TestLiveYouTubeImportGatewayPlaylistFallsBackToYTDLP(t *testing.T) {
 	if source.SourceType != youtubeImportSourcePlaylist || len(items) != 1 {
 		t.Fatalf("Scan() source=%#v items=%#v", source, items)
 	}
-	if items[0].ParsedTitle != "Fallback Track" || items[0].ParsedAlbumTitle != "Fallback Playlist" {
+	if items[0].ParsedTitle != "Fallback Track" || items[0].ParsedAlbumTitle != "Album - Favorites" {
 		t.Fatalf("fallback item = %#v", items[0])
 	}
 	argsData, err := os.ReadFile(argsPath)
@@ -868,6 +923,86 @@ func TestLiveYouTubeImportGatewayPlaylistFallsBackToYTDLP(t *testing.T) {
 	for _, expected := range []string{"--ignore-config", "--yes-playlist", "--skip-download", "--dump-single-json"} {
 		if !containsString(args, expected) {
 			t.Fatalf("yt-dlp playlist args = %#v, want %s", args, expected)
+		}
+	}
+}
+
+func TestLiveYouTubeImportGatewayNativeAlbumPlaylistNormalizesEveryItem(t *testing.T) {
+	const playlistID = "OLAK5uy_mBUtTPciMppnVrH0Yg6HYJlZ3dCg_JnTc"
+	playlistJSON := `{
+		"metadata":{"playlistHeaderRenderer":{"title":{"runs":[{"text":" Album - The Pale Emperor "}]},"ownerText":{"runs":[{"text":"Marilyn Manson"}]}}},
+		"contents":{"twoColumnBrowseResultsRenderer":{"tabs":[{"tabRenderer":{"content":{"sectionListRenderer":{"contents":[{"itemSectionRenderer":{"contents":[{"playlistVideoListRenderer":{"contents":[
+			{"playlistVideoRenderer":{"videoId":"video-1","title":{"runs":[{"text":"Track One"}]},"shortBylineText":{"runs":[{"text":"Marilyn Manson"}]},"lengthSeconds":"180","thumbnail":{"thumbnails":[]}}},
+			{"playlistVideoRenderer":{"videoId":"video-2","title":{"runs":[{"text":"Track Two"}]},"shortBylineText":{"runs":[{"text":"Marilyn Manson"}]},"lengthSeconds":"240","thumbnail":{"thumbnails":[]}}}
+		]}}]}}]}}}}]}}
+	}`
+
+	gateway := newLiveYouTubeImportGateway(youtubeImportConfig{RequestTimeout: time.Second}, newYouTubeCookieStore(""))
+	gateway.httpClient = &http.Client{Transport: youtubeRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		responseBody := "\nytcfg.set({\"INNERTUBE_CONTEXT\":{\"client\":{\"VisitorData\":\"visitor\"}}});"
+		if strings.Contains(req.URL.Path, "/youtubei/v1/browse") {
+			responseBody = playlistJSON
+		} else if req.URL.Path != "" && req.URL.Path != "/" {
+			return nil, errors.New("video metadata unavailable")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(responseBody)),
+		}, nil
+	})}
+
+	items, err := gateway.scanPlaylist(
+		context.Background(),
+		gateway.newClient(),
+		"https://www.youtube.com/playlist?list="+playlistID,
+		"https://music.youtube.com/playlist?list="+playlistID,
+		"youtube_music",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("scanPlaylist() error = %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("len(items) = %d, want 2", len(items))
+	}
+	for index, item := range items {
+		if item.ParsedAlbumTitle != "The Pale Emperor" {
+			t.Fatalf("items[%d].ParsedAlbumTitle = %q, want The Pale Emperor", index, item.ParsedAlbumTitle)
+		}
+	}
+}
+
+func TestLiveYouTubeImportGatewayAlbumPlaylistFallbackNormalizesEveryItem(t *testing.T) {
+	root := t.TempDir()
+	binaryPath := filepath.Join(root, "fake-yt-dlp.sh")
+	dumpJSON := `{"title":"  Album - The Pale Emperor  ","channel":"Marilyn Manson","entries":[{"id":"video-1","title":"Track One","channel":"Marilyn Manson","duration":180},{"id":"video-2","title":"Track Two","channel":"Marilyn Manson","duration":240}]}`
+	script := "#!/bin/sh\ncat <<'EOF'\n" + dumpJSON + "\nEOF\n"
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", binaryPath, err)
+	}
+
+	gateway := newLiveYouTubeImportGateway(youtubeImportConfig{
+		RequestTimeout: time.Second,
+		YTDLPBinary:    binaryPath,
+	}, newYouTubeCookieStore(""))
+	items, err := gateway.scanPlaylistWithYTDLP(
+		context.Background(),
+		"https://www.youtube.com/playlist?list=OLAK5uy_mBUtTPciMppnVrH0Yg6HYJlZ3dCg_JnTc",
+		"https://music.youtube.com/playlist?list=OLAK5uy_mBUtTPciMppnVrH0Yg6HYJlZ3dCg_JnTc",
+		"youtube_music",
+		nil,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("scanPlaylistWithYTDLP() error = %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("len(items) = %d, want 2", len(items))
+	}
+	for index, item := range items {
+		if item.ParsedAlbumTitle != "The Pale Emperor" {
+			t.Fatalf("items[%d].ParsedAlbumTitle = %q, want The Pale Emperor", index, item.ParsedAlbumTitle)
 		}
 	}
 }
