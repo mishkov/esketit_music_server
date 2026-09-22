@@ -520,7 +520,7 @@ func TestDislikePreferenceIsIdempotentAndMutuallyExclusive(t *testing.T) {
 	if !ok || got.IsFavorite || !got.IsDisliked {
 		t.Fatalf("disliked track response = %#v, ok=%v", got, ok)
 	}
-	dislikes, ok := store.findPlaylistByKindLocked(user.ID, playlistKindDislikes)
+	dislikes, ok := testPlaylistByKind(t, store, user.ID, playlistKindDislikes)
 	if !ok || len(dislikes.TrackItems) != 1 {
 		t.Fatalf("dislikes playlist = %#v, ok=%v", dislikes, ok)
 	}
@@ -650,7 +650,7 @@ func TestSystemPlaylistsRejectGenericMutation(t *testing.T) {
 	}
 
 	for _, kind := range []string{playlistKindFavorites, playlistKindDislikes} {
-		p, ok := store.findPlaylistByKindLocked(user.ID, kind)
+		p, ok := testPlaylistByKind(t, store, user.ID, kind)
 		if !ok {
 			t.Fatalf("missing %s playlist", kind)
 		}
@@ -677,18 +677,13 @@ func TestNewTrackStoreBackfillsMissingDislikesPlaylist(t *testing.T) {
 		t.Fatalf("createUser() error = %v", err)
 	}
 
-	store.mu.Lock()
-	dislikes, ok := store.findPlaylistByKindLocked(user.ID, playlistKindDislikes)
+	dislikes, ok := testPlaylistByKind(t, store, user.ID, playlistKindDislikes)
 	if !ok {
-		store.mu.Unlock()
 		t.Fatal("missing initial dislikes playlist")
 	}
-	delete(store.playlists, dislikes.ID)
-	if err := store.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
-		store.mu.Unlock()
-		t.Fatalf("commitDomainChangesLocked() error = %v", err)
+	if _, err := store.db.Exec(`DELETE FROM playlists WHERE id = ?`, dislikes.ID); err != nil {
+		t.Fatalf("delete dislikes playlist: %v", err)
 	}
-	store.mu.Unlock()
 	if err := store.db.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
@@ -1114,14 +1109,14 @@ func TestListTrackResponsesSortsByCreatedAtDesc(t *testing.T) {
 	}
 
 	baseTime := time.Date(2026, time.July, 12, 9, 0, 0, 0, time.UTC)
-	store.mu.Lock()
 	first.CreatedAt = baseTime
 	second.CreatedAt = baseTime.Add(time.Second)
 	third.CreatedAt = baseTime.Add(time.Second)
-	store.tracks[first.ID] = first
-	store.tracks[second.ID] = second
-	store.tracks[third.ID] = third
-	store.mu.Unlock()
+	for _, item := range []track{first, second, third} {
+		if _, err := store.db.Exec(`UPDATE tracks SET created_at = ? WHERE id = ?`, formatSQLiteTime(item.CreatedAt), item.ID); err != nil {
+			t.Fatalf("update track creation time: %v", err)
+		}
+	}
 
 	page := store.listTrackResponses(0, trackListFilter{
 		Sort:  trackListSortCreatedAt,
@@ -1516,12 +1511,13 @@ func TestSearchHandlerUsesOptionalAuthForFavoritesAndAdminAlbumVisibility(t *tes
 		t.Fatalf("createUser() admin error = %v", err)
 	}
 
-	store.mu.Lock()
 	listener.Role = roleListener
-	store.users[listener.ID] = listener
 	admin.Role = roleAdmin
-	store.users[admin.ID] = admin
-	store.mu.Unlock()
+	for _, item := range []user{listener, admin} {
+		if _, err := store.db.Exec(`UPDATE users SET role = ? WHERE id = ?`, item.Role, item.ID); err != nil {
+			t.Fatalf("update user role: %v", err)
+		}
+	}
 
 	if err := store.setFavoriteTrack(listener.ID, trackItem.ID, true); err != nil {
 		t.Fatalf("setFavoriteTrack() error = %v", err)
@@ -1631,12 +1627,13 @@ func TestListAlbumsHandlerHidesEmptyAlbumsForNonAdmin(t *testing.T) {
 		t.Fatalf("createUser() admin error = %v", err)
 	}
 
-	store.mu.Lock()
 	listener.Role = roleListener
-	store.users[listener.ID] = listener
 	admin.Role = roleAdmin
-	store.users[admin.ID] = admin
-	store.mu.Unlock()
+	for _, item := range []user{listener, admin} {
+		if _, err := store.db.Exec(`UPDATE users SET role = ? WHERE id = ?`, item.Role, item.ID); err != nil {
+			t.Fatalf("update user role: %v", err)
+		}
+	}
 
 	t.Run("anonymous", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/albums", nil)
@@ -2581,7 +2578,7 @@ func TestNewTrackStoreMigratesTrackCreatedAtColumn(t *testing.T) {
 	}
 }
 
-func TestStoreMutationsRestoreMemoryAfterPersistenceFailure(t *testing.T) {
+func TestStoreMutationsReturnPersistenceFailureAfterDatabaseClose(t *testing.T) {
 	t.Run("delete album", func(t *testing.T) {
 		store := newTestTrackStore(t)
 		_, albumItem := seedPlaylistTrackDependencies(t, store)
@@ -2592,9 +2589,6 @@ func TestStoreMutationsRestoreMemoryAfterPersistenceFailure(t *testing.T) {
 		deleted, err := store.deleteAlbum(albumItem.ID)
 		if err == nil || deleted {
 			t.Fatalf("deleteAlbum() = (%v, %v), want persistence error", deleted, err)
-		}
-		if _, ok := store.getAlbum(albumItem.ID); !ok {
-			t.Fatal("album was not restored after persistence failure")
 		}
 	})
 
@@ -2628,12 +2622,8 @@ func TestStoreMutationsRestoreMemoryAfterPersistenceFailure(t *testing.T) {
 		}
 
 		exists, err := store.reorderPlaylistTracks(userItem.ID, playlistItem.ID, []int64{second.ID, first.ID})
-		if err == nil || !exists {
-			t.Fatalf("reorderPlaylistTracks() = (%v, %v), want persistence error", exists, err)
-		}
-		stored := store.playlists[playlistItem.ID]
-		if len(stored.TrackItems) != 2 || stored.TrackItems[0].TrackID != first.ID || stored.TrackItems[1].TrackID != second.ID {
-			t.Fatalf("playlist order after failure = %#v, want [%d, %d]", stored.TrackItems, first.ID, second.ID)
+		if err == nil || exists {
+			t.Fatalf("reorderPlaylistTracks() = (%v, %v), want storage failure before lookup", exists, err)
 		}
 	})
 
@@ -2648,12 +2638,8 @@ func TestStoreMutationsRestoreMemoryAfterPersistenceFailure(t *testing.T) {
 		}
 
 		_, exists, err := store.updateAuthor(authorItem.ID, upsertAuthorRequest{CurrentName: "Changed"})
-		if err == nil || !exists {
-			t.Fatalf("updateAuthor() exists=%v error=%v, want persistence error", exists, err)
-		}
-		got, ok := store.getAuthor(authorItem.ID)
-		if !ok || got.CurrentName != "Original" {
-			t.Fatalf("author after failure = %#v, ok=%v", got, ok)
+		if err == nil || exists {
+			t.Fatalf("updateAuthor() exists=%v error=%v, want storage failure before lookup", exists, err)
 		}
 	})
 
@@ -2671,30 +2657,22 @@ func TestStoreMutationsRestoreMemoryAfterPersistenceFailure(t *testing.T) {
 		if err == nil || deleted {
 			t.Fatalf("deleteAuthor() = (%v, %v), want persistence error", deleted, err)
 		}
-		if _, ok := store.getAuthor(authorItem.ID); !ok {
-			t.Fatal("author was not restored after persistence failure")
-		}
 	})
 }
 
-func TestRefreshSessionPurgeRestoresMemoryAfterPersistenceFailure(t *testing.T) {
+func TestRefreshSessionOperationsReturnPersistenceFailureAfterDatabaseClose(t *testing.T) {
 	t.Run("create", func(t *testing.T) {
 		store := newTestTrackStore(t)
 		userItem, err := store.createUser("refresh-create@example.com", "hash")
 		if err != nil {
 			t.Fatal(err)
 		}
-		expired := refreshSession{ID: "expired", UserID: userItem.ID, TokenHash: "expired-hash", CreatedAt: time.Now().Add(-2 * time.Hour), ExpiresAt: time.Now().Add(-time.Hour)}
-		store.refreshSession[expired.ID] = expired
 		if err := store.db.Close(); err != nil {
 			t.Fatal(err)
 		}
 
 		if _, _, err := store.createRefreshSession(userItem.ID, time.Now().Add(time.Hour)); err == nil {
 			t.Fatal("createRefreshSession() error = nil, want persistence failure")
-		}
-		if got, ok := store.refreshSession[expired.ID]; !ok || got != expired || len(store.refreshSession) != 1 {
-			t.Fatalf("refresh sessions after failure = %#v, want only expired snapshot", store.refreshSession)
 		}
 	})
 
@@ -2704,24 +2682,16 @@ func TestRefreshSessionPurgeRestoresMemoryAfterPersistenceFailure(t *testing.T) 
 		if err != nil {
 			t.Fatal(err)
 		}
-		valid, rawToken, err := store.createRefreshSession(userItem.ID, time.Now().Add(time.Hour))
+		_, rawToken, err := store.createRefreshSession(userItem.ID, time.Now().Add(time.Hour))
 		if err != nil {
 			t.Fatal(err)
 		}
-		expired := refreshSession{ID: "expired", UserID: userItem.ID, TokenHash: "expired-hash", CreatedAt: time.Now().Add(-2 * time.Hour), ExpiresAt: time.Now().Add(-time.Hour)}
-		store.refreshSession[expired.ID] = expired
 		if err := store.db.Close(); err != nil {
 			t.Fatal(err)
 		}
 
 		if _, _, _, err := store.rotateRefreshSession(rawToken, time.Now().Add(time.Hour)); err == nil {
 			t.Fatal("rotateRefreshSession() error = nil, want persistence failure")
-		}
-		if got, ok := store.refreshSession[valid.ID]; !ok || got != valid {
-			t.Fatalf("valid refresh session after failure = %#v, ok=%v", got, ok)
-		}
-		if got, ok := store.refreshSession[expired.ID]; !ok || got != expired || len(store.refreshSession) != 2 {
-			t.Fatalf("refresh sessions after failure = %#v, want original snapshot", store.refreshSession)
 		}
 	})
 }
@@ -2760,9 +2730,10 @@ func TestAutoplayReportsUnexpectedLocalSongStatFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	albumItem = store.albums[albumItem.ID]
 	albumItem.IsPublished = true
-	store.albums[albumItem.ID] = albumItem
+	if _, err := store.db.Exec(`UPDATE albums SET is_published = 1 WHERE id = ?`, albumItem.ID); err != nil {
+		t.Fatal(err)
+	}
 	notDirectory := filepath.Join(t.TempDir(), "not-a-directory")
 	if err := os.WriteFile(notDirectory, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
@@ -2784,6 +2755,20 @@ func newTestTrackStore(t *testing.T) *trackStore {
 		t.Fatalf("newTrackStore() error = %v", err)
 	}
 	return store
+}
+
+func testPlaylistByKind(t *testing.T, store *trackStore, userID int64, kind string) (playlist, bool) {
+	t.Helper()
+	items, err := store.playlistRepository.List(context.Background())
+	if err != nil {
+		t.Fatalf("list playlists: %v", err)
+	}
+	for _, item := range items {
+		if item.UserID == userID && item.Kind == kind {
+			return item, true
+		}
+	}
+	return playlist{}, false
 }
 
 func assertAlbumListResponse(t *testing.T, rec *httptest.ResponseRecorder, wantIDs []int64) {

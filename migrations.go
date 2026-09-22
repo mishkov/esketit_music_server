@@ -21,6 +21,8 @@ func defaultSchemaMigrations() []schemaMigration {
 		{version: 1, name: "initial application schema", apply: createInitialSchema},
 		{version: 2, name: "track creation timestamps", apply: migrateTrackCreatedAt},
 		{version: 3, name: "unique system playlists", apply: migrateUniqueSystemPlaylists},
+		{version: 4, name: "repository query indexes", apply: migrateRepositoryIndexes},
+		{version: 5, name: "normalized system playlist keys", apply: migrateUniqueSystemPlaylists},
 	}
 }
 
@@ -313,9 +315,166 @@ func migrateUniqueSystemPlaylists(ctx context.Context, tx *sql.Tx) error {
 		}
 		canonical[key] = first
 	}
+	for _, item := range canonical {
+		if _, err := tx.ExecContext(ctx, `UPDATE playlists SET system = 1, kind = ? WHERE id = ?`, item.kind, item.id); err != nil {
+			return err
+		}
+	}
 	_, err = tx.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_user_system_kind
 		ON playlists (user_id, kind) WHERE kind IN ('favorites', 'dislikes')`)
 	return err
+}
+
+func migrateRepositoryIndexes(ctx context.Context, tx *sql.Tx) error {
+	statements := []string{
+		`CREATE INDEX IF NOT EXISTS idx_refresh_sessions_token_hash ON refresh_sessions (token_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_refresh_sessions_expires_at ON refresh_sessions (expires_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks (album_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_playlists_user_id ON playlists (user_id, id)`,
+		`CREATE INDEX IF NOT EXISTS idx_lyrics_track_id ON lyrics (track_id)`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func runSQLiteStartupRepairs(ctx context.Context, db *sql.DB) (returnErr error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin SQLite startup repairs: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			joinRollbackError(&returnErr, tx, "SQLite startup repairs")
+		}
+	}()
+
+	if err := validateSQLiteRelationships(ctx, tx); err != nil {
+		return err
+	}
+
+	counters := []struct {
+		key   string
+		query string
+	}{
+		{"next_track_id", `SELECT COALESCE(MAX(id), 0) + 1 FROM tracks`},
+		{"next_album_id", `SELECT COALESCE(MAX(id), 0) + 1 FROM albums`},
+		{"next_author_id", `SELECT COALESCE(MAX(id), 0) + 1 FROM authors`},
+		{"next_user_id", `SELECT COALESCE(MAX(id), 0) + 1 FROM users`},
+		{"next_playlist_id", `SELECT COALESCE(MAX(id), 0) + 1 FROM playlists`},
+		{"next_lyrics_id", `SELECT COALESCE(MAX(id), 0) + 1 FROM lyrics`},
+		{"next_lyrics_line_id", `SELECT COALESCE(MAX(CAST(json_extract(lines.value, '$.id') AS INTEGER)), 0) + 1 FROM lyrics LEFT JOIN json_each(lyrics.lines_json) AS lines`},
+	}
+	for _, counter := range counters {
+		var minimum int64
+		if err := tx.QueryRowContext(ctx, counter.query).Scan(&minimum); err != nil {
+			return fmt.Errorf("calculate %s: %w", counter.key, err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO store_metadata (key, value) VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = MAX(store_metadata.value, excluded.value)`, counter.key, minimum); err != nil {
+			return fmt.Errorf("repair %s: %w", counter.key, err)
+		}
+	}
+
+	repositories := newDomainRepositories(tx)
+	rows, err := tx.QueryContext(ctx, `SELECT users.id, kinds.kind
+		FROM users CROSS JOIN (SELECT 'favorites' AS kind UNION ALL SELECT 'dislikes') AS kinds
+		WHERE NOT EXISTS (
+			SELECT 1 FROM playlists
+			WHERE playlists.user_id = users.id AND playlists.kind = kinds.kind
+		)
+		ORDER BY users.id, kinds.kind`)
+	if err != nil {
+		return fmt.Errorf("find missing system playlists: %w", err)
+	}
+	type missingSystemPlaylist struct {
+		userID int64
+		kind   string
+	}
+	var missing []missingSystemPlaylist
+	for rows.Next() {
+		var item missingSystemPlaylist
+		if err := rows.Scan(&item.userID, &item.kind); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan missing system playlist: %w", err)
+		}
+		missing = append(missing, item)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate missing system playlists: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close missing system playlists: %w", err)
+	}
+	for _, item := range missing {
+		id, err := repositories.metadata.AllocateID(ctx, "next_playlist_id")
+		if err != nil {
+			return err
+		}
+		name := "Favorites"
+		if item.kind == playlistKindDislikes {
+			name = "Disliked"
+		}
+		if err := repositories.playlists.Insert(ctx, playlist{
+			ID: id, UserID: item.userID, Name: name, Visibility: playlistVisibilityPrivate,
+			TrackItems: []playlistTrack{}, System: true, Kind: item.kind,
+		}); err != nil {
+			return fmt.Errorf("create missing %s playlist for user %d: %w", item.kind, item.userID, err)
+		}
+	}
+	if err := repositories.sessions.DeleteExpired(ctx, time.Now().UTC()); err != nil {
+		return fmt.Errorf("remove expired refresh sessions: %w", err)
+	}
+	var foreignKeyViolation string
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT "table" || ':' || rowid FROM pragma_foreign_key_check LIMIT 1), '')`).Scan(&foreignKeyViolation); err != nil {
+		return fmt.Errorf("check SQLite relationships: %w", err)
+	}
+	if foreignKeyViolation != "" {
+		return fmt.Errorf("invalid SQLite relationship at %s", foreignKeyViolation)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit SQLite startup repairs: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+func validateSQLiteRelationships(ctx context.Context, tx *sql.Tx) error {
+	checks := []struct {
+		domain string
+		query  string
+	}{
+		{"authors", `SELECT id FROM authors WHERE id <= 0 OR TRIM(current_name) = '' OR json_valid(photos_json) = 0 ORDER BY id LIMIT 1`},
+		{"albums", `SELECT id FROM albums WHERE id <= 0 OR TRIM(title) = '' OR TRIM(release_date) = '' OR json_valid(author_ids_json) = 0 OR json_valid(track_ids_json) = 0 OR json_valid(additional_info_json) = 0 ORDER BY id LIMIT 1`},
+		{"tracks", `SELECT id FROM tracks WHERE id <= 0 OR TRIM(name) = '' OR TRIM(audio_file_path) = '' OR TRIM(created_at) = '' OR json_valid(author_ids_json) = 0 OR json_valid(additional_info_json) = 0 OR json_valid(source_metadata_json) = 0 ORDER BY id LIMIT 1`},
+		{"users", `SELECT id FROM users WHERE id <= 0 OR TRIM(email) = '' OR TRIM(role) = '' OR TRIM(password_hash) = '' OR TRIM(created_at) = '' ORDER BY id LIMIT 1`},
+		{"refresh_sessions", `SELECT rowid FROM refresh_sessions WHERE TRIM(id) = '' OR TRIM(token_hash) = '' OR TRIM(created_at) = '' OR TRIM(expires_at) = '' ORDER BY rowid LIMIT 1`},
+		{"playlists", `SELECT id FROM playlists WHERE id <= 0 OR TRIM(name) = '' OR json_valid(track_items_json) = 0 ORDER BY id LIMIT 1`},
+		{"lyrics", `SELECT id FROM lyrics WHERE id <= 0 OR TRIM(type) = '' OR TRIM(updated_at) = '' OR TRIM(created_at) = '' OR json_valid(lines_json) = 0 ORDER BY id LIMIT 1`},
+		{"tracks", `SELECT tracks.id FROM tracks LEFT JOIN albums ON albums.id = tracks.album_id WHERE albums.id IS NULL ORDER BY tracks.id LIMIT 1`},
+		{"tracks", `SELECT tracks.id FROM tracks WHERE json_array_length(tracks.author_ids_json) = 0 OR EXISTS (SELECT 1 FROM json_each(tracks.author_ids_json) AS item LEFT JOIN authors ON authors.id = CAST(item.value AS INTEGER) WHERE authors.id IS NULL) ORDER BY tracks.id LIMIT 1`},
+		{"albums", `SELECT albums.id FROM albums WHERE EXISTS (SELECT 1 FROM json_each(albums.track_ids_json) AS item LEFT JOIN tracks ON tracks.id = CAST(item.value AS INTEGER) WHERE tracks.id IS NULL OR tracks.album_id != albums.id) ORDER BY albums.id LIMIT 1`},
+		{"refresh_sessions", `SELECT refresh_sessions.rowid FROM refresh_sessions LEFT JOIN users ON users.id = refresh_sessions.user_id WHERE users.id IS NULL ORDER BY refresh_sessions.rowid LIMIT 1`},
+		{"playlists", `SELECT playlists.id FROM playlists LEFT JOIN users ON users.id = playlists.user_id WHERE users.id IS NULL ORDER BY playlists.id LIMIT 1`},
+		{"lyrics", `SELECT lyrics.id FROM lyrics LEFT JOIN tracks ON tracks.id = lyrics.track_id WHERE tracks.id IS NULL ORDER BY lyrics.id LIMIT 1`},
+	}
+	for _, check := range checks {
+		var id int64
+		err := tx.QueryRowContext(ctx, check.query).Scan(&id)
+		if err == nil {
+			return fmt.Errorf("invalid SQLite %s row id %d", check.domain, id)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("validate SQLite %s: %w", check.domain, err)
+		}
+	}
+	return nil
 }
 
 func currentSchemaVersion(ctx context.Context, db *sql.DB) (int, error) {

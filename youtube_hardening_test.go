@@ -324,6 +324,57 @@ func TestYouTubeCrossUserDuplicateSourceHasSingleAtomicWinner(t *testing.T) {
 	}
 }
 
+func TestYouTubePublicationDatabaseFailureRollsBackAndRemovesPublishedFile(t *testing.T) {
+	item := youtubeImportItem{
+		VideoID:           "rollback-publication",
+		SourceURL:         "https://www.youtube.com/watch?v=rollback-publication",
+		OriginalSourceURL: "https://www.youtube.com/watch?v=rollback-publication",
+		LinkProvider:      "youtube",
+		ParsedTitle:       "Rollback Publication",
+		ParsedAuthorNames: []string{"Artist"},
+	}
+	gateway := &fakeYouTubeGateway{
+		scanItems:    []youtubeImportItem{item},
+		scanSource:   youtubeImportScanSource{SourceType: youtubeImportSourceTrack, CanonicalURL: item.SourceURL},
+		downloadData: []byte("audio"),
+	}
+	service, store, songsDir, _ := newYouTubeImportTestService(t, gateway)
+	t.Cleanup(func() { _ = service.Close() })
+	t.Cleanup(func() { _ = store.db.Close() })
+	artist, albumItem := seedTrackDependencies(t, store)
+	if _, err := service.StartSession(context.Background(), 1, item.SourceURL, nil, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`CREATE TRIGGER reject_youtube_album_update BEFORE UPDATE ON albums BEGIN SELECT RAISE(FAIL, 'injected YouTube persistence failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.AddCurrent(context.Background(), 1, youtubeCreateRequest(artist, albumItem, item.ParsedTitle)); err == nil {
+		t.Fatal("AddCurrent error = nil, want injected persistence failure")
+	}
+	if tracks := store.list(); len(tracks) != 0 {
+		t.Fatalf("tracks after failed publication = %#v, want none", tracks)
+	}
+	storedAlbum, ok := store.getAlbum(albumItem.ID)
+	if !ok || len(storedAlbum.TrackIDs) != 0 {
+		t.Fatalf("album after failed publication = %#v found=%v", storedAlbum, ok)
+	}
+	regularFiles := 0
+	if err := filepath.Walk(songsDir, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			regularFiles++
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if regularFiles != 0 {
+		t.Fatalf("regular song files after failed publication = %d, want none", regularFiles)
+	}
+}
+
 func TestYouTubeAudioStaysHiddenUntilCommitAndCloseCleansActiveFiles(t *testing.T) {
 	item := youtubeImportItem{
 		VideoID:           "hidden-stage",

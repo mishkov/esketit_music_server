@@ -16,19 +16,16 @@ row scanning, constraint translation, and driver-specific behavior. The unit of
 work supplies all repositories bound to one transaction without exposing
 `*sql.Tx` to handlers or domain workflows.
 
-## Writes and compatibility cache
+## Reads and writes
 
-Existing handlers still read through `trackStore`'s in-memory maps. These maps
-are a compatibility cache, not an independently persisted data model. A write
-holds the store mutex until its SQL transaction commits, compares the affected
-domain cache with current repository rows, and issues only the necessary
-`INSERT`, `UPDATE`, or `DELETE` statements. A failed transaction restores the
-cache snapshot before releasing the mutex. Unrelated repositories are not
-opened for writes.
+`trackStore` retains only immutable service dependencies. Persistent entities
+are read from repositories for each operation. Algorithms that correlate
+multiple denormalized rows may construct a request-local `domainState`; it is
+discarded when the operation returns and is never an application cache.
 
-This bridge avoids a simultaneous HTTP-layer rewrite. A future step can replace
-map-backed query methods with repository query methods without changing the
-mutation or transaction boundaries introduced here.
+Mutations issue explicit inserts, updates, and deletes for affected rows only.
+Operations spanning domains use repositories bound to one unit-of-work
+transaction. SQLite rollback replaces the former map snapshot/restore logic.
 
 ## Transaction boundaries
 
@@ -46,29 +43,25 @@ mutation or transaction boundaries introduced here.
 
 ## ID allocation
 
-Existing IDs and `store_metadata` counters are retained. Creation performs a
-compare-and-set counter advance from the facade's expected value inside the same
-transaction as the inserted rows. A stale process therefore fails before it can
-overwrite a row allocated by another process. Counters never move backward.
-Deleting a highest-numbered row does not make its ID reusable.
+Existing IDs and `store_metadata` counters are retained. `AllocateID` advances
+a counter with `UPDATE ... RETURNING` inside the same transaction as the entity
+insert. Startup repairs counters upward from table maxima, so deleting the
+highest-numbered row never makes its ID reusable.
 
-If an imported track commits but audio publication fails, the catalog insert is
-compensated with a second transaction while the already-reserved ID remains
-consumed. This is intentional: SQLite cannot roll back a filesystem operation,
-and non-reuse is safer than trying to rewind the counter.
+Import files are staged and validated before publication. The filesystem link
+is published immediately before the database transaction; failures leave the
+database unchanged and the import service removes the published file.
 
 ## Startup and schema changes
 
 `schema_migrations` records ordered SQLite migrations. Each migration and its
-history row commit atomically. Startup loads repository rows directly into the
-compatibility cache, validates relationships, applies domain normalization,
-and reconciles only rows whose normalized representation changed. There is no
-JSON-file persistence or startup import path.
+history row commit atomically. Startup runs narrow transactional repairs for ID
+counters, expired sessions, missing system playlists, and relationship checks.
+It does not hydrate the database into memory. There is no JSON-file persistence
+or startup import path.
 
 The modernc SQLite DSN applies `foreign_keys(1)` and the busy timeout to every
-connection. Existing catalog tables are intentionally not retrofitted with
-foreign keys in this refactor; future RBAC migrations can safely create foreign
-keys referencing `users(id)`.
-
-Operational upgrade and rollback instructions are in
-[`SQLITE_MIGRATION_GUIDE.md`](SQLITE_MIGRATION_GUIDE.md).
+connection. Several existing relationships remain embedded in JSON columns and
+therefore cannot use SQLite foreign keys; startup validates those relationships
+with explicit SQL. New normalized relationship tables should declare foreign
+keys in their migrations.

@@ -257,6 +257,46 @@ func TestTelegramImportSaveCurrentPromotesFileAndCreatesTrack(t *testing.T) {
 	}
 }
 
+func TestTelegramPublicationDatabaseFailureRollsBackAndRemovesPromotedFile(t *testing.T) {
+	service, store, songsDir, _ := newTelegramImportTestService(t, &fakeTelegramGateway{
+		status: telegramAuthStatus{Configured: true, Authorized: true},
+		scannedItems: []telegramScannedTrack{{
+			MessageID: 31, MessageLink: "https://t.me/test_channel/31", FileName: "rollback.mp3",
+			MimeType: "audio/mpeg", SizeBytes: 123, ParsedTitle: "Rollback",
+		}},
+		downloadData: []byte("audio-data"),
+	})
+	t.Cleanup(func() { _ = service.Close() })
+	t.Cleanup(func() { _ = store.db.Close() })
+	artist, albumItem := seedTrackDependencies(t, store)
+	ctx := context.Background()
+	if _, err := service.StartSession(ctx, 1, "test_channel", 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`CREATE TRIGGER reject_telegram_album_update BEFORE UPDATE ON albums BEGIN SELECT RAISE(FAIL, 'injected Telegram persistence failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.SaveCurrent(ctx, 1, telegramSaveTrackRequest{
+		Name: "Rollback", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID,
+	}); err == nil {
+		t.Fatal("SaveCurrent error = nil, want injected persistence failure")
+	}
+	if tracks := store.list(); len(tracks) != 0 {
+		t.Fatalf("tracks after failed publication = %#v, want none", tracks)
+	}
+	storedAlbum, ok := store.getAlbum(albumItem.ID)
+	if !ok || len(storedAlbum.TrackIDs) != 0 {
+		t.Fatalf("album after failed publication = %#v found=%v", storedAlbum, ok)
+	}
+	entries, err := os.ReadDir(songsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("song files after failed publication = %#v, want none", entries)
+	}
+}
+
 func TestCreateUniqueFileConcurrentReservations(t *testing.T) {
 	dir := t.TempDir()
 	const reservations = 16

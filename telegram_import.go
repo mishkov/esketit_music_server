@@ -1332,7 +1332,7 @@ func (s *telegramImportService) SaveCurrent(ctx context.Context, userID int64, r
 		return telegramImportSessionDTO{}, track{}, err
 	}
 
-	createdTrack, err := s.store.create(upsertTrackRequest{
+	createdTrack, err := s.store.createWithContext(ctx, upsertTrackRequest{
 		Name:           strings.TrimSpace(req.Name),
 		AuthorIDs:      req.AuthorIDs,
 		AlbumID:        req.AlbumID,

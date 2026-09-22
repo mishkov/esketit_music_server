@@ -369,7 +369,6 @@ type playlistResponse struct {
 }
 
 type trackStore struct {
-	mu                 sync.RWMutex
 	songsDir           string
 	db                 *sql.DB
 	unitOfWork         unitOfWork
@@ -379,24 +378,6 @@ type trackStore struct {
 	catalogRepository  CatalogRepository
 	playlistRepository PlaylistRepository
 	lyricsRepository   LyricsRepository
-	metadataRepository metadataRepository
-	// Compatibility read cache for existing handlers. Mutations hold mu through
-	// the SQL commit, so speculative changes cannot escape; failures restore it.
-	nextTrackID      int64
-	nextAlbumID      int64
-	nextAuthorID     int64
-	nextUserID       int64
-	nextPlaylistID   int64
-	nextLyricsID     int64
-	nextLyricsLineID int64
-	tracks           map[int64]track
-	albums           map[int64]album
-	authors          map[int64]author
-	users            map[int64]user
-	usersByEmail     map[string]int64
-	refreshSession   map[string]refreshSession
-	playlists        map[int64]playlist
-	lyricsByTrack    map[int64]lyrics
 }
 
 type paginatedAlbums struct {
@@ -654,7 +635,7 @@ func run() (runErr error) {
 
 	tracksDBPath := os.Getenv("TRACKS_DB_PATH")
 	if tracksDBPath == "" {
-		tracksDBPath = "tracks.db"
+		tracksDBPath = "tracks.sqlite"
 	}
 
 	authSecret := os.Getenv("AUTH_SECRET")
@@ -1155,23 +1136,7 @@ func newAuthManager(secret []byte, accessTokenTTL, refreshTokenTTL time.Duration
 }
 
 func newTrackStore(path string) (*trackStore, error) {
-	s := &trackStore{
-		nextTrackID:      1,
-		nextAlbumID:      1,
-		nextAuthorID:     1,
-		nextUserID:       1,
-		nextPlaylistID:   1,
-		nextLyricsID:     1,
-		nextLyricsLineID: 1,
-		tracks:           make(map[int64]track),
-		albums:           make(map[int64]album),
-		authors:          make(map[int64]author),
-		users:            make(map[int64]user),
-		usersByEmail:     make(map[string]int64),
-		refreshSession:   make(map[string]refreshSession),
-		playlists:        make(map[int64]playlist),
-		lyricsByTrack:    make(map[int64]lyrics),
-	}
+	s := &trackStore{}
 
 	db, err := openSQLiteDB(path)
 	if err != nil {
@@ -1186,18 +1151,12 @@ func newTrackStore(path string) (*trackStore, error) {
 	s.catalogRepository = repositories.catalog
 	s.playlistRepository = repositories.playlists
 	s.lyricsRepository = repositories.lyrics
-	s.metadataRepository = repositories.metadata
 
 	if err := s.initSQLiteSchema(); err != nil {
 		return nil, closeDatabaseAfterError(db, err)
 	}
 
-	if err := s.loadSQLite(); err != nil {
-		return nil, closeDatabaseAfterError(db, err)
-	}
-	// Persist normalization repairs and initialize missing ID counters through
-	// the same transactional repository boundary used by regular mutations.
-	if err := s.commitDomainChangesLocked(context.Background(), allDomainWrites); err != nil {
+	if err := runSQLiteStartupRepairs(context.Background(), db); err != nil {
 		return nil, closeDatabaseAfterError(db, err)
 	}
 
@@ -1271,283 +1230,7 @@ func (s *trackStore) initSQLiteSchema() error {
 	return runSQLiteMigrations(context.Background(), s.db, defaultSchemaMigrations())
 }
 
-func (s *trackStore) loadSQLite() error {
-	ctx := context.Background()
-	metadata, err := s.metadataRepository.LoadNextIDs(ctx)
-	if err != nil {
-		return err
-	}
-	authors, err := s.authorRepository.List(ctx)
-	if err != nil {
-		return err
-	}
-	albums, err := s.catalogRepository.ListAlbums(ctx)
-	if err != nil {
-		return err
-	}
-	tracks, err := s.catalogRepository.ListTracks(ctx)
-	if err != nil {
-		return err
-	}
-	users, err := s.userRepository.List(ctx)
-	if err != nil {
-		return err
-	}
-	sessions, err := s.sessionRepository.List(ctx)
-	if err != nil {
-		return err
-	}
-	playlists, err := s.playlistRepository.List(ctx)
-	if err != nil {
-		return err
-	}
-	lyricsItems, err := s.lyricsRepository.List(ctx)
-	if err != nil {
-		return err
-	}
-	if err := validateSQLiteState(authors, albums, tracks, users, sessions, playlists, lyricsItems); err != nil {
-		return err
-	}
-
-	for _, item := range authors {
-		item.CurrentName = strings.TrimSpace(item.CurrentName)
-		item.Photos = normalizePhotos(item.Photos)
-		s.authors[item.ID] = item
-		s.nextAuthorID = maxNextID(s.nextAuthorID, item.ID)
-	}
-	for _, item := range albums {
-		item.Title = strings.TrimSpace(item.Title)
-		item.CoverImagePath = strings.TrimSpace(item.CoverImagePath)
-		item.AuthorIDs = normalizeAuthorIDs(item.AuthorIDs)
-		item.TrackIDs = normalizeTrackIDs(item.TrackIDs)
-		item.AdditionalInfo = normalizeAdditionalInfo(item.AdditionalInfo)
-		s.albums[item.ID] = item
-		s.nextAlbumID = maxNextID(s.nextAlbumID, item.ID)
-	}
-	for _, item := range tracks {
-		item.Name = strings.TrimSpace(item.Name)
-		item.AuthorIDs = normalizeAuthorIDs(item.AuthorIDs)
-		item.AudioFilePath = normalizeAudioFilePath(item.AudioFilePath)
-		item.AdditionalInfo = normalizeAdditionalInfo(item.AdditionalInfo)
-		item.SourceMetadata = normalizeSourceMetadata(item.SourceMetadata)
-		s.tracks[item.ID] = item
-		s.nextTrackID = maxNextID(s.nextTrackID, item.ID)
-	}
-	for _, item := range users {
-		item.Email = normalizeEmail(item.Email)
-		item.Role = normalizeRole(item.Role)
-		s.users[item.ID] = item
-		s.usersByEmail[item.Email] = item.ID
-		s.nextUserID = maxNextID(s.nextUserID, item.ID)
-	}
-	for _, item := range playlists {
-		item.Name = strings.TrimSpace(item.Name)
-		item.Description = strings.TrimSpace(item.Description)
-		item.CoverImagePath = strings.TrimSpace(item.CoverImagePath)
-		item.Visibility = normalizePlaylistVisibility(item.Visibility)
-		item.ShareToken = strings.TrimSpace(item.ShareToken)
-		item.Kind = normalizePlaylistKind(item.Kind, item.System)
-		item.TrackItems = normalizePlaylistTrackItems(item.TrackItems)
-		if err := s.normalizePlaylistSharingLocked(&item); err != nil {
-			return err
-		}
-		s.playlists[item.ID] = item
-		s.nextPlaylistID = maxNextID(s.nextPlaylistID, item.ID)
-	}
-	for _, item := range lyricsItems {
-		item, _ = normalizeLyrics(item)
-		s.lyricsByTrack[item.TrackID] = item
-		s.nextLyricsID = maxNextID(s.nextLyricsID, item.ID)
-		for _, line := range item.Lines {
-			s.nextLyricsLineID = maxNextID(s.nextLyricsLineID, line.ID)
-		}
-	}
-	now := time.Now()
-	for _, item := range sessions {
-		if !item.ExpiresAt.Before(now) {
-			s.refreshSession[item.ID] = item
-		}
-	}
-
-	s.nextTrackID = maxInt64(s.nextTrackID, metadata["next_track_id"])
-	s.nextAlbumID = maxInt64(s.nextAlbumID, metadata["next_album_id"])
-	s.nextAuthorID = maxInt64(s.nextAuthorID, metadata["next_author_id"])
-	s.nextUserID = maxInt64(s.nextUserID, metadata["next_user_id"])
-	s.nextPlaylistID = maxInt64(s.nextPlaylistID, metadata["next_playlist_id"])
-	s.nextLyricsID = maxInt64(s.nextLyricsID, metadata["next_lyrics_id"])
-	s.nextLyricsLineID = maxInt64(s.nextLyricsLineID, metadata["next_lyrics_line_id"])
-
-	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
-		return err
-	}
-	s.deduplicateSystemPlaylistsLocked()
-	if err := s.ensureSystemPlaylistsLocked(); err != nil {
-		return err
-	}
-	return s.validateLyricsStateLocked()
-}
-
-func maxNextID(current, existingID int64) int64 {
-	if existingID >= current {
-		return existingID + 1
-	}
-	return current
-}
-
-func maxInt64(left, right int64) int64 {
-	if right > left {
-		return right
-	}
-	return left
-}
-
-func validateSQLiteState(
-	authors []author,
-	albums []album,
-	trackItems []track,
-	users []user,
-	sessions []refreshSession,
-	playlists []playlist,
-	lyricsItems []lyrics,
-) error {
-	authorIDs := make(map[int64]struct{}, len(authors))
-	for _, item := range authors {
-		item.CurrentName = strings.TrimSpace(item.CurrentName)
-		item.Photos = normalizePhotos(item.Photos)
-		if item.ID <= 0 {
-			return fmt.Errorf("invalid SQLite authors row id %d: id must be positive", item.ID)
-		}
-		if err := validateAuthor(item); err != nil {
-			return fmt.Errorf("invalid SQLite authors row id %d: %w", item.ID, err)
-		}
-		authorIDs[item.ID] = struct{}{}
-	}
-
-	albumIDs := make(map[int64]struct{}, len(albums))
-	for _, item := range albums {
-		if item.ID <= 0 {
-			return fmt.Errorf("invalid SQLite albums row id %d: id must be positive", item.ID)
-		}
-		item.Title = strings.TrimSpace(item.Title)
-		if item.Title == "" {
-			return fmt.Errorf("invalid SQLite albums row id %d: title is required", item.ID)
-		}
-		if item.ReleaseDate.IsZero() {
-			return fmt.Errorf("invalid SQLite albums row id %d: release date is required", item.ID)
-		}
-		if len(item.TrackIDs) != len(normalizeTrackIDs(item.TrackIDs)) {
-			return fmt.Errorf("invalid SQLite albums row id %d: track ids must be positive and unique", item.ID)
-		}
-		if len(item.AuthorIDs) != len(normalizeAuthorIDs(item.AuthorIDs)) {
-			return fmt.Errorf("invalid SQLite albums row id %d: author ids must be positive and unique", item.ID)
-		}
-		if err := validateAdditionalInfo(normalizeAdditionalInfo(item.AdditionalInfo)); err != nil {
-			return fmt.Errorf("invalid SQLite albums row id %d: %w", item.ID, err)
-		}
-		albumIDs[item.ID] = struct{}{}
-	}
-
-	tracks := make(map[int64]track, len(trackItems))
-	for _, item := range trackItems {
-		if item.ID <= 0 {
-			return fmt.Errorf("invalid SQLite tracks row id %d: id must be positive", item.ID)
-		}
-		item.Name = strings.TrimSpace(item.Name)
-		item.AudioFilePath = normalizeAudioFilePath(item.AudioFilePath)
-		if item.Name == "" {
-			return fmt.Errorf("invalid SQLite tracks row id %d: name is required", item.ID)
-		}
-		if item.AudioFilePath == "" {
-			return fmt.Errorf("invalid SQLite tracks row id %d: audio file path is required", item.ID)
-		}
-		if item.AlbumID <= 0 {
-			return fmt.Errorf("invalid SQLite tracks row id %d: album id must be positive", item.ID)
-		}
-		if _, ok := albumIDs[item.AlbumID]; !ok {
-			return fmt.Errorf("invalid SQLite tracks row id %d: album id %d does not exist", item.ID, item.AlbumID)
-		}
-		if len(item.AuthorIDs) == 0 || len(item.AuthorIDs) != len(normalizeAuthorIDs(item.AuthorIDs)) {
-			return fmt.Errorf("invalid SQLite tracks row id %d: author ids must be non-empty, positive, and unique", item.ID)
-		}
-		for _, authorID := range item.AuthorIDs {
-			if _, ok := authorIDs[authorID]; !ok {
-				return fmt.Errorf("invalid SQLite tracks row id %d: author id %d does not exist", item.ID, authorID)
-			}
-		}
-		if err := validateAdditionalInfo(normalizeAdditionalInfo(item.AdditionalInfo)); err != nil {
-			return fmt.Errorf("invalid SQLite tracks row id %d: %w", item.ID, err)
-		}
-		if err := validateSourceMetadata(normalizeSourceMetadata(item.SourceMetadata)); err != nil {
-			return fmt.Errorf("invalid SQLite tracks row id %d: %w", item.ID, err)
-		}
-		tracks[item.ID] = item
-	}
-	for _, item := range albums {
-		for _, trackID := range item.TrackIDs {
-			trackItem, ok := tracks[trackID]
-			if !ok {
-				return fmt.Errorf("invalid SQLite albums row id %d: track id %d does not exist", item.ID, trackID)
-			}
-			if trackItem.AlbumID != item.ID {
-				return fmt.Errorf("invalid SQLite albums row id %d: track id %d belongs to album id %d", item.ID, trackID, trackItem.AlbumID)
-			}
-		}
-	}
-
-	userIDs := make(map[int64]struct{}, len(users))
-	emails := make(map[string]int64, len(users))
-	for _, item := range users {
-		email := normalizeEmail(item.Email)
-		role := normalizeRole(item.Role)
-		if item.ID <= 0 || email == "" || item.PasswordHash == "" || role == "" || item.CreatedAt.IsZero() {
-			return fmt.Errorf("invalid SQLite users row id %d: required user fields are invalid", item.ID)
-		}
-		if existingID, ok := emails[email]; ok && existingID != item.ID {
-			return fmt.Errorf("invalid SQLite users row id %d: normalized email duplicates row id %d", item.ID, existingID)
-		}
-		emails[email] = item.ID
-		userIDs[item.ID] = struct{}{}
-	}
-
-	for _, item := range playlists {
-		item.Name = strings.TrimSpace(item.Name)
-		item.Description = strings.TrimSpace(item.Description)
-		item.Visibility = normalizePlaylistVisibility(item.Visibility)
-		item.Kind = normalizePlaylistKind(item.Kind, item.System)
-		item.ShareToken = strings.TrimSpace(item.ShareToken)
-		if item.ID <= 0 {
-			return fmt.Errorf("invalid SQLite playlists row id %d: id must be positive", item.ID)
-		}
-		if _, ok := userIDs[item.UserID]; !ok {
-			return fmt.Errorf("invalid SQLite playlists row id %d: user id %d does not exist", item.ID, item.UserID)
-		}
-		if err := validatePlaylist(item); err != nil {
-			return fmt.Errorf("invalid SQLite playlists row id %d: %w", item.ID, err)
-		}
-	}
-
-	for _, item := range lyricsItems {
-		normalized, ok := normalizeLyrics(item)
-		if !ok {
-			return fmt.Errorf("invalid SQLite lyrics row id %d: lyrics fields are invalid", item.ID)
-		}
-		if _, ok := tracks[normalized.TrackID]; !ok {
-			return fmt.Errorf("invalid SQLite lyrics row id %d: track id %d does not exist", item.ID, normalized.TrackID)
-		}
-	}
-
-	for _, item := range sessions {
-		if item.ID == "" || item.UserID <= 0 || item.TokenHash == "" || item.CreatedAt.IsZero() || item.ExpiresAt.IsZero() {
-			return fmt.Errorf("invalid SQLite refresh_sessions row for user id %d: required session fields are invalid", item.UserID)
-		}
-		if _, ok := userIDs[item.UserID]; !ok {
-			return fmt.Errorf("invalid SQLite refresh_sessions row for user id %d: user does not exist", item.UserID)
-		}
-	}
-	return nil
-}
-
-func (s *trackStore) list() []track {
+func (s *domainState) list() []track {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1562,7 +1245,7 @@ func (s *trackStore) list() []track {
 	return items
 }
 
-func (s *trackStore) listAlbums(filter albumListFilter) paginatedAlbums {
+func (s *domainState) listAlbums(filter albumListFilter) paginatedAlbums {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1614,14 +1297,14 @@ func (s *trackStore) listAlbums(filter albumListFilter) paginatedAlbums {
 	}
 }
 
-func (s *trackStore) getAlbum(id int64) (album, bool) {
+func (s *domainState) getAlbum(id int64) (album, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	a, ok := s.albums[id]
 	return a, ok
 }
 
-func (s *trackStore) getAlbumTracks(id, userID int64) ([]trackResponse, bool) {
+func (s *domainState) getAlbumTracks(id, userID int64) ([]trackResponse, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1645,23 +1328,20 @@ func (s *trackStore) getAlbumTracks(id, userID int64) ([]trackResponse, bool) {
 	return tracks, true
 }
 
-func (s *trackStore) get(id int64) (track, bool) {
+func (s *domainState) get(id int64) (track, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	t, ok := s.tracks[id]
 	return t, ok
 }
 
-func (s *trackStore) createAlbum(req upsertAlbumRequest) (album, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	albumsSnapshot := cloneAlbumsMap(s.albums)
-	tracksSnapshot := cloneTracksMap(s.tracks)
-	nextAlbumIDSnapshot := s.nextAlbumID
-
+func (s *domainState) createAlbum(req upsertAlbumRequest) (album, error) {
+	id, err := s.repositories.metadata.AllocateID(s.ctx, "next_album_id")
+	if err != nil {
+		return album{}, err
+	}
 	a := album{
-		ID:             s.nextAlbumID,
+		ID:             id,
 		Title:          strings.TrimSpace(req.Title),
 		CoverImagePath: strings.TrimSpace(req.CoverImagePath),
 		ReleaseDate:    req.ReleaseDate.UTC(),
@@ -1672,33 +1352,39 @@ func (s *trackStore) createAlbum(req upsertAlbumRequest) (album, error) {
 	if err := s.validateAlbumLocked(a); err != nil {
 		return album{}, err
 	}
-
-	s.nextAlbumID++
+	previousAlbumIDs := make(map[int64]struct{})
+	for _, trackID := range a.TrackIDs {
+		if item, ok := s.tracks[trackID]; ok && item.AlbumID > 0 {
+			previousAlbumIDs[item.AlbumID] = struct{}{}
+		}
+	}
 	s.albums[a.ID] = a
 	if err := s.applyAlbumTrackIDsLocked(a.ID, a.TrackIDs, false); err != nil {
-		s.albums = albumsSnapshot
-		s.tracks = tracksSnapshot
-		s.nextAlbumID = nextAlbumIDSnapshot
 		return album{}, err
 	}
 	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
-		s.albums = albumsSnapshot
-		s.tracks = tracksSnapshot
-		s.nextAlbumID = nextAlbumIDSnapshot
 		return album{}, err
 	}
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{
-		metadataExpected: map[string]int64{"next_album_id": nextAlbumIDSnapshot}, catalog: true,
-	}); err != nil {
-		s.albums = albumsSnapshot
-		s.tracks = tracksSnapshot
-		s.nextAlbumID = nextAlbumIDSnapshot
+	if err := s.repositories.catalog.InsertAlbum(s.ctx, s.albums[a.ID]); err != nil {
 		return album{}, err
+	}
+	for _, trackID := range a.TrackIDs {
+		if err := s.repositories.catalog.UpdateTrack(s.ctx, s.tracks[trackID]); err != nil {
+			return album{}, err
+		}
+	}
+	delete(previousAlbumIDs, a.ID)
+	for previousID := range previousAlbumIDs {
+		if previous, ok := s.albums[previousID]; ok {
+			if err := s.repositories.catalog.UpdateAlbum(s.ctx, previous); err != nil {
+				return album{}, err
+			}
+		}
 	}
 	return s.albums[a.ID], nil
 }
 
-func (s *trackStore) updateAlbum(id int64, req upsertAlbumRequest) (album, bool, error) {
+func (s *domainState) updateAlbum(id int64, req upsertAlbumRequest) (album, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1706,9 +1392,6 @@ func (s *trackStore) updateAlbum(id int64, req upsertAlbumRequest) (album, bool,
 	if !ok {
 		return album{}, false, nil
 	}
-	albumsSnapshot := cloneAlbumsMap(s.albums)
-	tracksSnapshot := cloneTracksMap(s.tracks)
-
 	updated := album{
 		ID:             id,
 		Title:          strings.TrimSpace(req.Title),
@@ -1725,26 +1408,37 @@ func (s *trackStore) updateAlbum(id int64, req upsertAlbumRequest) (album, bool,
 		return album{}, true, fmt.Errorf("%w: cannot remove tracks from album using album update", errInvalidAlbum)
 	}
 
+	affectedAlbumIDs := map[int64]struct{}{id: {}}
+	movedTrackIDs := make([]int64, 0)
+	for _, trackID := range updated.TrackIDs {
+		if item, ok := s.tracks[trackID]; ok && item.AlbumID != id {
+			movedTrackIDs = append(movedTrackIDs, trackID)
+			if item.AlbumID > 0 {
+				affectedAlbumIDs[item.AlbumID] = struct{}{}
+			}
+		}
+	}
 	s.albums[id] = updated
 	if err := s.applyAlbumTrackIDsLocked(id, updated.TrackIDs, false); err != nil {
-		s.albums = albumsSnapshot
-		s.tracks = tracksSnapshot
 		return album{}, true, err
 	}
 	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
-		s.albums = albumsSnapshot
-		s.tracks = tracksSnapshot
 		return album{}, true, err
 	}
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{catalog: true}); err != nil {
-		s.albums = albumsSnapshot
-		s.tracks = tracksSnapshot
-		return album{}, true, err
+	for _, trackID := range movedTrackIDs {
+		if err := s.repositories.catalog.UpdateTrack(s.ctx, s.tracks[trackID]); err != nil {
+			return album{}, true, err
+		}
+	}
+	for albumID := range affectedAlbumIDs {
+		if err := s.repositories.catalog.UpdateAlbum(s.ctx, s.albums[albumID]); err != nil {
+			return album{}, true, err
+		}
 	}
 	return s.albums[id], true, nil
 }
 
-func (s *trackStore) deleteAlbum(id int64) (bool, error) {
+func (s *domainState) deleteAlbum(id int64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1755,28 +1449,28 @@ func (s *trackStore) deleteAlbum(id int64) (bool, error) {
 	if len(a.TrackIDs) > 0 {
 		return false, errAlbumInUse
 	}
-	delete(s.albums, id)
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{catalog: true}); err != nil {
-		s.albums[id] = a
+	if err := s.repositories.catalog.DeleteAlbum(s.ctx, id); err != nil {
+		if errors.Is(err, errRepositoryNotFound) {
+			return false, nil
+		}
 		return false, err
 	}
 	return true, nil
 }
 
-func (s *trackStore) create(req upsertTrackRequest) (track, error) {
+func (s *domainState) create(req upsertTrackRequest) (track, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	albumsSnapshot := cloneAlbumsMap(s.albums)
-	tracksSnapshot := cloneTracksMap(s.tracks)
-	nextTrackIDSnapshot := s.nextTrackID
 
 	if _, ok := s.albums[req.AlbumID]; !ok {
 		return track{}, fmt.Errorf("%w: albumId %d does not exist", errInvalidTrack, req.AlbumID)
 	}
-
+	id, err := s.repositories.metadata.AllocateID(s.ctx, "next_track_id")
+	if err != nil {
+		return track{}, err
+	}
 	t := track{
-		ID:             s.nextTrackID,
+		ID:             id,
 		Name:           strings.TrimSpace(req.Name),
 		AuthorIDs:      normalizeAuthorIDs(req.AuthorIDs),
 		AlbumID:        req.AlbumID,
@@ -1794,34 +1488,25 @@ func (s *trackStore) create(req upsertTrackRequest) (track, error) {
 		return track{}, fmt.Errorf("%w: %v", errInvalidTrack, err)
 	}
 
-	s.nextTrackID++
 	s.tracks[t.ID] = t
 	targetAlbum := s.albums[req.AlbumID]
 	insertTrackIntoAlbumLocked(&targetAlbum, t.ID, albumOrder)
 	s.albums[req.AlbumID] = targetAlbum
 	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
-		s.albums = albumsSnapshot
-		s.tracks = tracksSnapshot
-		s.nextTrackID = nextTrackIDSnapshot
 		return track{}, err
 	}
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{
-		metadataExpected: map[string]int64{"next_track_id": nextTrackIDSnapshot}, catalog: true,
-	}); err != nil {
-		s.albums = albumsSnapshot
-		s.tracks = tracksSnapshot
-		s.nextTrackID = nextTrackIDSnapshot
+	if err := s.repositories.catalog.InsertTrack(s.ctx, t); err != nil {
+		return track{}, err
+	}
+	if err := s.repositories.catalog.UpdateAlbum(s.ctx, s.albums[req.AlbumID]); err != nil {
 		return track{}, err
 	}
 	return s.tracks[t.ID], nil
 }
 
-func (s *trackStore) update(id int64, req upsertTrackRequest) (track, bool, error) {
+func (s *domainState) update(id int64, req upsertTrackRequest) (track, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	albumsSnapshot := cloneAlbumsMap(s.albums)
-	tracksSnapshot := cloneTracksMap(s.tracks)
 
 	current, ok := s.tracks[id]
 	if !ok {
@@ -1863,31 +1548,31 @@ func (s *trackStore) update(id int64, req upsertTrackRequest) (track, bool, erro
 	insertTrackIntoAlbumLocked(&targetAlbum, id, albumOrder)
 	s.albums[updated.AlbumID] = targetAlbum
 	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
-		s.albums = albumsSnapshot
-		s.tracks = tracksSnapshot
 		return track{}, true, err
 	}
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{catalog: true}); err != nil {
-		s.albums = albumsSnapshot
-		s.tracks = tracksSnapshot
+	if err := s.repositories.catalog.UpdateTrack(s.ctx, s.tracks[id]); err != nil {
 		return track{}, true, err
+	}
+	if err := s.repositories.catalog.UpdateAlbum(s.ctx, s.albums[current.AlbumID]); err != nil {
+		return track{}, true, err
+	}
+	if updated.AlbumID != current.AlbumID {
+		if err := s.repositories.catalog.UpdateAlbum(s.ctx, s.albums[updated.AlbumID]); err != nil {
+			return track{}, true, err
+		}
 	}
 	return s.tracks[id], true, nil
 }
 
-func (s *trackStore) delete(id int64) (bool, error) {
+func (s *domainState) delete(id int64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	albumsSnapshot := cloneAlbumsMap(s.albums)
-	tracksSnapshot := cloneTracksMap(s.tracks)
-	playlistsSnapshot := clonePlaylistsMap(s.playlists)
-	lyricsSnapshot := cloneLyricsMap(s.lyricsByTrack)
 
 	t, ok := s.tracks[id]
 	if !ok {
 		return false, nil
 	}
+	_, hadLyrics := s.lyricsByTrack[id]
 	delete(s.tracks, id)
 	delete(s.lyricsByTrack, id)
 	if albumItem, ok := s.albums[t.AlbumID]; ok {
@@ -1896,23 +1581,33 @@ func (s *trackStore) delete(id int64) (bool, error) {
 	}
 	s.markTrackUnavailableLocked(t)
 	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
-		s.albums = albumsSnapshot
-		s.tracks = tracksSnapshot
-		s.playlists = playlistsSnapshot
-		s.lyricsByTrack = lyricsSnapshot
 		return false, err
 	}
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{catalog: true, playlists: true, lyrics: true}); err != nil {
-		s.albums = albumsSnapshot
-		s.tracks = tracksSnapshot
-		s.playlists = playlistsSnapshot
-		s.lyricsByTrack = lyricsSnapshot
+	if err := s.repositories.catalog.UpdateAlbum(s.ctx, s.albums[t.AlbumID]); err != nil {
+		return false, err
+	}
+	for _, p := range s.playlists {
+		for _, item := range p.TrackItems {
+			if item.TrackID == id {
+				if err := s.repositories.playlists.Update(s.ctx, p); err != nil {
+					return false, err
+				}
+				break
+			}
+		}
+	}
+	if hadLyrics {
+		if err := s.repositories.lyrics.DeleteByTrackID(s.ctx, id); err != nil {
+			return false, err
+		}
+	}
+	if err := s.repositories.catalog.DeleteTrack(s.ctx, id); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func (s *trackStore) listPlaylists(userID int64, filter playlistListFilter) paginatedPlaylists {
+func (s *domainState) listPlaylists(userID int64, filter playlistListFilter) paginatedPlaylists {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1969,7 +1664,7 @@ func (s *trackStore) listPlaylists(userID int64, filter playlistListFilter) pagi
 	}
 }
 
-func (s *trackStore) getPlaylist(userID, playlistID int64) (playlistResponse, bool) {
+func (s *domainState) getPlaylist(userID, playlistID int64) (playlistResponse, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1980,7 +1675,7 @@ func (s *trackStore) getPlaylist(userID, playlistID int64) (playlistResponse, bo
 	return s.buildPlaylistResponseLocked(p), true
 }
 
-func (s *trackStore) createPlaylist(userID int64, req upsertPlaylistRequest) (playlistResponse, error) {
+func (s *domainState) createPlaylist(userID int64, req upsertPlaylistRequest) (playlistResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1988,8 +1683,12 @@ func (s *trackStore) createPlaylist(userID int64, req upsertPlaylistRequest) (pl
 		return playlistResponse{}, errPlaylistNotFound
 	}
 
+	id, err := s.repositories.metadata.AllocateID(s.ctx, "next_playlist_id")
+	if err != nil {
+		return playlistResponse{}, err
+	}
 	p := playlist{
-		ID:             s.nextPlaylistID,
+		ID:             id,
 		UserID:         userID,
 		Name:           strings.TrimSpace(req.Name),
 		Description:    strings.TrimSpace(req.Description),
@@ -2006,19 +1705,14 @@ func (s *trackStore) createPlaylist(userID int64, req upsertPlaylistRequest) (pl
 		return playlistResponse{}, err
 	}
 
-	s.nextPlaylistID++
 	s.playlists[p.ID] = p
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{
-		metadataExpected: map[string]int64{"next_playlist_id": p.ID}, playlists: true,
-	}); err != nil {
-		delete(s.playlists, p.ID)
-		s.nextPlaylistID--
+	if err := s.repositories.playlists.Insert(s.ctx, p); err != nil {
 		return playlistResponse{}, err
 	}
 	return s.buildPlaylistResponseLocked(p), nil
 }
 
-func (s *trackStore) updatePlaylist(userID, playlistID int64, req upsertPlaylistRequest) (playlistResponse, bool, error) {
+func (s *domainState) updatePlaylist(userID, playlistID int64, req upsertPlaylistRequest) (playlistResponse, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2043,14 +1737,13 @@ func (s *trackStore) updatePlaylist(userID, playlistID int64, req upsertPlaylist
 	}
 
 	s.playlists[playlistID] = updated
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
-		s.playlists[playlistID] = current
+	if err := s.repositories.playlists.Update(s.ctx, updated); err != nil {
 		return playlistResponse{}, true, err
 	}
 	return s.buildPlaylistResponseLocked(updated), true, nil
 }
 
-func (s *trackStore) validatePlaylistCoverUploadTarget(userID, playlistID int64) (bool, error) {
+func (s *domainState) validatePlaylistCoverUploadTarget(userID, playlistID int64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2064,7 +1757,7 @@ func (s *trackStore) validatePlaylistCoverUploadTarget(userID, playlistID int64)
 	return true, nil
 }
 
-func (s *trackStore) updatePlaylistCoverImage(userID, playlistID int64, coverImagePath string) (playlistResponse, bool, error) {
+func (s *domainState) updatePlaylistCoverImage(userID, playlistID int64, coverImagePath string) (playlistResponse, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2079,14 +1772,13 @@ func (s *trackStore) updatePlaylistCoverImage(userID, playlistID int64, coverIma
 	updated := current
 	updated.CoverImagePath = strings.TrimSpace(coverImagePath)
 	s.playlists[playlistID] = updated
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
-		s.playlists[playlistID] = current
+	if err := s.repositories.playlists.Update(s.ctx, updated); err != nil {
 		return playlistResponse{}, true, err
 	}
 	return s.buildPlaylistResponseLocked(updated), true, nil
 }
 
-func (s *trackStore) deletePlaylist(userID, playlistID int64) (bool, error) {
+func (s *domainState) deletePlaylist(userID, playlistID int64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2097,15 +1789,13 @@ func (s *trackStore) deletePlaylist(userID, playlistID int64) (bool, error) {
 	if current.System {
 		return false, errSystemPlaylistImmutable
 	}
-	delete(s.playlists, playlistID)
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
-		s.playlists[playlistID] = current
+	if err := s.repositories.playlists.Delete(s.ctx, playlistID); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func (s *trackStore) getPlaylistTracks(userID, playlistID int64, page, pageSize int64) (paginatedTracks, bool) {
+func (s *domainState) getPlaylistTracks(userID, playlistID int64, page, pageSize int64) (paginatedTracks, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2146,7 +1836,7 @@ func (s *trackStore) getPlaylistTracks(userID, playlistID int64, page, pageSize 
 	}, true
 }
 
-func (s *trackStore) getPublicPlaylist(playlistID int64) (playlistResponse, bool) {
+func (s *domainState) getPublicPlaylist(playlistID int64) (playlistResponse, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2157,7 +1847,7 @@ func (s *trackStore) getPublicPlaylist(playlistID int64) (playlistResponse, bool
 	return publicPlaylistResponse(s.buildPlaylistResponseLocked(p)), true
 }
 
-func (s *trackStore) getPublicPlaylistTracks(playlistID, userID, page, pageSize int64) (paginatedTracks, bool) {
+func (s *domainState) getPublicPlaylistTracks(playlistID, userID, page, pageSize int64) (paginatedTracks, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2168,7 +1858,7 @@ func (s *trackStore) getPublicPlaylistTracks(playlistID, userID, page, pageSize 
 	return s.buildPublicPlaylistTracksPageLocked(p, userID, page, pageSize), true
 }
 
-func (s *trackStore) getSharedPlaylist(shareToken string) (playlistResponse, bool) {
+func (s *domainState) getSharedPlaylist(shareToken string) (playlistResponse, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2179,7 +1869,7 @@ func (s *trackStore) getSharedPlaylist(shareToken string) (playlistResponse, boo
 	return publicPlaylistResponse(s.buildPlaylistResponseLocked(p)), true
 }
 
-func (s *trackStore) getSharedPlaylistTracks(shareToken string, userID, page, pageSize int64) (paginatedTracks, bool) {
+func (s *domainState) getSharedPlaylistTracks(shareToken string, userID, page, pageSize int64) (paginatedTracks, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2190,7 +1880,7 @@ func (s *trackStore) getSharedPlaylistTracks(shareToken string, userID, page, pa
 	return s.buildPublicPlaylistTracksPageLocked(p, userID, page, pageSize), true
 }
 
-func (s *trackStore) buildPublicPlaylistTracksPageLocked(p playlist, userID, page, pageSize int64) paginatedTracks {
+func (s *domainState) buildPublicPlaylistTracksPageLocked(p playlist, userID, page, pageSize int64) paginatedTracks {
 	items := make([]trackResponse, 0, len(p.TrackItems))
 	favoriteIDs := s.favoriteTrackSetLocked(userID)
 	dislikedIDs := s.dislikedTrackSetLocked(userID)
@@ -2223,7 +1913,7 @@ func (s *trackStore) buildPublicPlaylistTracksPageLocked(p playlist, userID, pag
 	}
 }
 
-func (s *trackStore) addTrackToPlaylists(userID, trackID int64, playlistIDs []int64) error {
+func (s *domainState) addTrackToPlaylists(userID, trackID int64, playlistIDs []int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2245,20 +1935,22 @@ func (s *trackStore) addTrackToPlaylists(userID, trackID int64, playlistIDs []in
 		}
 	}
 
-	playlistsSnapshot := clonePlaylistsMap(s.playlists)
 	for _, playlistID := range normalizedPlaylistIDs {
 		p := s.playlists[playlistID]
-		p.TrackItems = appendPlaylistTrack(p.TrackItems, playlistTrack{TrackID: trackID})
+		updated := appendPlaylistTrack(p.TrackItems, playlistTrack{TrackID: trackID})
+		if len(updated) == len(p.TrackItems) {
+			continue
+		}
+		p.TrackItems = updated
 		s.playlists[playlistID] = p
-	}
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
-		s.playlists = playlistsSnapshot
-		return err
+		if err := s.repositories.playlists.Update(s.ctx, p); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func (s *trackStore) removeTrackFromPlaylist(userID, playlistID, trackID int64) (bool, error) {
+func (s *domainState) removeTrackFromPlaylist(userID, playlistID, trackID int64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2269,29 +1961,27 @@ func (s *trackStore) removeTrackFromPlaylist(userID, playlistID, trackID int64) 
 	if p.System {
 		return false, errSystemPlaylistImmutable
 	}
-	original := clonePlaylist(p)
 	updated := removePlaylistTrack(p.TrackItems, trackID)
 	if len(updated) == len(p.TrackItems) {
 		return false, nil
 	}
 	p.TrackItems = updated
 	s.playlists[playlistID] = p
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
-		s.playlists[playlistID] = original
+	if err := s.repositories.playlists.Update(s.ctx, p); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func (s *trackStore) setFavoriteTrack(userID, trackID int64, favorite bool) error {
+func (s *domainState) setFavoriteTrack(userID, trackID int64, favorite bool) error {
 	return s.setTrackPreference(userID, trackID, playlistKindFavorites, favorite)
 }
 
-func (s *trackStore) setDislikedTrack(userID, trackID int64, disliked bool) error {
+func (s *domainState) setDislikedTrack(userID, trackID int64, disliked bool) error {
 	return s.setTrackPreference(userID, trackID, playlistKindDislikes, disliked)
 }
 
-func (s *trackStore) setTrackPreference(userID, trackID int64, kind string, enabled bool) error {
+func (s *domainState) setTrackPreference(userID, trackID int64, kind string, enabled bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2306,13 +1996,18 @@ func (s *trackStore) setTrackPreference(userID, trackID int64, kind string, enab
 	if !ok {
 		return errPlaylistNotFound
 	}
-	playlistsSnapshot := clonePlaylistsMap(s.playlists)
+	currentLength := len(p.TrackItems)
 	if enabled {
 		p.TrackItems = appendPlaylistTrack(p.TrackItems, playlistTrack{TrackID: trackID})
 	} else {
 		p.TrackItems = removePlaylistTrack(p.TrackItems, trackID)
 	}
-	s.playlists[p.ID] = p
+	if len(p.TrackItems) != currentLength {
+		s.playlists[p.ID] = p
+		if err := s.repositories.playlists.Update(s.ctx, p); err != nil {
+			return err
+		}
+	}
 
 	if enabled {
 		oppositeKind := playlistKindFavorites
@@ -2320,19 +2015,20 @@ func (s *trackStore) setTrackPreference(userID, trackID int64, kind string, enab
 			oppositeKind = playlistKindDislikes
 		}
 		if opposite, ok := s.findPlaylistByKindLocked(userID, oppositeKind); ok {
-			opposite.TrackItems = removePlaylistTrack(opposite.TrackItems, trackID)
-			s.playlists[opposite.ID] = opposite
+			updated := removePlaylistTrack(opposite.TrackItems, trackID)
+			if len(updated) != len(opposite.TrackItems) {
+				opposite.TrackItems = updated
+				s.playlists[opposite.ID] = opposite
+				if err := s.repositories.playlists.Update(s.ctx, opposite); err != nil {
+					return err
+				}
+			}
 		}
-	}
-
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
-		s.playlists = playlistsSnapshot
-		return err
 	}
 	return nil
 }
 
-func (s *trackStore) nextAutoplayTracks(userID int64, req autoplayNextRequest) (autoplayNextResponse, error) {
+func (s *domainState) nextAutoplayTracks(userID int64, req autoplayNextRequest) (autoplayNextResponse, error) {
 	songsMutationMu.RLock()
 	defer songsMutationMu.RUnlock()
 
@@ -2402,7 +2098,7 @@ func (s *trackStore) nextAutoplayTracks(userID int64, req autoplayNextRequest) (
 	}, nil
 }
 
-func (s *trackStore) nextAuthorAutoplayTracksLocked(
+func (s *domainState) nextAuthorAutoplayTracksLocked(
 	userID int64,
 	req autoplayNextRequest,
 	excluded, dislikedIDs map[int64]struct{},
@@ -2462,7 +2158,7 @@ func (s *trackStore) nextAuthorAutoplayTracksLocked(
 	}, nil
 }
 
-func (s *trackStore) isTrackAutomaticallyPlayableLocked(trackItem track) (bool, error) {
+func (s *domainState) isTrackAutomaticallyPlayableLocked(trackItem track) (bool, error) {
 	if trackItem.AudioFilePath == "" {
 		return false, nil
 	}
@@ -2488,7 +2184,7 @@ func (s *trackStore) isTrackAutomaticallyPlayableLocked(trackItem track) (bool, 
 	return info.Mode().IsRegular() && info.Size() > 0, nil
 }
 
-func (s *trackStore) reorderPlaylistTracks(userID, playlistID int64, trackIDs []int64) (bool, error) {
+func (s *domainState) reorderPlaylistTracks(userID, playlistID int64, trackIDs []int64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2502,36 +2198,20 @@ func (s *trackStore) reorderPlaylistTracks(userID, playlistID int64, trackIDs []
 	if err := validatePlaylistTrackOrder(trackIDs, p.TrackItems); err != nil {
 		return true, err
 	}
-	currentPlaylist := clonePlaylist(p)
 	p.TrackItems = reorderPlaylistTrackItems(p.TrackItems, trackIDs)
 	s.playlists[playlistID] = p
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{playlists: true}); err != nil {
-		s.playlists[playlistID] = currentPlaylist
+	if err := s.repositories.playlists.Update(s.ctx, p); err != nil {
 		return true, err
 	}
 	return true, nil
 }
 
-func (s *trackStore) listAuthors(filter authorListFilter) ([]author, error) {
+func (s *domainState) listAuthors(filter authorListFilter) ([]author, error) {
 	var rankedAuthorIDs []int64
 	if filter.Sort == authorPopularitySort {
-		rows, err := s.db.Query(`SELECT author_id FROM author_popularity_snapshot ORDER BY ranking_position`)
+		var err error
+		rankedAuthorIDs, err = s.repositories.authors.ListPopularityRankedIDs(s.ctx)
 		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var authorID int64
-			if err := rows.Scan(&authorID); err != nil {
-				_ = rows.Close()
-				return nil, err
-			}
-			rankedAuthorIDs = append(rankedAuthorIDs, authorID)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		if err := rows.Close(); err != nil {
 			return nil, err
 		}
 	}
@@ -2564,7 +2244,7 @@ func (s *trackStore) listAuthors(filter authorListFilter) ([]author, error) {
 	return items, nil
 }
 
-func (s *trackStore) search(userID int64, filter searchListFilter) paginatedSearchResults {
+func (s *domainState) search(userID int64, filter searchListFilter) paginatedSearchResults {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2668,19 +2348,22 @@ func (s *trackStore) search(userID int64, filter searchListFilter) paginatedSear
 	}
 }
 
-func (s *trackStore) getAuthor(id int64) (author, bool) {
+func (s *domainState) getAuthor(id int64) (author, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	a, ok := s.authors[id]
 	return a, ok
 }
 
-func (s *trackStore) createAuthor(req upsertAuthorRequest) (author, error) {
+func (s *domainState) createAuthor(req upsertAuthorRequest) (author, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
+	id, err := s.repositories.metadata.AllocateID(s.ctx, "next_author_id")
+	if err != nil {
+		return author{}, err
+	}
 	a := author{
-		ID:          s.nextAuthorID,
+		ID:          id,
 		CurrentName: strings.TrimSpace(req.CurrentName),
 		Photos:      normalizePhotos(req.Photos),
 	}
@@ -2688,13 +2371,8 @@ func (s *trackStore) createAuthor(req upsertAuthorRequest) (author, error) {
 		return author{}, err
 	}
 
-	s.nextAuthorID++
 	s.authors[a.ID] = a
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{
-		metadataExpected: map[string]int64{"next_author_id": a.ID}, authors: true,
-	}); err != nil {
-		delete(s.authors, a.ID)
-		s.nextAuthorID--
+	if err := s.repositories.authors.Insert(s.ctx, a); err != nil {
 		return author{}, err
 	}
 	return a, nil
@@ -2779,11 +2457,11 @@ func (s *trackStore) appendAnalyticsEvents(events []analyticsEventRecord) (respo
 	return response, nil
 }
 
-func (s *trackStore) updateAuthor(id int64, req upsertAuthorRequest) (author, bool, error) {
+func (s *domainState) updateAuthor(id int64, req upsertAuthorRequest) (author, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	current, ok := s.authors[id]
+	_, ok := s.authors[id]
 	if !ok {
 		return author{}, false, nil
 	}
@@ -2798,18 +2476,17 @@ func (s *trackStore) updateAuthor(id int64, req upsertAuthorRequest) (author, bo
 	}
 
 	s.authors[id] = a
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{authors: true}); err != nil {
-		s.authors[id] = current
+	if err := s.repositories.authors.Update(s.ctx, a); err != nil {
 		return author{}, true, err
 	}
 	return a, true, nil
 }
 
-func (s *trackStore) deleteAuthor(id int64) (bool, error) {
+func (s *domainState) deleteAuthor(id int64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	current, ok := s.authors[id]
+	_, ok := s.authors[id]
 	if !ok {
 		return false, nil
 	}
@@ -2821,15 +2498,13 @@ func (s *trackStore) deleteAuthor(id int64) (bool, error) {
 		}
 	}
 
-	delete(s.authors, id)
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{authors: true}); err != nil {
-		s.authors[id] = current
+	if err := s.repositories.authors.Delete(s.ctx, id); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func (s *trackStore) createUser(email, passwordHash string) (user, error) {
+func (s *domainState) createUser(email, passwordHash string) (user, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2842,41 +2517,44 @@ func (s *trackStore) createUser(email, passwordHash string) (user, error) {
 	if len(s.users) == 0 {
 		role = roleAdmin
 	}
-
+	userID, err := s.repositories.metadata.AllocateID(s.ctx, "next_user_id")
+	if err != nil {
+		return user{}, err
+	}
 	u := user{
-		ID:           s.nextUserID,
+		ID:           userID,
 		Email:        email,
 		Role:         role,
 		PasswordHash: passwordHash,
 		CreatedAt:    time.Now().UTC(),
 	}
 
-	s.nextUserID++
-	s.users[u.ID] = u
-	s.usersByEmail[email] = u.ID
-	nextPlaylistIDSnapshot := s.nextPlaylistID
-	favoritesPlaylist := s.newFavoritesPlaylistLocked(u.ID)
-	dislikesPlaylist := s.newDislikesPlaylistLocked(u.ID)
-	s.playlists[favoritesPlaylist.ID] = favoritesPlaylist
-	s.playlists[dislikesPlaylist.ID] = dislikesPlaylist
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{
-		metadataExpected: map[string]int64{
-			"next_user_id": u.ID, "next_playlist_id": nextPlaylistIDSnapshot,
-		},
-		users: true, playlists: true,
-	}); err != nil {
-		delete(s.users, u.ID)
-		delete(s.usersByEmail, email)
-		delete(s.playlists, favoritesPlaylist.ID)
-		delete(s.playlists, dislikesPlaylist.ID)
-		s.nextPlaylistID = nextPlaylistIDSnapshot
-		s.nextUserID--
+	favoritesID, err := s.repositories.metadata.AllocateID(s.ctx, "next_playlist_id")
+	if err != nil {
+		return user{}, err
+	}
+	dislikesID, err := s.repositories.metadata.AllocateID(s.ctx, "next_playlist_id")
+	if err != nil {
+		return user{}, err
+	}
+	favoritesPlaylist := playlist{ID: favoritesID, UserID: u.ID, Name: "Favorites", Visibility: playlistVisibilityPrivate, TrackItems: []playlistTrack{}, System: true, Kind: playlistKindFavorites}
+	dislikesPlaylist := playlist{ID: dislikesID, UserID: u.ID, Name: "Disliked", Visibility: playlistVisibilityPrivate, TrackItems: []playlistTrack{}, System: true, Kind: playlistKindDislikes}
+	if err := s.repositories.users.Insert(s.ctx, u); err != nil {
+		if errors.Is(err, errRepositoryConflict) {
+			return user{}, errEmailAlreadyExists
+		}
+		return user{}, err
+	}
+	if err := s.repositories.playlists.Insert(s.ctx, favoritesPlaylist); err != nil {
+		return user{}, err
+	}
+	if err := s.repositories.playlists.Insert(s.ctx, dislikesPlaylist); err != nil {
 		return user{}, err
 	}
 	return u, nil
 }
 
-func (s *trackStore) getUserByEmail(email string) (user, bool) {
+func (s *domainState) getUserByEmail(email string) (user, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2888,7 +2566,7 @@ func (s *trackStore) getUserByEmail(email string) (user, bool) {
 	return u, ok
 }
 
-func (s *trackStore) getUser(id int64) (user, bool) {
+func (s *domainState) getUser(id int64) (user, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2896,27 +2574,24 @@ func (s *trackStore) getUser(id int64) (user, bool) {
 	return u, ok
 }
 
-func (s *trackStore) createRefreshSession(userID int64, expiresAt time.Time) (refreshSession, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, ok := s.users[userID]; !ok {
+func (s *domainState) createRefreshSession(userID int64, expiresAt time.Time) (refreshSession, string, error) {
+	if _, ok, err := s.repositories.users.FindByID(s.ctx, userID); err != nil {
+		return refreshSession{}, "", err
+	} else if !ok {
 		return refreshSession{}, "", errInvalidCredentials
 	}
-
-	sessionsSnapshot := cloneRefreshSessionsMap(s.refreshSession)
 	now := time.Now().UTC()
-	s.removeExpiredSessionsLocked(now)
+	if err := s.repositories.sessions.DeleteExpired(s.ctx, now); err != nil {
+		return refreshSession{}, "", err
+	}
 
 	rawToken, err := randomToken(32)
 	if err != nil {
-		s.refreshSession = sessionsSnapshot
 		return refreshSession{}, "", err
 	}
 
 	sessionID, err := randomToken(16)
 	if err != nil {
-		s.refreshSession = sessionsSnapshot
 		return refreshSession{}, "", err
 	}
 
@@ -2928,49 +2603,42 @@ func (s *trackStore) createRefreshSession(userID int64, expiresAt time.Time) (re
 		ExpiresAt: expiresAt.UTC(),
 	}
 
-	s.refreshSession[session.ID] = session
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{sessions: true}); err != nil {
-		s.refreshSession = sessionsSnapshot
+	if err := s.repositories.sessions.Insert(s.ctx, session); err != nil {
 		return refreshSession{}, "", err
 	}
 	return session, rawToken, nil
 }
 
-func (s *trackStore) rotateRefreshSession(rawToken string, expiresAt time.Time) (user, refreshSession, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	sessionsSnapshot := cloneRefreshSessionsMap(s.refreshSession)
+func (s *domainState) rotateRefreshSession(rawToken string, expiresAt time.Time) (user, refreshSession, string, error) {
 	now := time.Now().UTC()
-	s.removeExpiredSessionsLocked(now)
-
-	session, ok := s.findRefreshSessionLocked(rawToken)
+	if err := s.repositories.sessions.DeleteExpired(s.ctx, now); err != nil {
+		return user{}, refreshSession{}, "", err
+	}
+	session, ok, err := s.repositories.sessions.FindByToken(s.ctx, rawToken, now)
+	if err != nil {
+		return user{}, refreshSession{}, "", err
+	}
 	if !ok {
-		s.refreshSession = sessionsSnapshot
 		return user{}, refreshSession{}, "", errInvalidRefreshToken
 	}
-
-	u, ok := s.users[session.UserID]
+	u, ok, err := s.repositories.users.FindByID(s.ctx, session.UserID)
+	if err != nil {
+		return user{}, refreshSession{}, "", err
+	}
 	if !ok {
-		delete(s.refreshSession, session.ID)
-		if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{sessions: true}); err != nil {
-			s.refreshSession = sessionsSnapshot
+		if err := s.repositories.sessions.Delete(s.ctx, session.ID); err != nil {
 			return user{}, refreshSession{}, "", fmt.Errorf("remove refresh session for missing user: %w", err)
 		}
 		return user{}, refreshSession{}, "", errInvalidRefreshToken
 	}
 
-	delete(s.refreshSession, session.ID)
-
 	newRawToken, err := randomToken(32)
 	if err != nil {
-		s.refreshSession = sessionsSnapshot
 		return user{}, refreshSession{}, "", err
 	}
 
 	newSessionID, err := randomToken(16)
 	if err != nil {
-		s.refreshSession = sessionsSnapshot
 		return user{}, refreshSession{}, "", err
 	}
 
@@ -2982,47 +2650,28 @@ func (s *trackStore) rotateRefreshSession(rawToken string, expiresAt time.Time) 
 		ExpiresAt: expiresAt.UTC(),
 	}
 
-	s.refreshSession[newSession.ID] = newSession
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{sessions: true}); err != nil {
-		s.refreshSession = sessionsSnapshot
+	if err := s.repositories.sessions.Delete(s.ctx, session.ID); err != nil {
+		return user{}, refreshSession{}, "", err
+	}
+	if err := s.repositories.sessions.Insert(s.ctx, newSession); err != nil {
 		return user{}, refreshSession{}, "", err
 	}
 
 	return u, newSession, newRawToken, nil
 }
 
-func (s *trackStore) deleteRefreshSession(rawToken string) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	session, ok := s.findRefreshSessionLocked(rawToken)
+func (s *domainState) deleteRefreshSession(rawToken string) (bool, error) {
+	session, ok, err := s.repositories.sessions.FindByToken(s.ctx, rawToken, time.Time{})
+	if err != nil {
+		return false, err
+	}
 	if !ok {
 		return false, nil
 	}
-	delete(s.refreshSession, session.ID)
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{sessions: true}); err != nil {
-		s.refreshSession[session.ID] = session
+	if err := s.repositories.sessions.Delete(s.ctx, session.ID); err != nil {
 		return false, err
 	}
 	return true, nil
-}
-
-func (s *trackStore) findRefreshSessionLocked(rawToken string) (refreshSession, bool) {
-	hashed := hashToken(rawToken)
-	for _, session := range s.refreshSession {
-		if subtle.ConstantTimeCompare([]byte(session.TokenHash), []byte(hashed)) == 1 {
-			return session, true
-		}
-	}
-	return refreshSession{}, false
-}
-
-func (s *trackStore) removeExpiredSessionsLocked(now time.Time) {
-	for id, session := range s.refreshSession {
-		if session.ExpiresAt.Before(now) {
-			delete(s.refreshSession, id)
-		}
-	}
 }
 
 func marshalJSONColumn(v any) (string, error) {
@@ -5583,7 +5232,7 @@ func normalizePlaylistVisibility(value string) string {
 	}
 }
 
-func (s *trackStore) normalizePlaylistSharingLocked(p *playlist) error {
+func (s *domainState) normalizePlaylistSharingLocked(p *playlist) error {
 	if p.Visibility != playlistVisibilityShared {
 		p.ShareToken = ""
 		return nil
@@ -5600,7 +5249,7 @@ func (s *trackStore) normalizePlaylistSharingLocked(p *playlist) error {
 	return nil
 }
 
-func (s *trackStore) newPlaylistShareTokenLocked(excludePlaylistID int64) (string, error) {
+func (s *domainState) newPlaylistShareTokenLocked(excludePlaylistID int64) (string, error) {
 	for attempts := 0; attempts < 10; attempts++ {
 		token, err := randomURLToken(playlistShareTokenBytes)
 		if err != nil {
@@ -5613,7 +5262,7 @@ func (s *trackStore) newPlaylistShareTokenLocked(excludePlaylistID int64) (strin
 	return "", errors.New("failed to generate unique playlist share token")
 }
 
-func (s *trackStore) playlistShareTokenInUseLocked(token string, excludePlaylistID int64) bool {
+func (s *domainState) playlistShareTokenInUseLocked(token string, excludePlaylistID int64) bool {
 	token = strings.TrimSpace(token)
 	if token == "" {
 		return false
@@ -5626,7 +5275,7 @@ func (s *trackStore) playlistShareTokenInUseLocked(token string, excludePlaylist
 	return false
 }
 
-func (s *trackStore) findSharedPlaylistByTokenLocked(shareToken string) (playlist, bool) {
+func (s *domainState) findSharedPlaylistByTokenLocked(shareToken string) (playlist, bool) {
 	shareToken = strings.TrimSpace(shareToken)
 	if shareToken == "" {
 		return playlist{}, false
@@ -5680,7 +5329,7 @@ func playlistKindSortRank(kind string) int {
 	}
 }
 
-func (s *trackStore) validateTrackLocked(t track) error {
+func (s *domainState) validateTrackLocked(t track) error {
 	switch {
 	case t.Name == "":
 		return fmt.Errorf("%w: name is required", errInvalidTrack)
@@ -5709,7 +5358,7 @@ func (s *trackStore) validateTrackLocked(t track) error {
 	}
 }
 
-func (s *trackStore) songFileReferenced(fileName string) (bool, int64) {
+func (s *domainState) songFileReferenced(fileName string) (bool, int64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -5722,7 +5371,7 @@ func (s *trackStore) songFileReferenced(fileName string) (bool, int64) {
 	return false, 0
 }
 
-func (s *trackStore) referencedSongFiles() map[string]struct{} {
+func (s *domainState) referencedSongFiles() map[string]struct{} {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -5798,7 +5447,7 @@ func validatePlaylistTrackOrder(trackIDs []int64, existing []playlistTrack) erro
 	return nil
 }
 
-func (s *trackStore) validateAlbumLocked(a album) error {
+func (s *domainState) validateAlbumLocked(a album) error {
 	switch {
 	case a.Title == "":
 		return fmt.Errorf("%w: title is required", errInvalidAlbum)
@@ -5892,81 +5541,7 @@ func sourceMetadataIdentityKey(identity map[string]any) (string, error) {
 	return string(encoded), nil
 }
 
-func (s *trackStore) ensureSystemPlaylistsLocked() error {
-	for userID := range s.users {
-		if _, ok := s.findPlaylistByKindLocked(userID, playlistKindFavorites); !ok {
-			p := s.newFavoritesPlaylistLocked(userID)
-			s.playlists[p.ID] = p
-		}
-		if _, ok := s.findPlaylistByKindLocked(userID, playlistKindDislikes); !ok {
-			p := s.newDislikesPlaylistLocked(userID)
-			s.playlists[p.ID] = p
-		}
-	}
-	return nil
-}
-
-func (s *trackStore) deduplicateSystemPlaylistsLocked() {
-	canonical := make(map[string]int64)
-	playlistIDs := make([]int64, 0, len(s.playlists))
-	for playlistID := range s.playlists {
-		playlistIDs = append(playlistIDs, playlistID)
-	}
-	sort.Slice(playlistIDs, func(i, j int) bool { return playlistIDs[i] < playlistIDs[j] })
-
-	for _, playlistID := range playlistIDs {
-		p := s.playlists[playlistID]
-		if p.Kind != playlistKindFavorites && p.Kind != playlistKindDislikes {
-			continue
-		}
-		key := strconv.FormatInt(p.UserID, 10) + "\x00" + p.Kind
-		canonicalID, exists := canonical[key]
-		if !exists {
-			canonical[key] = p.ID
-			continue
-		}
-		canonicalPlaylist := s.playlists[canonicalID]
-		for _, item := range p.TrackItems {
-			canonicalPlaylist.TrackItems = appendPlaylistTrack(canonicalPlaylist.TrackItems, item)
-		}
-		s.playlists[canonicalID] = canonicalPlaylist
-		delete(s.playlists, p.ID)
-	}
-}
-
-func (s *trackStore) newFavoritesPlaylistLocked(userID int64) playlist {
-	p := playlist{
-		ID:             s.nextPlaylistID,
-		UserID:         userID,
-		Name:           "Favorites",
-		Description:    "Tracks marked as favorite by the user.",
-		CoverImagePath: "",
-		Visibility:     playlistVisibilityPrivate,
-		TrackItems:     []playlistTrack{},
-		System:         true,
-		Kind:           playlistKindFavorites,
-	}
-	s.nextPlaylistID++
-	return p
-}
-
-func (s *trackStore) newDislikesPlaylistLocked(userID int64) playlist {
-	p := playlist{
-		ID:             s.nextPlaylistID,
-		UserID:         userID,
-		Name:           "Dislikes",
-		Description:    "Tracks disliked by the user.",
-		CoverImagePath: "",
-		Visibility:     playlistVisibilityPrivate,
-		TrackItems:     []playlistTrack{},
-		System:         true,
-		Kind:           playlistKindDislikes,
-	}
-	s.nextPlaylistID++
-	return p
-}
-
-func (s *trackStore) findPlaylistByKindLocked(userID int64, kind string) (playlist, bool) {
+func (s *domainState) findPlaylistByKindLocked(userID int64, kind string) (playlist, bool) {
 	for _, p := range s.playlists {
 		if p.UserID == userID && p.Kind == kind {
 			return p, true
@@ -5975,11 +5550,11 @@ func (s *trackStore) findPlaylistByKindLocked(userID int64, kind string) (playli
 	return playlist{}, false
 }
 
-func (s *trackStore) findFavoritesPlaylistLocked(userID int64) (playlist, bool) {
+func (s *domainState) findFavoritesPlaylistLocked(userID int64) (playlist, bool) {
 	return s.findPlaylistByKindLocked(userID, playlistKindFavorites)
 }
 
-func (s *trackStore) favoriteTrackSetLocked(userID int64) map[int64]struct{} {
+func (s *domainState) favoriteTrackSetLocked(userID int64) map[int64]struct{} {
 	favorites, ok := s.findFavoritesPlaylistLocked(userID)
 	if !ok {
 		return map[int64]struct{}{}
@@ -5991,7 +5566,7 @@ func (s *trackStore) favoriteTrackSetLocked(userID int64) map[int64]struct{} {
 	return items
 }
 
-func (s *trackStore) dislikedTrackSetLocked(userID int64) map[int64]struct{} {
+func (s *domainState) dislikedTrackSetLocked(userID int64) map[int64]struct{} {
 	dislikes, ok := s.findPlaylistByKindLocked(userID, playlistKindDislikes)
 	if !ok {
 		return map[int64]struct{}{}
@@ -6003,7 +5578,7 @@ func (s *trackStore) dislikedTrackSetLocked(userID int64) map[int64]struct{} {
 	return items
 }
 
-func (s *trackStore) automaticPlaybackExcludedTrackSetLocked(userID int64, recentTrackIDs, requestedExcludedTrackIDs []int64) (map[int64]struct{}, map[int64]struct{}) {
+func (s *domainState) automaticPlaybackExcludedTrackSetLocked(userID int64, recentTrackIDs, requestedExcludedTrackIDs []int64) (map[int64]struct{}, map[int64]struct{}) {
 	dislikedIDs := s.dislikedTrackSetLocked(userID)
 	excluded := make(map[int64]struct{}, len(recentTrackIDs)+len(requestedExcludedTrackIDs)+len(dislikedIDs))
 	for _, trackID := range recentTrackIDs {
@@ -6018,7 +5593,7 @@ func (s *trackStore) automaticPlaybackExcludedTrackSetLocked(userID int64, recen
 	return excluded, dislikedIDs
 }
 
-func (s *trackStore) buildPlaylistResponseLocked(p playlist) playlistResponse {
+func (s *domainState) buildPlaylistResponseLocked(p playlist) playlistResponse {
 	return playlistResponse{
 		ID:             p.ID,
 		UserID:         p.UserID,
@@ -6039,7 +5614,7 @@ func publicPlaylistResponse(p playlistResponse) playlistResponse {
 	return p
 }
 
-func (s *trackStore) buildPlaylistTrackResponseLocked(item playlistTrack, favoriteIDs, dislikedIDs map[int64]struct{}) trackResponse {
+func (s *domainState) buildPlaylistTrackResponseLocked(item playlistTrack, favoriteIDs, dislikedIDs map[int64]struct{}) trackResponse {
 	if current, ok := s.tracks[item.TrackID]; ok {
 		_, isFavorite := favoriteIDs[item.TrackID]
 		_, isDisliked := dislikedIDs[item.TrackID]
@@ -6057,7 +5632,7 @@ func (s *trackStore) buildPlaylistTrackResponseLocked(item playlistTrack, favori
 	}
 }
 
-func (s *trackStore) listTrackResponses(userID int64, filter trackListFilter) paginatedTracks {
+func (s *domainState) listTrackResponses(userID int64, filter trackListFilter) paginatedTracks {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -6125,7 +5700,7 @@ func (s *trackStore) listTrackResponses(userID int64, filter trackListFilter) pa
 	}
 }
 
-func (s *trackStore) getTrackResponse(trackID, userID int64) (trackResponse, bool) {
+func (s *domainState) getTrackResponse(trackID, userID int64) (trackResponse, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -6138,7 +5713,7 @@ func (s *trackStore) getTrackResponse(trackID, userID int64) (trackResponse, boo
 	return s.toTrackResponseLocked(t, isFavorite, isDisliked, true), true
 }
 
-func (s *trackStore) markTrackUnavailableLocked(t track) {
+func (s *domainState) markTrackUnavailableLocked(t track) {
 	snapshot := cloneTrack(t)
 	for playlistID, p := range s.playlists {
 		changed := false
@@ -6155,7 +5730,7 @@ func (s *trackStore) markTrackUnavailableLocked(t track) {
 	}
 }
 
-func (s *trackStore) rebuildAlbumDerivedDataLocked() error {
+func (s *domainState) rebuildAlbumDerivedDataLocked() error {
 	for albumID, albumItem := range s.albums {
 		normalizedTrackIDs := make([]int64, 0, len(albumItem.TrackIDs))
 		authorSet := make(map[int64]struct{})
@@ -6183,7 +5758,7 @@ func (s *trackStore) rebuildAlbumDerivedDataLocked() error {
 	return nil
 }
 
-func (s *trackStore) applyAlbumTrackIDsLocked(albumID int64, trackIDs []int64, allowRemoval bool) error {
+func (s *domainState) applyAlbumTrackIDsLocked(albumID int64, trackIDs []int64, allowRemoval bool) error {
 	albumItem, ok := s.albums[albumID]
 	if !ok {
 		return fmt.Errorf("%w: albumId %d does not exist", errInvalidAlbum, albumID)
@@ -6214,7 +5789,7 @@ func (s *trackStore) applyAlbumTrackIDsLocked(albumID int64, trackIDs []int64, a
 	return nil
 }
 
-func (s *trackStore) removeTrackFromAlbumLocked(albumID, trackID int64) {
+func (s *domainState) removeTrackFromAlbumLocked(albumID, trackID int64) {
 	albumItem, ok := s.albums[albumID]
 	if !ok {
 		return
@@ -6413,17 +5988,6 @@ func parseIntWithDefault(raw string, fallback int) int {
 	return value
 }
 
-func cloneTracksMap(src map[int64]track) map[int64]track {
-	cloned := make(map[int64]track, len(src))
-	for id, item := range src {
-		item.AuthorIDs = append([]int64(nil), item.AuthorIDs...)
-		item.AdditionalInfo = normalizeAdditionalInfo(item.AdditionalInfo)
-		item.SourceMetadata = normalizeSourceMetadata(item.SourceMetadata)
-		cloned[id] = item
-	}
-	return cloned
-}
-
 func cloneTrack(t track) track {
 	t.AuthorIDs = append([]int64(nil), t.AuthorIDs...)
 	t.AdditionalInfo = normalizeAdditionalInfo(t.AdditionalInfo)
@@ -6444,36 +6008,9 @@ func cloneAuthor(a author) author {
 	return a
 }
 
-func cloneAlbumsMap(src map[int64]album) map[int64]album {
-	cloned := make(map[int64]album, len(src))
-	for id, item := range src {
-		item.AuthorIDs = append([]int64(nil), item.AuthorIDs...)
-		item.TrackIDs = append([]int64(nil), item.TrackIDs...)
-		item.AdditionalInfo = normalizeAdditionalInfo(item.AdditionalInfo)
-		cloned[id] = item
-	}
-	return cloned
-}
-
 func clonePlaylist(p playlist) playlist {
 	p.TrackItems = normalizePlaylistTrackItems(p.TrackItems)
 	return p
-}
-
-func clonePlaylistsMap(src map[int64]playlist) map[int64]playlist {
-	cloned := make(map[int64]playlist, len(src))
-	for id, item := range src {
-		cloned[id] = clonePlaylist(item)
-	}
-	return cloned
-}
-
-func cloneRefreshSessionsMap(src map[string]refreshSession) map[string]refreshSession {
-	cloned := make(map[string]refreshSession, len(src))
-	for id, item := range src {
-		cloned[id] = item
-	}
-	return cloned
 }
 
 func appendPlaylistTrack(items []playlistTrack, item playlistTrack) []playlistTrack {
@@ -6534,14 +6071,14 @@ func toTrackResponse(t track, isFavorite, isAvailable bool) trackResponse {
 	}
 }
 
-func (s *trackStore) toTrackResponse(t track, isFavorite, isDisliked, isAvailable bool) trackResponse {
+func (s *domainState) toTrackResponse(t track, isFavorite, isDisliked, isAvailable bool) trackResponse {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	return s.toTrackResponseLocked(t, isFavorite, isDisliked, isAvailable)
 }
 
-func (s *trackStore) toTrackResponseLocked(t track, isFavorite, isDisliked, isAvailable bool) trackResponse {
+func (s *domainState) toTrackResponseLocked(t track, isFavorite, isDisliked, isAvailable bool) trackResponse {
 	response := toTrackResponse(t, isFavorite, isAvailable)
 	response.IsDisliked = isDisliked
 	if albumItem, ok := s.albums[t.AlbumID]; ok {
@@ -6550,7 +6087,7 @@ func (s *trackStore) toTrackResponseLocked(t track, isFavorite, isDisliked, isAv
 	return response
 }
 
-func (s *trackStore) toSearchTrackResponseLocked(t track, isFavorite, isDisliked bool) trackResponse {
+func (s *domainState) toSearchTrackResponseLocked(t track, isFavorite, isDisliked bool) trackResponse {
 	response := s.toTrackResponseLocked(t, isFavorite, isDisliked, true)
 	response.Authors = make([]author, 0, len(t.AuthorIDs))
 	for _, authorID := range t.AuthorIDs {

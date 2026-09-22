@@ -455,10 +455,10 @@ func createTestUserWithRole(t *testing.T, store *trackStore, role, email string)
 	if err != nil {
 		t.Fatalf("createUser() error = %v", err)
 	}
-	store.mu.Lock()
 	u.Role = role
-	store.users[u.ID] = u
-	store.mu.Unlock()
+	if _, err := store.db.Exec(`UPDATE users SET role = ? WHERE id = ?`, role, u.ID); err != nil {
+		t.Fatalf("update user role: %v", err)
+	}
 	return u
 }
 

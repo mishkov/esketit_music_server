@@ -9,7 +9,7 @@ DOTENV_PATH="$SCRIPT_DIR/.env"
 
 DEFAULT_SONGS_DIR="$HOME/Projects/esketit_music/media_storage/songs"
 DEFAULT_ALBUM_COVERS_DIR="$HOME/Projects/esketit_music/media_storage/album_covers"
-DEFAULT_TRACKS_DB_PATH="$SCRIPT_DIR/tracks.db"
+DEFAULT_TRACKS_DB_PATH="$SCRIPT_DIR/tracks.sqlite"
 
 if [[ -f "$DOTENV_PATH" ]]; then
   set -a

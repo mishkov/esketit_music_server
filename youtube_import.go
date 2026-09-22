@@ -1372,7 +1372,7 @@ func (s *youtubeImportService) AddCurrent(ctx context.Context, userID int64, req
 
 	switch strings.ToLower(strings.TrimSpace(req.Mode)) {
 	case youtubeAddModeCreate:
-		if _, exists := s.store.findTrackBySourceMetadata(generatedSourceMetadata[0]); exists {
+		if _, exists := s.store.findTrackBySourceMetadataContext(ctx, generatedSourceMetadata[0]); exists {
 			return youtubeImportSessionDTO{}, track{}, errYouTubeCurrentConflict
 		}
 
@@ -1410,7 +1410,7 @@ func (s *youtubeImportService) AddCurrent(ctx context.Context, userID int64, req
 			return youtubeImportSessionDTO{}, track{}, err
 		}
 		preparedAudio.finalPath = finalPath
-		createdTrack, err := s.store.createTrackIfSourceAbsent(upsertTrackRequest{
+		createdTrack, err := s.store.createTrackIfSourceAbsentContext(ctx, upsertTrackRequest{
 			Name:           strings.TrimSpace(req.Name),
 			AuthorIDs:      req.AuthorIDs,
 			AlbumID:        req.AlbumID,
@@ -1437,7 +1437,7 @@ func (s *youtubeImportService) AddCurrent(ctx context.Context, userID int64, req
 		if err := ctx.Err(); err != nil {
 			return youtubeImportSessionDTO{}, track{}, err
 		}
-		updatedTrack, exists, err := s.store.attachTrackImportMetadataIfSourceAbsent(req.TrackID, generatedAdditionalInfo, generatedSourceMetadata, generatedSourceMetadata[0])
+		updatedTrack, exists, err := s.store.attachTrackImportMetadataIfSourceAbsentContext(ctx, req.TrackID, generatedAdditionalInfo, generatedSourceMetadata, generatedSourceMetadata[0])
 		if err != nil {
 			return youtubeImportSessionDTO{}, track{}, err
 		}
@@ -2995,7 +2995,7 @@ func passesYouTubeCutoff(item youtubeImportItem, cutoff *time.Time) bool {
 	return !item.ParsedReleaseDate.Before(cutoff.UTC())
 }
 
-func (s *trackStore) getTrack(trackID int64) (track, bool) {
+func (s *domainState) getTrack(trackID int64) (track, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -3006,7 +3006,7 @@ func (s *trackStore) getTrack(trackID int64) (track, bool) {
 	return cloneTrack(t), true
 }
 
-func (s *trackStore) getTrackAlbumOrder(trackID int64) (int, bool) {
+func (s *domainState) getTrackAlbumOrder(trackID int64) (int, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -3026,14 +3026,14 @@ func (s *trackStore) getTrackAlbumOrder(trackID int64) (int, bool) {
 	return 0, false
 }
 
-func (s *trackStore) findTrackBySourceMetadata(target sourceMetadata) (track, bool) {
+func (s *domainState) findTrackBySourceMetadata(target sourceMetadata) (track, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	return s.findTrackBySourceMetadataLocked(target)
 }
 
-func (s *trackStore) findTrackBySourceMetadataLocked(target sourceMetadata) (track, bool) {
+func (s *domainState) findTrackBySourceMetadataLocked(target sourceMetadata) (track, bool) {
 	targetProvider, ok := target["provider"].(string)
 	if !ok || strings.TrimSpace(targetProvider) == "" {
 		return track{}, false
@@ -3069,7 +3069,7 @@ func (s *trackStore) findTrackBySourceMetadataLocked(target sourceMetadata) (tra
 	return track{}, false
 }
 
-func (s *trackStore) createTrackIfSourceAbsent(req upsertTrackRequest, target sourceMetadata, publishAudio func() error) (track, error) {
+func (s *domainState) insertTrackIfSourceAbsent(req upsertTrackRequest, target sourceMetadata) (track, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -3080,20 +3080,12 @@ func (s *trackStore) createTrackIfSourceAbsent(req upsertTrackRequest, target so
 		return track{}, fmt.Errorf("%w: albumId %d does not exist", errInvalidTrack, req.AlbumID)
 	}
 
-	albumsSnapshot := cloneAlbumsMap(s.albums)
-	tracksSnapshot := cloneTracksMap(s.tracks)
-	nextTrackIDSnapshot := s.nextTrackID
-	restoreCatalog := func() {
-		s.albums = albumsSnapshot
-		s.tracks = tracksSnapshot
+	id, err := s.repositories.metadata.AllocateID(s.ctx, "next_track_id")
+	if err != nil {
+		return track{}, err
 	}
-	restoreBeforeCommit := func() {
-		restoreCatalog()
-		s.nextTrackID = nextTrackIDSnapshot
-	}
-
 	created := track{
-		ID:             s.nextTrackID,
+		ID:             id,
 		Name:           strings.TrimSpace(req.Name),
 		AuthorIDs:      normalizeAuthorIDs(req.AuthorIDs),
 		AlbumID:        req.AlbumID,
@@ -3110,37 +3102,23 @@ func (s *trackStore) createTrackIfSourceAbsent(req upsertTrackRequest, target so
 		return track{}, fmt.Errorf("%w: %v", errInvalidTrack, err)
 	}
 
-	s.nextTrackID++
 	s.tracks[created.ID] = created
 	targetAlbum := s.albums[req.AlbumID]
 	insertTrackIntoAlbumLocked(&targetAlbum, created.ID, albumOrder)
 	s.albums[req.AlbumID] = targetAlbum
 	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
-		restoreBeforeCommit()
 		return track{}, err
 	}
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{
-		metadataExpected: map[string]int64{"next_track_id": nextTrackIDSnapshot}, catalog: true,
-	}); err != nil {
-		restoreBeforeCommit()
+	if err := s.repositories.catalog.InsertTrack(s.ctx, created); err != nil {
 		return track{}, err
 	}
-	if publishAudio != nil {
-		if err := publishAudio(); err != nil {
-			// The database commit reserved the ID. Compensate the catalog rows,
-			// but deliberately keep the counter advanced so IDs are never reused.
-			restoreCatalog()
-			rollbackErr := s.commitDomainChangesLocked(context.Background(), domainWriteScope{catalog: true})
-			if rollbackErr != nil {
-				rollbackErr = fmt.Errorf("rollback track after audio publish failure: %w", rollbackErr)
-			}
-			return track{}, errors.Join(err, rollbackErr)
-		}
+	if err := s.repositories.catalog.UpdateAlbum(s.ctx, s.albums[req.AlbumID]); err != nil {
+		return track{}, err
 	}
 	return cloneTrack(s.tracks[created.ID]), nil
 }
 
-func (s *trackStore) attachTrackImportMetadata(trackID int64, infos []additionalInfo, metadata []sourceMetadata) (track, bool, error) {
+func (s *domainState) attachTrackImportMetadata(trackID int64, infos []additionalInfo, metadata []sourceMetadata) (track, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -3149,7 +3127,6 @@ func (s *trackStore) attachTrackImportMetadata(trackID int64, infos []additional
 		return track{}, false, nil
 	}
 
-	tracksSnapshot := cloneTracksMap(s.tracks)
 	updated := cloneTrack(current)
 	updated.AdditionalInfo = mergeAdditionalInfoItems(updated.AdditionalInfo, infos)
 	updated.SourceMetadata = mergeSourceMetadataItems(updated.SourceMetadata, metadata)
@@ -3157,14 +3134,13 @@ func (s *trackStore) attachTrackImportMetadata(trackID int64, infos []additional
 		return track{}, true, err
 	}
 	s.tracks[trackID] = updated
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{catalog: true}); err != nil {
-		s.tracks = tracksSnapshot
+	if err := s.repositories.catalog.UpdateTrack(s.ctx, updated); err != nil {
 		return track{}, true, err
 	}
 	return s.tracks[trackID], true, nil
 }
 
-func (s *trackStore) attachTrackImportMetadataIfSourceAbsent(trackID int64, infos []additionalInfo, metadata []sourceMetadata, target sourceMetadata) (track, bool, error) {
+func (s *domainState) attachTrackImportMetadataIfSourceAbsent(trackID int64, infos []additionalInfo, metadata []sourceMetadata, target sourceMetadata) (track, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -3176,7 +3152,6 @@ func (s *trackStore) attachTrackImportMetadataIfSourceAbsent(trackID int64, info
 		return track{}, true, errYouTubeCurrentConflict
 	}
 
-	tracksSnapshot := cloneTracksMap(s.tracks)
 	updated := cloneTrack(current)
 	updated.AdditionalInfo = mergeAdditionalInfoItems(updated.AdditionalInfo, infos)
 	updated.SourceMetadata = mergeSourceMetadataItems(updated.SourceMetadata, metadata)
@@ -3184,8 +3159,7 @@ func (s *trackStore) attachTrackImportMetadataIfSourceAbsent(trackID int64, info
 		return track{}, true, err
 	}
 	s.tracks[trackID] = updated
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{catalog: true}); err != nil {
-		s.tracks = tracksSnapshot
+	if err := s.repositories.catalog.UpdateTrack(s.ctx, updated); err != nil {
 		return track{}, true, err
 	}
 	return cloneTrack(s.tracks[trackID]), true, nil
@@ -3258,7 +3232,7 @@ func sourceMetadataDedupKey(item sourceMetadata) string {
 	return strings.ToLower(strings.TrimSpace(provider)) + "\x00" + identityKey
 }
 
-func (s *trackStore) youtubeImportSuggestions(item youtubeImportItem) []youtubeImportSuggestion {
+func (s *domainState) youtubeImportSuggestions(item youtubeImportItem) []youtubeImportSuggestion {
 	_, generatedSourceMetadata, err := buildYouTubeImportMetadata(item)
 	if err != nil || len(generatedSourceMetadata) == 0 {
 		return nil
