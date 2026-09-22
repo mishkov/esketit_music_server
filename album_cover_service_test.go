@@ -306,10 +306,10 @@ func newAdminOnlyTestHandler(t *testing.T, next http.Handler) http.Handler {
 		t.Fatalf("createUser() error = %v", err)
 	}
 
-	store.mu.Lock()
 	admin.Role = roleAdmin
-	store.users[admin.ID] = admin
-	store.mu.Unlock()
+	if _, err := store.db.Exec(`UPDATE users SET role = ? WHERE id = ?`, admin.Role, admin.ID); err != nil {
+		t.Fatalf("update admin role: %v", err)
+	}
 
 	token, _, err := auth.createAccessToken(admin.ID)
 	if err != nil {

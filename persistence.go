@@ -2,12 +2,9 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"database/sql"
 	"errors"
 	"fmt"
-	"reflect"
-	"sort"
 	"time"
 )
 
@@ -17,49 +14,59 @@ type UserRepository interface {
 	List(context.Context) ([]user, error)
 	FindByID(context.Context, int64) (user, bool, error)
 	FindByEmail(context.Context, string) (user, bool, error)
-	Save(context.Context, user) error
+	Count(context.Context) (int, error)
+	Insert(context.Context, user) error
+	Update(context.Context, user) error
 	Delete(context.Context, int64) error
 }
 
 type RefreshSessionRepository interface {
-	List(context.Context) ([]refreshSession, error)
 	FindByToken(context.Context, string, time.Time) (refreshSession, bool, error)
-	Save(context.Context, refreshSession) error
+	Insert(context.Context, refreshSession) error
 	Delete(context.Context, string) error
 	DeleteExpired(context.Context, time.Time) error
 }
 
 type AuthorRepository interface {
 	List(context.Context) ([]author, error)
-	Save(context.Context, author) error
+	ListPopularityRankedIDs(context.Context) ([]int64, error)
+	FindByID(context.Context, int64) (author, bool, error)
+	Insert(context.Context, author) error
+	Update(context.Context, author) error
 	Delete(context.Context, int64) error
 }
 
 type CatalogRepository interface {
 	ListAlbums(context.Context) ([]album, error)
 	ListTracks(context.Context) ([]track, error)
-	SaveAlbum(context.Context, album) error
+	FindAlbumByID(context.Context, int64) (album, bool, error)
+	FindTrackByID(context.Context, int64) (track, bool, error)
+	InsertAlbum(context.Context, album) error
+	UpdateAlbum(context.Context, album) error
 	DeleteAlbum(context.Context, int64) error
-	SaveTrack(context.Context, track) error
+	InsertTrack(context.Context, track) error
+	UpdateTrack(context.Context, track) error
 	DeleteTrack(context.Context, int64) error
 }
 
 type PlaylistRepository interface {
 	List(context.Context) ([]playlist, error)
-	Save(context.Context, playlist) error
+	FindByID(context.Context, int64) (playlist, bool, error)
+	Insert(context.Context, playlist) error
+	Update(context.Context, playlist) error
 	Delete(context.Context, int64) error
 }
 
 type LyricsRepository interface {
 	List(context.Context) ([]lyrics, error)
-	Save(context.Context, lyrics) error
+	FindByTrackID(context.Context, int64) (lyrics, bool, error)
+	Insert(context.Context, lyrics) error
+	Update(context.Context, lyrics) error
 	DeleteByTrackID(context.Context, int64) error
 }
 
 type metadataRepository interface {
-	LoadNextIDs(context.Context) (map[string]int64, error)
-	SetNextID(context.Context, string, int64) error
-	AdvanceNextID(context.Context, string, int64, int64) error
+	AllocateID(context.Context, string) (int64, error)
 }
 
 type domainRepositories struct {
@@ -93,9 +100,18 @@ type sqliteUnitOfWork struct {
 }
 
 var (
-	errRepositoryConflict = errors.New("repository conflict")
-	errRepositoryNotFound = errors.New("repository record not found")
+	errRepositoryConflict    = errors.New("repository conflict")
+	errRepositoryNotFound    = errors.New("repository record not found")
+	errRepositoryPersistence = errors.New("repository persistence failure")
 )
+
+type repositoryPersistenceError struct{ cause error }
+
+func (e repositoryPersistenceError) Error() string { return errRepositoryPersistence.Error() }
+func (e repositoryPersistenceError) Unwrap() error { return e.cause }
+func (e repositoryPersistenceError) Is(target error) bool {
+	return target == errRepositoryPersistence
+}
 
 func (u *sqliteUnitOfWork) WithinTransaction(ctx context.Context, operation func(domainRepositories) error) (returnErr error) {
 	tx, err := u.db.BeginTx(ctx, nil)
@@ -119,8 +135,9 @@ func (u *sqliteUnitOfWork) WithinTransaction(ctx context.Context, operation func
 	return nil
 }
 
-// SQLite constraint errors use extended codes whose low byte is 19. Keep the
-// driver detail at this boundary instead of exposing SQLite messages upstream.
+// SQLite constraint errors use extended codes whose low byte is 19. All other
+// driver failures retain their cause for diagnostics while exposing only a
+// stable repository message upstream.
 func translateSQLiteError(err error) error {
 	if err == nil {
 		return nil
@@ -128,52 +145,24 @@ func translateSQLiteError(err error) error {
 	type codedSQLiteError interface{ Code() int }
 	var coded codedSQLiteError
 	if errors.As(err, &coded) && coded.Code()&0xff == 19 {
-		return fmt.Errorf("%w: %v", errRepositoryConflict, err)
+		return errRepositoryConflict
 	}
-	return err
+	return repositoryPersistenceError{cause: err}
 }
 
-func (r *sqliteRepositories) SetNextID(ctx context.Context, key string, value int64) error {
-	_, err := r.q.ExecContext(ctx, `INSERT INTO store_metadata (key, value) VALUES (?, ?)
-		ON CONFLICT(key) DO UPDATE SET value = excluded.value
-		WHERE store_metadata.value < excluded.value`, key, value)
-	return translateSQLiteError(err)
-}
-
-func (r *sqliteRepositories) LoadNextIDs(ctx context.Context) (values map[string]int64, returnErr error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT key, value FROM store_metadata`)
+func (r *sqliteRepositories) AllocateID(ctx context.Context, key string) (int64, error) {
+	var next int64
+	err := r.q.QueryRowContext(ctx, `UPDATE store_metadata
+		SET value = value + 1
+		WHERE key = ?
+		RETURNING value - 1`, key).Scan(&next)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("%w: missing ID counter %q", errRepositoryConflict, key)
+	}
 	if err != nil {
-		return nil, translateSQLiteError(err)
+		return 0, translateSQLiteError(err)
 	}
-	defer joinRowsCloseError(&returnErr, rows, "load ID counters")
-	values = make(map[string]int64)
-	for rows.Next() {
-		var key string
-		var value int64
-		if err := rows.Scan(&key, &value); err != nil {
-			return nil, translateSQLiteError(err)
-		}
-		values[key] = value
-	}
-	return values, translateSQLiteError(rows.Err())
-}
-
-func (r *sqliteRepositories) AdvanceNextID(ctx context.Context, key string, expected, next int64) error {
-	if next <= expected {
-		return fmt.Errorf("%w: invalid %s counter advance from %d to %d", errRepositoryConflict, key, expected, next)
-	}
-	result, err := r.q.ExecContext(ctx, `UPDATE store_metadata SET value = ? WHERE key = ? AND value = ?`, next, key, expected)
-	if err != nil {
-		return translateSQLiteError(err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return translateSQLiteError(err)
-	}
-	if affected != 1 {
-		return fmt.Errorf("%w: stale %s counter", errRepositoryConflict, key)
-	}
-	return nil
+	return next, nil
 }
 
 func (r *sqliteRepositories) List(ctx context.Context) (items []user, returnErr error) {
@@ -226,14 +215,26 @@ func (r *sqliteRepositories) FindByEmail(ctx context.Context, email string) (use
 	return item, err == nil, err
 }
 
-func (r *sqliteRepositories) Save(ctx context.Context, item user) error {
+func (r *sqliteRepositories) Count(ctx context.Context) (int, error) {
+	var count int
+	err := r.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count)
+	return count, translateSQLiteError(err)
+}
+
+func (r *sqliteRepositories) Insert(ctx context.Context, item user) error {
 	createdAt := formatSQLiteTime(item.CreatedAt)
-	return updateOrInsert(ctx, r.q,
-		`UPDATE users SET email = ?, role = ?, password_hash = ?, created_at = ? WHERE id = ?`,
-		[]any{item.Email, item.Role, item.PasswordHash, createdAt, item.ID},
-		`INSERT INTO users (id, email, role, password_hash, created_at) VALUES (?, ?, ?, ?, ?)`,
-		[]any{item.ID, item.Email, item.Role, item.PasswordHash, createdAt},
-	)
+	_, err := r.q.ExecContext(ctx, `INSERT INTO users (id, email, role, password_hash, created_at) VALUES (?, ?, ?, ?, ?)`,
+		item.ID, item.Email, item.Role, item.PasswordHash, createdAt)
+	return translateSQLiteError(err)
+}
+
+func (r *sqliteRepositories) Update(ctx context.Context, item user) error {
+	result, err := r.q.ExecContext(ctx, `UPDATE users SET email = ?, role = ?, password_hash = ?, created_at = ? WHERE id = ?`,
+		item.Email, item.Role, item.PasswordHash, formatSQLiteTime(item.CreatedAt), item.ID)
+	if err != nil {
+		return translateSQLiteError(err)
+	}
+	return requireAffected(result)
 }
 
 func (r *sqliteRepositories) Delete(ctx context.Context, id int64) error {
@@ -244,62 +245,39 @@ func (r *sqliteRepositories) Delete(ctx context.Context, id int64) error {
 	return requireAffected(result)
 }
 
-func (r *sqliteRepositories) listSessions(ctx context.Context) (items []refreshSession, returnErr error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT id, user_id, token_hash, created_at, expires_at FROM refresh_sessions ORDER BY user_id, created_at`)
-	if err != nil {
-		return nil, translateSQLiteError(err)
-	}
-	defer joinRowsCloseError(&returnErr, rows, "list refresh sessions")
-	for rows.Next() {
-		var item refreshSession
-		var createdAt, expiresAt string
-		if err := rows.Scan(&item.ID, &item.UserID, &item.TokenHash, &createdAt, &expiresAt); err != nil {
-			return nil, translateSQLiteError(err)
-		}
-		item.CreatedAt, err = parseSQLiteTime(createdAt)
-		if err != nil {
-			return nil, err
-		}
-		item.ExpiresAt, err = parseSQLiteTime(expiresAt)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	return items, translateSQLiteError(rows.Err())
-}
-
 func (r *sqliteRepositories) FindByToken(ctx context.Context, rawToken string, now time.Time) (refreshSession, bool, error) {
-	items, err := r.listSessions(ctx)
+	var item refreshSession
+	var createdAt, expiresAt string
+	err := r.q.QueryRowContext(ctx, `SELECT id, user_id, token_hash, created_at, expires_at
+		FROM refresh_sessions WHERE token_hash = ? AND expires_at >= ?`, hashToken(rawToken), formatSQLiteTime(now)).
+		Scan(&item.ID, &item.UserID, &item.TokenHash, &createdAt, &expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return refreshSession{}, false, nil
+	}
 	if err != nil {
-		return refreshSession{}, false, err
+		return refreshSession{}, false, translateSQLiteError(err)
 	}
-	hashed := hashToken(rawToken)
-	for _, item := range items {
-		if item.ExpiresAt.Before(now) {
-			continue
-		}
-		if subtle.ConstantTimeCompare([]byte(item.TokenHash), []byte(hashed)) == 1 {
-			return item, true, nil
-		}
+	item.CreatedAt, err = parseSQLiteTime(createdAt)
+	if err == nil {
+		item.ExpiresAt, err = parseSQLiteTime(expiresAt)
 	}
-	return refreshSession{}, false, nil
+	return item, err == nil, err
 }
 
-func (r *sqliteRepositories) SaveSession(ctx context.Context, item refreshSession) error {
+func (r *sqliteRepositories) InsertSession(ctx context.Context, item refreshSession) error {
 	createdAt := formatSQLiteTime(item.CreatedAt)
 	expiresAt := formatSQLiteTime(item.ExpiresAt)
-	return updateOrInsert(ctx, r.q,
-		`UPDATE refresh_sessions SET user_id = ?, token_hash = ?, created_at = ?, expires_at = ? WHERE id = ?`,
-		[]any{item.UserID, item.TokenHash, createdAt, expiresAt, item.ID},
-		`INSERT INTO refresh_sessions (id, user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)`,
-		[]any{item.ID, item.UserID, item.TokenHash, createdAt, expiresAt},
-	)
+	_, err := r.q.ExecContext(ctx, `INSERT INTO refresh_sessions (id, user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)`,
+		item.ID, item.UserID, item.TokenHash, createdAt, expiresAt)
+	return translateSQLiteError(err)
 }
 
 func (r *sqliteRepositories) DeleteSession(ctx context.Context, id string) error {
-	_, err := r.q.ExecContext(ctx, `DELETE FROM refresh_sessions WHERE id = ?`, id)
-	return translateSQLiteError(err)
+	result, err := r.q.ExecContext(ctx, `DELETE FROM refresh_sessions WHERE id = ?`, id)
+	if err != nil {
+		return translateSQLiteError(err)
+	}
+	return requireAffected(result)
 }
 
 func (r *sqliteRepositories) DeleteExpired(ctx context.Context, now time.Time) error {
@@ -327,22 +305,69 @@ func (r *sqliteRepositories) ListAuthors(ctx context.Context) (items []author, r
 	return items, translateSQLiteError(rows.Err())
 }
 
-func (r *sqliteRepositories) SaveAuthor(ctx context.Context, item author) error {
+func (r *sqliteRepositories) ListPopularityRankedAuthorIDs(ctx context.Context) (items []int64, returnErr error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT author_id FROM author_popularity_snapshot ORDER BY ranking_position`)
+	if err != nil {
+		return nil, translateSQLiteError(err)
+	}
+	defer joinRowsCloseError(&returnErr, rows, "list popularity-ranked authors")
+	for rows.Next() {
+		var authorID int64
+		if err := rows.Scan(&authorID); err != nil {
+			return nil, translateSQLiteError(err)
+		}
+		items = append(items, authorID)
+	}
+	return items, translateSQLiteError(rows.Err())
+}
+
+func scanAuthor(row rowScanner) (author, error) {
+	var item author
+	var photosJSON string
+	if err := row.Scan(&item.ID, &item.CurrentName, &photosJSON); err != nil {
+		return author{}, translateSQLiteError(err)
+	}
+	if err := unmarshalJSONColumn(photosJSON, &item.Photos); err != nil {
+		return author{}, err
+	}
+	return item, nil
+}
+
+func (r *sqliteRepositories) FindAuthorByID(ctx context.Context, id int64) (author, bool, error) {
+	item, err := scanAuthor(r.q.QueryRowContext(ctx, `SELECT id, current_name, photos_json FROM authors WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return author{}, false, nil
+	}
+	return item, err == nil, err
+}
+
+func (r *sqliteRepositories) InsertAuthor(ctx context.Context, item author) error {
 	photosJSON, err := marshalJSONColumn(item.Photos)
 	if err != nil {
 		return err
 	}
-	return updateOrInsert(ctx, r.q,
-		`UPDATE authors SET current_name = ?, photos_json = ? WHERE id = ?`,
-		[]any{item.CurrentName, photosJSON, item.ID},
-		`INSERT INTO authors (id, current_name, photos_json) VALUES (?, ?, ?)`,
-		[]any{item.ID, item.CurrentName, photosJSON},
-	)
+	_, err = r.q.ExecContext(ctx, `INSERT INTO authors (id, current_name, photos_json) VALUES (?, ?, ?)`, item.ID, item.CurrentName, photosJSON)
+	return translateSQLiteError(err)
+}
+
+func (r *sqliteRepositories) UpdateAuthor(ctx context.Context, item author) error {
+	photosJSON, err := marshalJSONColumn(item.Photos)
+	if err != nil {
+		return err
+	}
+	result, err := r.q.ExecContext(ctx, `UPDATE authors SET current_name = ?, photos_json = ? WHERE id = ?`, item.CurrentName, photosJSON, item.ID)
+	if err != nil {
+		return translateSQLiteError(err)
+	}
+	return requireAffected(result)
 }
 
 func (r *sqliteRepositories) DeleteAuthor(ctx context.Context, id int64) error {
-	_, err := r.q.ExecContext(ctx, `DELETE FROM authors WHERE id = ?`, id)
-	return translateSQLiteError(err)
+	result, err := r.q.ExecContext(ctx, `DELETE FROM authors WHERE id = ?`, id)
+	if err != nil {
+		return translateSQLiteError(err)
+	}
+	return requireAffected(result)
 }
 
 func (r *sqliteRepositories) ListAlbums(ctx context.Context) (items []album, returnErr error) {
@@ -377,6 +402,39 @@ func (r *sqliteRepositories) ListAlbums(ctx context.Context) (items []album, ret
 	return items, translateSQLiteError(rows.Err())
 }
 
+func scanAlbum(row rowScanner) (album, error) {
+	var item album
+	var authorIDsJSON, releaseDate, trackIDsJSON, additionalInfoJSON string
+	var isPublished int
+	if err := row.Scan(&item.ID, &item.Title, &item.CoverImagePath, &authorIDsJSON, &releaseDate, &isPublished, &trackIDsJSON, &additionalInfoJSON); err != nil {
+		return album{}, translateSQLiteError(err)
+	}
+	if err := unmarshalJSONColumn(authorIDsJSON, &item.AuthorIDs); err != nil {
+		return album{}, err
+	}
+	if err := unmarshalJSONColumn(trackIDsJSON, &item.TrackIDs); err != nil {
+		return album{}, err
+	}
+	if err := unmarshalJSONColumn(additionalInfoJSON, &item.AdditionalInfo); err != nil {
+		return album{}, err
+	}
+	parsed, err := parseSQLiteTime(releaseDate)
+	if err != nil {
+		return album{}, err
+	}
+	item.ReleaseDate = parsed
+	item.IsPublished = isPublished != 0
+	return item, nil
+}
+
+func (r *sqliteRepositories) FindAlbumByID(ctx context.Context, id int64) (album, bool, error) {
+	item, err := scanAlbum(r.q.QueryRowContext(ctx, `SELECT id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json FROM albums WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return album{}, false, nil
+	}
+	return item, err == nil, err
+}
+
 func (r *sqliteRepositories) ListTracks(ctx context.Context) (items []track, returnErr error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at FROM tracks ORDER BY id`)
 	if err != nil {
@@ -407,63 +465,131 @@ func (r *sqliteRepositories) ListTracks(ctx context.Context) (items []track, ret
 	return items, translateSQLiteError(rows.Err())
 }
 
-func (r *sqliteRepositories) SaveAlbum(ctx context.Context, item album) error {
+func scanTrack(row rowScanner) (track, error) {
+	var item track
+	var authorIDsJSON, additionalInfoJSON, sourceMetadataJSON, createdAt string
+	if err := row.Scan(&item.ID, &item.Name, &authorIDsJSON, &item.AlbumID, &item.AudioFilePath, &additionalInfoJSON, &sourceMetadataJSON, &createdAt); err != nil {
+		return track{}, translateSQLiteError(err)
+	}
+	if err := unmarshalJSONColumn(authorIDsJSON, &item.AuthorIDs); err != nil {
+		return track{}, err
+	}
+	if err := unmarshalJSONColumn(additionalInfoJSON, &item.AdditionalInfo); err != nil {
+		return track{}, err
+	}
+	if err := unmarshalJSONColumn(sourceMetadataJSON, &item.SourceMetadata); err != nil {
+		return track{}, err
+	}
+	parsed, err := parseSQLiteTime(createdAt)
+	if err != nil {
+		return track{}, err
+	}
+	item.CreatedAt = parsed
+	return item, nil
+}
+
+func (r *sqliteRepositories) FindTrackByID(ctx context.Context, id int64) (track, bool, error) {
+	item, err := scanTrack(r.q.QueryRowContext(ctx, `SELECT id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at FROM tracks WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return track{}, false, nil
+	}
+	return item, err == nil, err
+}
+
+func encodeAlbum(item album) (string, string, string, error) {
 	authorIDsJSON, err := marshalJSONColumn(item.AuthorIDs)
 	if err != nil {
-		return err
+		return "", "", "", err
 	}
 	trackIDsJSON, err := marshalJSONColumn(item.TrackIDs)
 	if err != nil {
-		return err
+		return "", "", "", err
 	}
 	additionalInfoJSON, err := marshalJSONColumn(item.AdditionalInfo)
 	if err != nil {
+		return "", "", "", err
+	}
+	return authorIDsJSON, trackIDsJSON, additionalInfoJSON, nil
+}
+
+func (r *sqliteRepositories) InsertAlbum(ctx context.Context, item album) error {
+	authorIDsJSON, trackIDsJSON, additionalInfoJSON, err := encodeAlbum(item)
+	if err != nil {
 		return err
 	}
-	releaseDate := formatSQLiteTime(item.ReleaseDate)
-	isPublished := boolToSQLiteInt(item.IsPublished)
-	return updateOrInsert(ctx, r.q,
-		`UPDATE albums SET title = ?, cover_image_path = ?, author_ids_json = ?, release_date = ?,
+	_, err = r.q.ExecContext(ctx, `INSERT INTO albums (id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, item.ID, item.Title, item.CoverImagePath, authorIDsJSON, formatSQLiteTime(item.ReleaseDate), boolToSQLiteInt(item.IsPublished), trackIDsJSON, additionalInfoJSON)
+	return translateSQLiteError(err)
+}
+
+func (r *sqliteRepositories) UpdateAlbum(ctx context.Context, item album) error {
+	authorIDsJSON, trackIDsJSON, additionalInfoJSON, err := encodeAlbum(item)
+	if err != nil {
+		return err
+	}
+	result, err := r.q.ExecContext(ctx, `UPDATE albums SET title = ?, cover_image_path = ?, author_ids_json = ?, release_date = ?,
 		is_published = ?, track_ids_json = ?, additional_info_json = ? WHERE id = ?`,
-		[]any{item.Title, item.CoverImagePath, authorIDsJSON, releaseDate, isPublished, trackIDsJSON, additionalInfoJSON, item.ID},
-		`INSERT INTO albums (id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		[]any{item.ID, item.Title, item.CoverImagePath, authorIDsJSON, releaseDate, isPublished, trackIDsJSON, additionalInfoJSON},
-	)
+		item.Title, item.CoverImagePath, authorIDsJSON, formatSQLiteTime(item.ReleaseDate), boolToSQLiteInt(item.IsPublished), trackIDsJSON, additionalInfoJSON, item.ID)
+	if err != nil {
+		return translateSQLiteError(err)
+	}
+	return requireAffected(result)
 }
 
 func (r *sqliteRepositories) DeleteAlbum(ctx context.Context, id int64) error {
-	_, err := r.q.ExecContext(ctx, `DELETE FROM albums WHERE id = ?`, id)
-	return translateSQLiteError(err)
+	result, err := r.q.ExecContext(ctx, `DELETE FROM albums WHERE id = ?`, id)
+	if err != nil {
+		return translateSQLiteError(err)
+	}
+	return requireAffected(result)
 }
 
-func (r *sqliteRepositories) SaveTrack(ctx context.Context, item track) error {
+func encodeTrack(item track) (string, string, string, error) {
 	authorIDsJSON, err := marshalJSONColumn(item.AuthorIDs)
 	if err != nil {
-		return err
+		return "", "", "", err
 	}
 	additionalInfoJSON, err := marshalJSONColumn(item.AdditionalInfo)
 	if err != nil {
-		return err
+		return "", "", "", err
 	}
 	sourceMetadataJSON, err := marshalJSONColumn(item.SourceMetadata)
 	if err != nil {
+		return "", "", "", err
+	}
+	return authorIDsJSON, additionalInfoJSON, sourceMetadataJSON, nil
+}
+
+func (r *sqliteRepositories) InsertTrack(ctx context.Context, item track) error {
+	authorIDsJSON, additionalInfoJSON, sourceMetadataJSON, err := encodeTrack(item)
+	if err != nil {
 		return err
 	}
-	createdAt := formatSQLiteTime(item.CreatedAt)
-	return updateOrInsert(ctx, r.q,
-		`UPDATE tracks SET name = ?, author_ids_json = ?, album_id = ?, audio_file_path = ?,
+	_, err = r.q.ExecContext(ctx, `INSERT INTO tracks (id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, item.ID, item.Name, authorIDsJSON, item.AlbumID, item.AudioFilePath, additionalInfoJSON, sourceMetadataJSON, formatSQLiteTime(item.CreatedAt))
+	return translateSQLiteError(err)
+}
+
+func (r *sqliteRepositories) UpdateTrack(ctx context.Context, item track) error {
+	authorIDsJSON, additionalInfoJSON, sourceMetadataJSON, err := encodeTrack(item)
+	if err != nil {
+		return err
+	}
+	result, err := r.q.ExecContext(ctx, `UPDATE tracks SET name = ?, author_ids_json = ?, album_id = ?, audio_file_path = ?,
 		additional_info_json = ?, source_metadata_json = ?, created_at = ? WHERE id = ?`,
-		[]any{item.Name, authorIDsJSON, item.AlbumID, item.AudioFilePath, additionalInfoJSON, sourceMetadataJSON, createdAt, item.ID},
-		`INSERT INTO tracks (id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		[]any{item.ID, item.Name, authorIDsJSON, item.AlbumID, item.AudioFilePath, additionalInfoJSON, sourceMetadataJSON, createdAt},
-	)
+		item.Name, authorIDsJSON, item.AlbumID, item.AudioFilePath, additionalInfoJSON, sourceMetadataJSON, formatSQLiteTime(item.CreatedAt), item.ID)
+	if err != nil {
+		return translateSQLiteError(err)
+	}
+	return requireAffected(result)
 }
 
 func (r *sqliteRepositories) DeleteTrack(ctx context.Context, id int64) error {
-	_, err := r.q.ExecContext(ctx, `DELETE FROM tracks WHERE id = ?`, id)
-	return translateSQLiteError(err)
+	result, err := r.q.ExecContext(ctx, `DELETE FROM tracks WHERE id = ?`, id)
+	if err != nil {
+		return translateSQLiteError(err)
+	}
+	return requireAffected(result)
 }
 
 func (r *sqliteRepositories) ListPlaylists(ctx context.Context) (items []playlist, returnErr error) {
@@ -488,25 +614,66 @@ func (r *sqliteRepositories) ListPlaylists(ctx context.Context) (items []playlis
 	return items, translateSQLiteError(rows.Err())
 }
 
-func (r *sqliteRepositories) SavePlaylist(ctx context.Context, item playlist) error {
+func scanPlaylist(row rowScanner) (playlist, error) {
+	var item playlist
+	var trackItemsJSON string
+	var system int
+	if err := row.Scan(&item.ID, &item.UserID, &item.Name, &item.Description, &item.CoverImagePath, &item.Visibility, &item.ShareToken, &trackItemsJSON, &system, &item.Kind); err != nil {
+		return playlist{}, translateSQLiteError(err)
+	}
+	if err := unmarshalJSONColumn(trackItemsJSON, &item.TrackItems); err != nil {
+		return playlist{}, err
+	}
+	item.System = system != 0
+	return item, nil
+}
+
+func (r *sqliteRepositories) FindPlaylistByID(ctx context.Context, id int64) (playlist, bool, error) {
+	item, err := scanPlaylist(r.q.QueryRowContext(ctx, `SELECT id, user_id, name, description, cover_image_path, visibility, share_token, track_items_json, system, kind FROM playlists WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return playlist{}, false, nil
+	}
+	return item, err == nil, err
+}
+
+func encodePlaylist(item playlist) (string, error) {
 	trackItemsJSON, err := marshalJSONColumn(item.TrackItems)
+	if err != nil {
+		return "", err
+	}
+	return trackItemsJSON, nil
+}
+
+func (r *sqliteRepositories) InsertPlaylist(ctx context.Context, item playlist) error {
+	trackItemsJSON, err := encodePlaylist(item)
 	if err != nil {
 		return err
 	}
-	system := boolToSQLiteInt(item.System)
-	return updateOrInsert(ctx, r.q,
-		`UPDATE playlists SET user_id = ?, name = ?, description = ?, cover_image_path = ?,
+	_, err = r.q.ExecContext(ctx, `INSERT INTO playlists (id, user_id, name, description, cover_image_path, visibility, share_token, track_items_json, system, kind)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, item.ID, item.UserID, item.Name, item.Description, item.CoverImagePath, item.Visibility, item.ShareToken, trackItemsJSON, boolToSQLiteInt(item.System), item.Kind)
+	return translateSQLiteError(err)
+}
+
+func (r *sqliteRepositories) UpdatePlaylist(ctx context.Context, item playlist) error {
+	trackItemsJSON, err := encodePlaylist(item)
+	if err != nil {
+		return err
+	}
+	result, err := r.q.ExecContext(ctx, `UPDATE playlists SET user_id = ?, name = ?, description = ?, cover_image_path = ?,
 		visibility = ?, share_token = ?, track_items_json = ?, system = ?, kind = ? WHERE id = ?`,
-		[]any{item.UserID, item.Name, item.Description, item.CoverImagePath, item.Visibility, item.ShareToken, trackItemsJSON, system, item.Kind, item.ID},
-		`INSERT INTO playlists (id, user_id, name, description, cover_image_path, visibility, share_token, track_items_json, system, kind)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		[]any{item.ID, item.UserID, item.Name, item.Description, item.CoverImagePath, item.Visibility, item.ShareToken, trackItemsJSON, system, item.Kind},
-	)
+		item.UserID, item.Name, item.Description, item.CoverImagePath, item.Visibility, item.ShareToken, trackItemsJSON, boolToSQLiteInt(item.System), item.Kind, item.ID)
+	if err != nil {
+		return translateSQLiteError(err)
+	}
+	return requireAffected(result)
 }
 
 func (r *sqliteRepositories) DeletePlaylist(ctx context.Context, id int64) error {
-	_, err := r.q.ExecContext(ctx, `DELETE FROM playlists WHERE id = ?`, id)
-	return translateSQLiteError(err)
+	result, err := r.q.ExecContext(ctx, `DELETE FROM playlists WHERE id = ?`, id)
+	if err != nil {
+		return translateSQLiteError(err)
+	}
+	return requireAffected(result)
 }
 
 func (r *sqliteRepositories) ListLyrics(ctx context.Context) (items []lyrics, returnErr error) {
@@ -543,30 +710,74 @@ func (r *sqliteRepositories) ListLyrics(ctx context.Context) (items []lyrics, re
 	return items, translateSQLiteError(rows.Err())
 }
 
-func (r *sqliteRepositories) SaveLyrics(ctx context.Context, item lyrics) error {
+func scanLyrics(row rowScanner) (lyrics, error) {
+	var item lyrics
+	var plainText, languageCode, source sql.NullString
+	var verified int
+	var updatedAt, createdAt, linesJSON string
+	if err := row.Scan(&item.ID, &item.TrackID, &item.Type, &plainText, &languageCode, &source, &verified, &updatedAt, &createdAt, &linesJSON); err != nil {
+		return lyrics{}, translateSQLiteError(err)
+	}
+	item.PlainText = nullStringPointer(plainText)
+	item.LanguageCode = nullStringPointer(languageCode)
+	item.Source = nullStringPointer(source)
+	item.IsVerified = verified != 0
+	var err error
+	item.UpdatedAt, err = parseSQLiteTime(updatedAt)
+	if err == nil {
+		item.CreatedAt, err = parseSQLiteTime(createdAt)
+	}
+	if err == nil {
+		err = unmarshalJSONColumn(linesJSON, &item.Lines)
+	}
+	return item, err
+}
+
+func (r *sqliteRepositories) FindLyricsByTrackID(ctx context.Context, trackID int64) (lyrics, bool, error) {
+	item, err := scanLyrics(r.q.QueryRowContext(ctx, `SELECT id, track_id, type, plain_text, language_code, source, is_verified, updated_at, created_at, lines_json FROM lyrics WHERE track_id = ?`, trackID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return lyrics{}, false, nil
+	}
+	return item, err == nil, err
+}
+
+func encodeLyrics(item lyrics) (string, error) {
 	linesJSON, err := marshalJSONColumn(item.Lines)
+	if err != nil {
+		return "", err
+	}
+	return linesJSON, nil
+}
+
+func (r *sqliteRepositories) InsertLyrics(ctx context.Context, item lyrics) error {
+	linesJSON, err := encodeLyrics(item)
 	if err != nil {
 		return err
 	}
-	plainText := sqlNullString(item.PlainText)
-	languageCode := sqlNullString(item.LanguageCode)
-	source := sqlNullString(item.Source)
-	verified := boolToSQLiteInt(item.IsVerified)
-	updatedAt := formatSQLiteTime(item.UpdatedAt)
-	createdAt := formatSQLiteTime(item.CreatedAt)
-	return updateOrInsert(ctx, r.q,
-		`UPDATE lyrics SET track_id = ?, type = ?, plain_text = ?, language_code = ?, source = ?,
-		is_verified = ?, updated_at = ?, created_at = ?, lines_json = ? WHERE id = ?`,
-		[]any{item.TrackID, item.Type, plainText, languageCode, source, verified, updatedAt, createdAt, linesJSON, item.ID},
-		`INSERT INTO lyrics (id, track_id, type, plain_text, language_code, source, is_verified, updated_at, created_at, lines_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		[]any{item.ID, item.TrackID, item.Type, plainText, languageCode, source, verified, updatedAt, createdAt, linesJSON},
-	)
+	_, err = r.q.ExecContext(ctx, `INSERT INTO lyrics (id, track_id, type, plain_text, language_code, source, is_verified, updated_at, created_at, lines_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, item.ID, item.TrackID, item.Type, sqlNullString(item.PlainText), sqlNullString(item.LanguageCode), sqlNullString(item.Source), boolToSQLiteInt(item.IsVerified), formatSQLiteTime(item.UpdatedAt), formatSQLiteTime(item.CreatedAt), linesJSON)
+	return translateSQLiteError(err)
+}
+
+func (r *sqliteRepositories) UpdateLyrics(ctx context.Context, item lyrics) error {
+	linesJSON, err := encodeLyrics(item)
+	if err != nil {
+		return err
+	}
+	result, err := r.q.ExecContext(ctx, `UPDATE lyrics SET track_id = ?, type = ?, plain_text = ?, language_code = ?, source = ?,
+		is_verified = ?, updated_at = ?, created_at = ?, lines_json = ? WHERE id = ?`, item.TrackID, item.Type, sqlNullString(item.PlainText), sqlNullString(item.LanguageCode), sqlNullString(item.Source), boolToSQLiteInt(item.IsVerified), formatSQLiteTime(item.UpdatedAt), formatSQLiteTime(item.CreatedAt), linesJSON, item.ID)
+	if err != nil {
+		return translateSQLiteError(err)
+	}
+	return requireAffected(result)
 }
 
 func (r *sqliteRepositories) DeleteByTrackID(ctx context.Context, trackID int64) error {
-	_, err := r.q.ExecContext(ctx, `DELETE FROM lyrics WHERE track_id = ?`, trackID)
-	return translateSQLiteError(err)
+	result, err := r.q.ExecContext(ctx, `DELETE FROM lyrics WHERE track_id = ?`, trackID)
+	if err != nil {
+		return translateSQLiteError(err)
+	}
+	return requireAffected(result)
 }
 
 func requireAffected(result sql.Result) error {
@@ -580,43 +791,16 @@ func requireAffected(result sql.Result) error {
 	return nil
 }
 
-func updateOrInsert(
-	ctx context.Context,
-	q sqlExecutor,
-	updateStatement string,
-	updateArguments []any,
-	insertStatement string,
-	insertArguments []any,
-) error {
-	result, err := q.ExecContext(ctx, updateStatement, updateArguments...)
-	if err != nil {
-		return translateSQLiteError(err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return translateSQLiteError(err)
-	}
-	if affected > 0 {
-		return nil
-	}
-	_, err = q.ExecContext(ctx, insertStatement, insertArguments...)
-	return translateSQLiteError(err)
-}
-
 // Go does not support overloading, so the concrete adapter methods below
-// bridge the domain interfaces that intentionally share names such as List,
-// Save, and Delete.
+// bridge the domain interfaces that intentionally share method names.
 type sqliteUserRepository struct{ *sqliteRepositories }
 type sqliteSessionRepository struct{ *sqliteRepositories }
 type sqliteAuthorRepository struct{ *sqliteRepositories }
 type sqlitePlaylistRepository struct{ *sqliteRepositories }
 type sqliteLyricsRepository struct{ *sqliteRepositories }
 
-func (r sqliteSessionRepository) List(ctx context.Context) ([]refreshSession, error) {
-	return r.listSessions(ctx)
-}
-func (r sqliteSessionRepository) Save(ctx context.Context, item refreshSession) error {
-	return r.SaveSession(ctx, item)
+func (r sqliteSessionRepository) Insert(ctx context.Context, item refreshSession) error {
+	return r.InsertSession(ctx, item)
 }
 func (r sqliteSessionRepository) Delete(ctx context.Context, id string) error {
 	return r.DeleteSession(ctx, id)
@@ -624,8 +808,17 @@ func (r sqliteSessionRepository) Delete(ctx context.Context, id string) error {
 func (r sqliteAuthorRepository) List(ctx context.Context) ([]author, error) {
 	return r.ListAuthors(ctx)
 }
-func (r sqliteAuthorRepository) Save(ctx context.Context, item author) error {
-	return r.SaveAuthor(ctx, item)
+func (r sqliteAuthorRepository) ListPopularityRankedIDs(ctx context.Context) ([]int64, error) {
+	return r.ListPopularityRankedAuthorIDs(ctx)
+}
+func (r sqliteAuthorRepository) FindByID(ctx context.Context, id int64) (author, bool, error) {
+	return r.FindAuthorByID(ctx, id)
+}
+func (r sqliteAuthorRepository) Insert(ctx context.Context, item author) error {
+	return r.InsertAuthor(ctx, item)
+}
+func (r sqliteAuthorRepository) Update(ctx context.Context, item author) error {
+	return r.UpdateAuthor(ctx, item)
 }
 func (r sqliteAuthorRepository) Delete(ctx context.Context, id int64) error {
 	return r.DeleteAuthor(ctx, id)
@@ -633,8 +826,14 @@ func (r sqliteAuthorRepository) Delete(ctx context.Context, id int64) error {
 func (r sqlitePlaylistRepository) List(ctx context.Context) ([]playlist, error) {
 	return r.ListPlaylists(ctx)
 }
-func (r sqlitePlaylistRepository) Save(ctx context.Context, item playlist) error {
-	return r.SavePlaylist(ctx, item)
+func (r sqlitePlaylistRepository) FindByID(ctx context.Context, id int64) (playlist, bool, error) {
+	return r.FindPlaylistByID(ctx, id)
+}
+func (r sqlitePlaylistRepository) Insert(ctx context.Context, item playlist) error {
+	return r.InsertPlaylist(ctx, item)
+}
+func (r sqlitePlaylistRepository) Update(ctx context.Context, item playlist) error {
+	return r.UpdatePlaylist(ctx, item)
 }
 func (r sqlitePlaylistRepository) Delete(ctx context.Context, id int64) error {
 	return r.DeletePlaylist(ctx, id)
@@ -642,8 +841,14 @@ func (r sqlitePlaylistRepository) Delete(ctx context.Context, id int64) error {
 func (r sqliteLyricsRepository) List(ctx context.Context) ([]lyrics, error) {
 	return r.ListLyrics(ctx)
 }
-func (r sqliteLyricsRepository) Save(ctx context.Context, item lyrics) error {
-	return r.SaveLyrics(ctx, item)
+func (r sqliteLyricsRepository) FindByTrackID(ctx context.Context, trackID int64) (lyrics, bool, error) {
+	return r.FindLyricsByTrackID(ctx, trackID)
+}
+func (r sqliteLyricsRepository) Insert(ctx context.Context, item lyrics) error {
+	return r.InsertLyrics(ctx, item)
+}
+func (r sqliteLyricsRepository) Update(ctx context.Context, item lyrics) error {
+	return r.UpdateLyrics(ctx, item)
 }
 
 func newDomainRepositories(q sqlExecutor) domainRepositories {
@@ -657,251 +862,4 @@ func newDomainRepositories(q sqlExecutor) domainRepositories {
 		lyrics:    sqliteLyricsRepository{base},
 		metadata:  base,
 	}
-}
-
-type domainWriteScope struct {
-	repairMetadata   bool
-	metadataExpected map[string]int64
-	users            bool
-	sessions         bool
-	authors          bool
-	catalog          bool
-	playlists        bool
-	lyrics           bool
-}
-
-var allDomainWrites = domainWriteScope{
-	repairMetadata: true,
-	users:          true, sessions: true, authors: true,
-	catalog: true, playlists: true, lyrics: true,
-}
-
-// commitDomainChangesLocked compares the locked cache with authoritative SQL
-// state and applies only changed rows in the declared domains. It exists as a
-// compatibility bridge while handlers continue using trackStore.
-func (s *trackStore) commitDomainChangesLocked(ctx context.Context, scope domainWriteScope) error {
-	if s.unitOfWork == nil {
-		return errors.New("persistence unit of work is not initialized")
-	}
-	return s.unitOfWork.WithinTransaction(ctx, func(repositories domainRepositories) error {
-		metadata := map[string]int64{
-			"next_track_id":       s.nextTrackID,
-			"next_album_id":       s.nextAlbumID,
-			"next_author_id":      s.nextAuthorID,
-			"next_user_id":        s.nextUserID,
-			"next_playlist_id":    s.nextPlaylistID,
-			"next_lyrics_id":      s.nextLyricsID,
-			"next_lyrics_line_id": s.nextLyricsLineID,
-		}
-		if scope.repairMetadata {
-			keys := make([]string, 0, len(metadata))
-			for key := range metadata {
-				keys = append(keys, key)
-			}
-			sort.Strings(keys)
-			for _, key := range keys {
-				if err := repositories.metadata.SetNextID(ctx, key, metadata[key]); err != nil {
-					return err
-				}
-			}
-		} else if len(scope.metadataExpected) > 0 {
-			keys := make([]string, 0, len(scope.metadataExpected))
-			for key := range scope.metadataExpected {
-				keys = append(keys, key)
-			}
-			sort.Strings(keys)
-			for _, key := range keys {
-				next, ok := metadata[key]
-				if !ok {
-					return fmt.Errorf("unknown metadata counter %q", key)
-				}
-				if err := repositories.metadata.AdvanceNextID(ctx, key, scope.metadataExpected[key], next); err != nil {
-					return err
-				}
-			}
-		}
-
-		if scope.authors {
-			items, err := repositories.authors.List(ctx)
-			if err != nil {
-				return err
-			}
-			current := make(map[int64]author, len(items))
-			for _, item := range items {
-				current[item.ID] = item
-			}
-			for id, item := range s.authors {
-				if previous, ok := current[id]; !ok || !reflect.DeepEqual(previous, item) {
-					if err := repositories.authors.Save(ctx, item); err != nil {
-						return err
-					}
-				}
-				delete(current, id)
-			}
-			for id := range current {
-				if err := repositories.authors.Delete(ctx, id); err != nil {
-					return err
-				}
-			}
-		}
-
-		if scope.catalog {
-			albums, err := repositories.catalog.ListAlbums(ctx)
-			if err != nil {
-				return err
-			}
-			tracks, err := repositories.catalog.ListTracks(ctx)
-			if err != nil {
-				return err
-			}
-			currentAlbums := make(map[int64]album, len(albums))
-			currentTracks := make(map[int64]track, len(tracks))
-			for _, item := range albums {
-				currentAlbums[item.ID] = item
-			}
-			for _, item := range tracks {
-				currentTracks[item.ID] = item
-			}
-			// Deletes precede updates so track removal side effects remain atomic.
-			for id := range currentTracks {
-				if _, ok := s.tracks[id]; !ok {
-					if err := repositories.catalog.DeleteTrack(ctx, id); err != nil {
-						return err
-					}
-				}
-			}
-			for id := range currentAlbums {
-				if _, ok := s.albums[id]; !ok {
-					if err := repositories.catalog.DeleteAlbum(ctx, id); err != nil {
-						return err
-					}
-				}
-			}
-			albumIDs := sortedInt64Keys(s.albums)
-			for _, id := range albumIDs {
-				item := s.albums[id]
-				if previous, ok := currentAlbums[id]; !ok || !reflect.DeepEqual(previous, item) {
-					if err := repositories.catalog.SaveAlbum(ctx, item); err != nil {
-						return err
-					}
-				}
-			}
-			trackIDs := sortedInt64Keys(s.tracks)
-			for _, id := range trackIDs {
-				item := s.tracks[id]
-				if previous, ok := currentTracks[id]; !ok || !reflect.DeepEqual(previous, item) {
-					if err := repositories.catalog.SaveTrack(ctx, item); err != nil {
-						return err
-					}
-				}
-			}
-		}
-
-		if scope.users {
-			items, err := repositories.users.List(ctx)
-			if err != nil {
-				return err
-			}
-			current := make(map[int64]user, len(items))
-			for _, item := range items {
-				current[item.ID] = item
-			}
-			for id, item := range s.users {
-				if previous, ok := current[id]; !ok || !reflect.DeepEqual(previous, item) {
-					if err := repositories.users.Save(ctx, item); err != nil {
-						return err
-					}
-				}
-				delete(current, id)
-			}
-			for id := range current {
-				if err := repositories.users.Delete(ctx, id); err != nil {
-					return err
-				}
-			}
-		}
-
-		if scope.sessions {
-			items, err := repositories.sessions.List(ctx)
-			if err != nil {
-				return err
-			}
-			current := make(map[string]refreshSession, len(items))
-			for _, item := range items {
-				current[item.ID] = item
-			}
-			for id, item := range s.refreshSession {
-				if previous, ok := current[id]; !ok || !reflect.DeepEqual(previous, item) {
-					if err := repositories.sessions.Save(ctx, item); err != nil {
-						return err
-					}
-				}
-				delete(current, id)
-			}
-			for id := range current {
-				if err := repositories.sessions.Delete(ctx, id); err != nil {
-					return err
-				}
-			}
-		}
-
-		if scope.playlists {
-			items, err := repositories.playlists.List(ctx)
-			if err != nil {
-				return err
-			}
-			current := make(map[int64]playlist, len(items))
-			for _, item := range items {
-				current[item.ID] = item
-			}
-			for id, item := range s.playlists {
-				if previous, ok := current[id]; !ok || !reflect.DeepEqual(previous, item) {
-					if err := repositories.playlists.Save(ctx, item); err != nil {
-						return err
-					}
-				}
-				delete(current, id)
-			}
-			for id := range current {
-				if err := repositories.playlists.Delete(ctx, id); err != nil {
-					return err
-				}
-			}
-		}
-
-		if scope.lyrics {
-			items, err := repositories.lyrics.List(ctx)
-			if err != nil {
-				return err
-			}
-			current := make(map[int64]lyrics, len(items))
-			for _, item := range items {
-				current[item.TrackID] = item
-			}
-			for trackID, item := range s.lyricsByTrack {
-				if previous, ok := current[trackID]; !ok || !reflect.DeepEqual(previous, item) {
-					if err := repositories.lyrics.Save(ctx, item); err != nil {
-						return err
-					}
-				}
-				delete(current, trackID)
-			}
-			for trackID := range current {
-				if err := repositories.lyrics.DeleteByTrackID(ctx, trackID); err != nil {
-					return err
-				}
-			}
-		}
-
-		return nil
-	})
-}
-
-func sortedInt64Keys[T any](items map[int64]T) []int64 {
-	ids := make([]int64, 0, len(items))
-	for id := range items {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	return ids
 }

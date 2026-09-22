@@ -53,7 +53,7 @@ func getTrackLyricsHandler(store *trackStore) http.HandlerFunc {
 			return
 		}
 
-		item, err := store.getLyrics(trackID)
+		item, err := store.getLyricsContext(r.Context(), trackID)
 		if err != nil {
 			switch {
 			case errors.Is(err, errTrackNotFound), errors.Is(err, errLyricsNotFound):
@@ -82,7 +82,7 @@ func putTrackLyricsHandler(store *trackStore) http.HandlerFunc {
 			return
 		}
 
-		item, created, err := store.upsertLyrics(trackID, req)
+		item, created, err := store.upsertLyricsContext(r.Context(), trackID, req)
 		if err != nil {
 			switch {
 			case errors.Is(err, errTrackNotFound), strings.Contains(err.Error(), "trackId"):
@@ -111,7 +111,7 @@ func deleteTrackLyricsHandler(store *trackStore) http.HandlerFunc {
 			return
 		}
 
-		if err := store.deleteLyrics(trackID); err != nil {
+		if err := store.deleteLyricsContext(r.Context(), trackID); err != nil {
 			switch {
 			case errors.Is(err, errTrackNotFound), errors.Is(err, errLyricsNotFound):
 				http.NotFound(w, r)
@@ -138,13 +138,19 @@ func parseTrackLyricsID(path string) (int64, error) {
 }
 
 func (s *trackStore) getLyrics(trackID int64) (lyrics, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	return s.getLyricsContext(context.Background(), trackID)
+}
 
-	if _, ok := s.tracks[trackID]; !ok {
+func (s *trackStore) getLyricsContext(ctx context.Context, trackID int64) (lyrics, error) {
+	if _, ok, err := s.catalogRepository.FindTrackByID(ctx, trackID); err != nil {
+		return lyrics{}, err
+	} else if !ok {
 		return lyrics{}, errTrackNotFound
 	}
-	item, ok := s.lyricsByTrack[trackID]
+	item, ok, err := s.lyricsRepository.FindByTrackID(ctx, trackID)
+	if err != nil {
+		return lyrics{}, err
+	}
 	if !ok {
 		return lyrics{}, errLyricsNotFound
 	}
@@ -152,107 +158,89 @@ func (s *trackStore) getLyrics(trackID int64) (lyrics, error) {
 }
 
 func (s *trackStore) upsertLyrics(trackID int64, req upsertLyricsRequest) (lyrics, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, ok := s.tracks[trackID]; !ok {
-		return lyrics{}, false, errTrackNotFound
-	}
-
-	previous, hadPrevious := s.lyricsByTrack[trackID]
-	snapshot := cloneLyricsMap(s.lyricsByTrack)
-	nextLyricsIDSnapshot := s.nextLyricsID
-	nextLyricsLineIDSnapshot := s.nextLyricsLineID
-
-	now := time.Now().UTC()
-	item := lyrics{
-		TrackID:      trackID,
-		Type:         normalizeLyricsType(req.Type),
-		PlainText:    normalizeOptionalString(req.PlainText),
-		LanguageCode: normalizeOptionalString(req.LanguageCode),
-		Source:       normalizeOptionalString(req.Source),
-		IsVerified:   req.IsVerified,
-		UpdatedAt:    now,
-		CreatedAt:    now,
-		Lines:        make([]syncedLyricLine, 0, len(req.Lines)),
-	}
-	if hadPrevious {
-		item.ID = previous.ID
-		item.CreatedAt = previous.CreatedAt
-	} else {
-		item.ID = s.nextLyricsID
-		s.nextLyricsID++
-	}
-	for index, lineReq := range req.Lines {
-		item.Lines = append(item.Lines, syncedLyricLine{
-			ID:         s.nextLyricsLineID,
-			LyricsID:   item.ID,
-			StartMs:    lineReq.StartMs,
-			EndMs:      cloneOptionalInt(lineReq.EndMs),
-			Text:       strings.TrimSpace(lineReq.Text),
-			OrderIndex: index,
-		})
-		s.nextLyricsLineID++
-	}
-
-	if err := validateLyrics(item); err != nil {
-		s.nextLyricsID = nextLyricsIDSnapshot
-		s.nextLyricsLineID = nextLyricsLineIDSnapshot
-		return lyrics{}, false, err
-	}
-
-	s.lyricsByTrack[trackID] = item
-	metadataExpected := make(map[string]int64, 2)
-	if s.nextLyricsID > nextLyricsIDSnapshot {
-		metadataExpected["next_lyrics_id"] = nextLyricsIDSnapshot
-	}
-	if s.nextLyricsLineID > nextLyricsLineIDSnapshot {
-		metadataExpected["next_lyrics_line_id"] = nextLyricsLineIDSnapshot
-	}
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{
-		metadataExpected: metadataExpected,
-		lyrics:           true,
-	}); err != nil {
-		s.lyricsByTrack = snapshot
-		s.nextLyricsID = nextLyricsIDSnapshot
-		s.nextLyricsLineID = nextLyricsLineIDSnapshot
-		return lyrics{}, false, fmt.Errorf("persist lyrics: %w", err)
-	}
-
-	return cloneLyrics(item), !hadPrevious, nil
+	return s.upsertLyricsContext(context.Background(), trackID, req)
 }
 
-func (s *trackStore) deleteLyrics(trackID int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, ok := s.tracks[trackID]; !ok {
-		return errTrackNotFound
-	}
-	if _, ok := s.lyricsByTrack[trackID]; !ok {
-		return errLyricsNotFound
-	}
-
-	snapshot := cloneLyricsMap(s.lyricsByTrack)
-	delete(s.lyricsByTrack, trackID)
-	if err := s.commitDomainChangesLocked(context.Background(), domainWriteScope{lyrics: true}); err != nil {
-		s.lyricsByTrack = snapshot
-		return fmt.Errorf("persist lyrics deletion: %w", err)
-	}
-
-	return nil
-}
-
-func (s *trackStore) validateLyricsStateLocked() error {
-	for trackID, item := range s.lyricsByTrack {
-		if _, ok := s.tracks[trackID]; !ok {
-			return fmt.Errorf("%w: trackId %d does not exist", errInvalidLyricsPayload, trackID)
+func (s *trackStore) upsertLyricsContext(ctx context.Context, trackID int64, req upsertLyricsRequest) (lyrics, bool, error) {
+	var saved lyrics
+	var created bool
+	err := s.unitOfWork.WithinTransaction(ctx, func(repositories domainRepositories) error {
+		if _, ok, err := repositories.catalog.FindTrackByID(ctx, trackID); err != nil {
+			return err
+		} else if !ok {
+			return errTrackNotFound
+		}
+		previous, exists, err := repositories.lyrics.FindByTrackID(ctx, trackID)
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		item := lyrics{
+			TrackID: trackID, Type: normalizeLyricsType(req.Type), PlainText: normalizeOptionalString(req.PlainText),
+			LanguageCode: normalizeOptionalString(req.LanguageCode), Source: normalizeOptionalString(req.Source),
+			IsVerified: req.IsVerified, UpdatedAt: now, CreatedAt: now,
+			Lines: make([]syncedLyricLine, 0, len(req.Lines)),
+		}
+		if exists {
+			item.ID = previous.ID
+			item.CreatedAt = previous.CreatedAt
+		} else {
+			item.ID, err = repositories.metadata.AllocateID(ctx, "next_lyrics_id")
+			if err != nil {
+				return err
+			}
+		}
+		for index, lineReq := range req.Lines {
+			lineID, err := repositories.metadata.AllocateID(ctx, "next_lyrics_line_id")
+			if err != nil {
+				return err
+			}
+			item.Lines = append(item.Lines, syncedLyricLine{
+				ID: lineID, LyricsID: item.ID, StartMs: lineReq.StartMs, EndMs: cloneOptionalInt(lineReq.EndMs),
+				Text: strings.TrimSpace(lineReq.Text), OrderIndex: index,
+			})
 		}
 		if err := validateLyrics(item); err != nil {
 			return err
 		}
+		if exists {
+			err = repositories.lyrics.Update(ctx, item)
+		} else {
+			err = repositories.lyrics.Insert(ctx, item)
+		}
+		if err != nil {
+			return fmt.Errorf("persist lyrics: %w", err)
+		}
+		saved, created = cloneLyrics(item), !exists
+		return nil
+	})
+	if err != nil {
+		return lyrics{}, false, fmt.Errorf("persist lyrics: %w", err)
 	}
-	return nil
+	return saved, created, nil
+}
+
+func (s *trackStore) deleteLyrics(trackID int64) error {
+	return s.deleteLyricsContext(context.Background(), trackID)
+}
+
+func (s *trackStore) deleteLyricsContext(ctx context.Context, trackID int64) error {
+	return s.unitOfWork.WithinTransaction(ctx, func(repositories domainRepositories) error {
+		if _, ok, err := repositories.catalog.FindTrackByID(ctx, trackID); err != nil {
+			return err
+		} else if !ok {
+			return errTrackNotFound
+		}
+		if _, ok, err := repositories.lyrics.FindByTrackID(ctx, trackID); err != nil {
+			return err
+		} else if !ok {
+			return errLyricsNotFound
+		}
+		if err := repositories.lyrics.DeleteByTrackID(ctx, trackID); err != nil {
+			return fmt.Errorf("persist lyrics deletion: %w", err)
+		}
+		return nil
+	})
 }
 
 func validateLyrics(item lyrics) error {
@@ -390,14 +378,6 @@ func cloneLyrics(item lyrics) lyrics {
 	item.Source = normalizeOptionalString(item.Source)
 	item.Lines = normalizeSyncedLyricLines(item.Lines, item.ID)
 	return item
-}
-
-func cloneLyricsMap(src map[int64]lyrics) map[int64]lyrics {
-	cloned := make(map[int64]lyrics, len(src))
-	for trackID, item := range src {
-		cloned[trackID] = cloneLyrics(item)
-	}
-	return cloned
 }
 
 func toLyricsResponse(item lyrics) lyricsResponse {

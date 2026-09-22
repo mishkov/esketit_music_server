@@ -79,7 +79,10 @@ func (s *trackStore) refreshAuthorPopularity(ctx context.Context, snapshotTime t
 	snapshotTime = snapshotTime.UTC()
 	windowStart := snapshotTime.Add(-authorPopularityWindow)
 
-	authorIDs, trackAuthorIDs := s.authorPopularityCatalogSnapshot()
+	authorIDs, trackAuthorIDs, err := s.authorPopularityCatalogSnapshot(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load popularity catalog: %w", err)
+	}
 	events, err := s.loadAuthorPopularityEvents(ctx, windowStart, snapshotTime)
 	if err != nil {
 		return nil, fmt.Errorf("load popularity analytics events: %w", err)
@@ -94,20 +97,24 @@ func (s *trackStore) refreshAuthorPopularity(ctx context.Context, snapshotTime t
 	return entries, nil
 }
 
-func (s *trackStore) authorPopularityCatalogSnapshot() ([]int64, map[int64][]int64) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	authorIDs := make([]int64, 0, len(s.authors))
-	for authorID := range s.authors {
-		authorIDs = append(authorIDs, authorID)
+func (s *trackStore) authorPopularityCatalogSnapshot(ctx context.Context) ([]int64, map[int64][]int64, error) {
+	authors, err := s.authorRepository.List(ctx)
+	if err != nil {
+		return nil, nil, err
 	}
-
-	trackAuthorIDs := make(map[int64][]int64, len(s.tracks))
-	for trackID, item := range s.tracks {
-		trackAuthorIDs[trackID] = append([]int64(nil), item.AuthorIDs...)
+	tracks, err := s.catalogRepository.ListTracks(ctx)
+	if err != nil {
+		return nil, nil, err
 	}
-	return authorIDs, trackAuthorIDs
+	authorIDs := make([]int64, 0, len(authors))
+	for _, item := range authors {
+		authorIDs = append(authorIDs, item.ID)
+	}
+	trackAuthorIDs := make(map[int64][]int64, len(tracks))
+	for _, item := range tracks {
+		trackAuthorIDs[item.ID] = append([]int64(nil), item.AuthorIDs...)
+	}
+	return authorIDs, trackAuthorIDs, nil
 }
 
 func (s *trackStore) loadAuthorPopularityEvents(
