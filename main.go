@@ -2809,7 +2809,11 @@ func listUnusedSongsHandler(store *trackStore, songsDir string) http.HandlerFunc
 			return
 		}
 
-		referenced := store.referencedSongFiles()
+		referenced, err := store.referencedSongFiles()
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to inspect song references", "database", "songs.list_unused_references")
+			return
+		}
 		songs := make([]songInfo, 0, len(entries))
 		for _, entry := range entries {
 			if entry.IsDir() {
@@ -2853,7 +2857,11 @@ func deleteSongHandler(store *trackStore, songsDir string) http.HandlerFunc {
 		songsMutationMu.Lock()
 		defer songsMutationMu.Unlock()
 
-		inUse, trackID := store.songFileReferenced(name)
+		inUse, trackID, err := store.songFileReferenced(name)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to inspect song references", "database", "songs.delete_reference")
+			return
+		}
 		if inUse {
 			http.Error(w, fmt.Sprintf("song is referenced by track %d", trackID), http.StatusConflict)
 			return
@@ -3253,12 +3261,22 @@ func listAlbumsHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 			userID, err := auth.authenticateRequest(r)
 			if err == nil {
 				setSentryUser(r.Context(), userID)
-				if user, ok := store.getUser(userID); ok && user.Role == roleAdmin {
+				user, ok, err := store.getUser(userID)
+				if err != nil {
+					writeSentryInternalError(w, r, err, "failed to read user", "database", "albums.list_user")
+					return
+				}
+				if ok && user.Role == roleAdmin {
 					filter.IncludeEmpty = true
 				}
 			}
 		}
-		writeJSON(w, http.StatusOK, store.listAlbums(filter))
+		items, err := store.listAlbums(filter)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to list albums", "database", "albums.list")
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
 	}
 }
 
@@ -3300,7 +3318,11 @@ func getAlbumByIDHandler(store *trackStore) http.HandlerFunc {
 			http.Error(w, "invalid album id", http.StatusBadRequest)
 			return
 		}
-		a, ok := store.getAlbum(id)
+		a, ok, err := store.getAlbum(id)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to get album", "database", "albums.get")
+			return
+		}
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -3316,7 +3338,11 @@ func getAlbumTracksHandler(store *trackStore, auth *authManager) http.HandlerFun
 			http.Error(w, "invalid album id", http.StatusBadRequest)
 			return
 		}
-		tracks, ok := store.getAlbumTracks(id, optionalUserIDFromRequest(r, auth))
+		tracks, ok, err := store.getAlbumTracks(id, optionalUserIDFromRequest(r, auth))
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to get album tracks", "database", "albums.get_tracks")
+			return
+		}
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -3338,16 +3364,16 @@ func updateAlbumByRouteHandler(store *trackStore) http.HandlerFunc {
 			return
 		}
 		a, exists, err := store.updateAlbum(id, req)
-		if !exists {
-			http.NotFound(w, r)
-			return
-		}
 		if err != nil {
 			if errors.Is(err, errInvalidAlbum) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 			writeSentryInternalError(w, r, err, "failed to update album", "database", "albums.update")
+			return
+		}
+		if !exists {
+			http.NotFound(w, r)
 			return
 		}
 		writeJSON(w, http.StatusOK, a)
@@ -3401,7 +3427,12 @@ func listPlaylistsHandler(store *trackStore) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		writeJSON(w, http.StatusOK, store.listPlaylists(userID, filter))
+		items, err := store.listPlaylists(userID, filter)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to list playlists", "database", "playlists.list")
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
 	}
 }
 
@@ -3452,7 +3483,11 @@ func getPlaylistByIDHandler(store *trackStore) http.HandlerFunc {
 			http.Error(w, "invalid playlist id", http.StatusBadRequest)
 			return
 		}
-		p, ok := store.getPlaylist(userID, id)
+		p, ok, err := store.getPlaylist(userID, id)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to get playlist", "database", "playlists.get")
+			return
+		}
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -3475,7 +3510,11 @@ func getPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
 		}
 		page := int64(parseIntWithDefault(r.URL.Query().Get("page"), 1))
 		pageSize := int64(parseIntWithDefault(r.URL.Query().Get("pageSize"), 20))
-		items, exists := store.getPlaylistTracks(userID, id, page, pageSize)
+		items, exists, err := store.getPlaylistTracks(userID, id, page, pageSize)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to get playlist tracks", "database", "playlists.get_tracks")
+			return
+		}
 		if !exists {
 			http.NotFound(w, r)
 			return
@@ -3501,7 +3540,11 @@ func getPublicPlaylistByIDHandler(store *trackStore) http.HandlerFunc {
 			http.Error(w, "invalid playlist id", http.StatusBadRequest)
 			return
 		}
-		p, ok := store.getPublicPlaylist(id)
+		p, ok, err := store.getPublicPlaylist(id)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to get public playlist", "database", "playlists.get_public")
+			return
+		}
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -3519,7 +3562,11 @@ func getPublicPlaylistTracksHandler(store *trackStore, auth *authManager) http.H
 		}
 		page := int64(parseIntWithDefault(r.URL.Query().Get("page"), 1))
 		pageSize := int64(parseIntWithDefault(r.URL.Query().Get("pageSize"), 20))
-		items, exists := store.getPublicPlaylistTracks(id, optionalUserIDFromRequest(r, auth), page, pageSize)
+		items, exists, err := store.getPublicPlaylistTracks(id, optionalUserIDFromRequest(r, auth), page, pageSize)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to get public playlist tracks", "database", "playlists.get_public_tracks")
+			return
+		}
 		if !exists {
 			http.NotFound(w, r)
 			return
@@ -3545,7 +3592,11 @@ func getSharedPlaylistByTokenHandler(store *trackStore) http.HandlerFunc {
 			http.NotFound(w, r)
 			return
 		}
-		p, ok := store.getSharedPlaylist(shareToken)
+		p, ok, err := store.getSharedPlaylist(shareToken)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to get shared playlist", "database", "playlists.get_shared")
+			return
+		}
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -3563,7 +3614,11 @@ func getSharedPlaylistTracksHandler(store *trackStore, auth *authManager) http.H
 		}
 		page := int64(parseIntWithDefault(r.URL.Query().Get("page"), 1))
 		pageSize := int64(parseIntWithDefault(r.URL.Query().Get("pageSize"), 20))
-		items, exists := store.getSharedPlaylistTracks(shareToken, optionalUserIDFromRequest(r, auth), page, pageSize)
+		items, exists, err := store.getSharedPlaylistTracks(shareToken, optionalUserIDFromRequest(r, auth), page, pageSize)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to get shared playlist tracks", "database", "playlists.get_shared_tracks")
+			return
+		}
 		if !exists {
 			http.NotFound(w, r)
 			return
@@ -3586,16 +3641,16 @@ func uploadPlaylistCoverByRouteHandler(store *trackStore, albumCoversDir string)
 		}
 
 		exists, err := store.validatePlaylistCoverUploadTarget(userID, id)
-		if !exists {
-			http.NotFound(w, r)
-			return
-		}
 		if err != nil {
 			if errors.Is(err, errSystemPlaylistImmutable) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 			writeSentryInternalError(w, r, err, "failed to update playlist cover", "database", "playlists.cover_validate")
+			return
+		}
+		if !exists {
+			http.NotFound(w, r)
 			return
 		}
 
@@ -3606,13 +3661,6 @@ func uploadPlaylistCoverByRouteHandler(store *trackStore, albumCoversDir string)
 		}
 
 		p, exists, err := store.updatePlaylistCoverImage(userID, id, info.URL)
-		if !exists {
-			if cleanupErr := removeUploadedMediaFile(albumCoversDir, info.Name); cleanupErr != nil {
-				captureSentryError(r.Context(), fmt.Errorf("remove orphaned playlist cover: %w", cleanupErr), "storage", "playlists.cover_cleanup")
-			}
-			http.NotFound(w, r)
-			return
-		}
 		if err != nil {
 			cleanupErr := removeUploadedMediaFile(albumCoversDir, info.Name)
 			if errors.Is(err, errSystemPlaylistImmutable) {
@@ -3626,6 +3674,13 @@ func uploadPlaylistCoverByRouteHandler(store *trackStore, albumCoversDir string)
 				err = errors.Join(err, fmt.Errorf("remove failed playlist cover upload: %w", cleanupErr))
 			}
 			writeSentryInternalError(w, r, err, "failed to update playlist cover", "database", "playlists.cover_update")
+			return
+		}
+		if !exists {
+			if cleanupErr := removeUploadedMediaFile(albumCoversDir, info.Name); cleanupErr != nil {
+				captureSentryError(r.Context(), fmt.Errorf("remove orphaned playlist cover: %w", cleanupErr), "storage", "playlists.cover_cleanup")
+			}
+			http.NotFound(w, r)
 			return
 		}
 
@@ -3655,16 +3710,16 @@ func updatePlaylistByRouteHandler(store *trackStore) http.HandlerFunc {
 			return
 		}
 		p, exists, err := store.updatePlaylist(userID, id, req)
-		if !exists {
-			http.NotFound(w, r)
-			return
-		}
 		if err != nil {
 			if errors.Is(err, errInvalidPlaylistPayload) || errors.Is(err, errSystemPlaylistImmutable) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 			writeSentryInternalError(w, r, err, "failed to update playlist", "database", "playlists.update")
+			return
+		}
+		if !exists {
+			http.NotFound(w, r)
 			return
 		}
 		writeJSON(w, http.StatusOK, p)
@@ -3718,16 +3773,16 @@ func reorderPlaylistTracksHandler(store *trackStore) http.HandlerFunc {
 			return
 		}
 		exists, err := store.reorderPlaylistTracks(userID, id, req.TrackIDs)
-		if !exists {
-			http.NotFound(w, r)
-			return
-		}
 		if err != nil {
 			if errors.Is(err, errInvalidPlaylistPayload) || errors.Is(err, errSystemPlaylistImmutable) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 			writeSentryInternalError(w, r, err, "failed to reorder playlist tracks", "database", "playlists.reorder_tracks")
+			return
+		}
+		if !exists {
+			http.NotFound(w, r)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -3741,7 +3796,12 @@ func listTracksHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		writeJSON(w, http.StatusOK, store.listTrackResponses(optionalUserIDFromRequest(r, auth), filter))
+		items, err := store.listTrackResponses(optionalUserIDFromRequest(r, auth), filter)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to list tracks", "database", "tracks.list")
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
 	}
 }
 
@@ -3762,7 +3822,12 @@ func createTrackHandler(store *trackStore) http.HandlerFunc {
 			writeSentryInternalError(w, r, err, "failed to create track", "database", "tracks.create")
 			return
 		}
-		writeJSON(w, http.StatusCreated, store.toTrackResponse(t, false, false, true))
+		response, err := store.toTrackResponse(t, false, false, true)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to build track response", "database", "tracks.create_response")
+			return
+		}
+		writeJSON(w, http.StatusCreated, response)
 	}
 }
 
@@ -3783,7 +3848,11 @@ func getTrackByIDHandler(store *trackStore, auth *authManager) http.HandlerFunc 
 			http.Error(w, "invalid track id", http.StatusBadRequest)
 			return
 		}
-		t, ok := store.getTrackResponse(id, optionalUserIDFromRequest(r, auth))
+		t, ok, err := store.getTrackResponse(id, optionalUserIDFromRequest(r, auth))
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to get track", "database", "tracks.get")
+			return
+		}
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -3807,10 +3876,6 @@ func updateTrackHandler(store *trackStore) http.HandlerFunc {
 		}
 
 		t, exists, err := store.update(id, req)
-		if !exists {
-			http.NotFound(w, r)
-			return
-		}
 		if err != nil {
 			if errors.Is(err, errInvalidTrack) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -3819,7 +3884,16 @@ func updateTrackHandler(store *trackStore) http.HandlerFunc {
 			writeSentryInternalError(w, r, err, "failed to update track", "database", "tracks.update")
 			return
 		}
-		writeJSON(w, http.StatusOK, store.toTrackResponse(t, false, false, true))
+		if !exists {
+			http.NotFound(w, r)
+			return
+		}
+		response, err := store.toTrackResponse(t, false, false, true)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to build track response", "database", "tracks.update_response")
+			return
+		}
+		writeJSON(w, http.StatusOK, response)
 	}
 }
 
@@ -3832,12 +3906,12 @@ func deleteTrackHandler(store *trackStore) http.HandlerFunc {
 		}
 
 		deleted, err := store.delete(id)
-		if !deleted {
-			http.NotFound(w, r)
-			return
-		}
 		if err != nil {
 			writeSentryInternalError(w, r, err, "failed to delete track", "database", "tracks.delete")
+			return
+		}
+		if !deleted {
+			http.NotFound(w, r)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -4038,6 +4112,10 @@ func analyticsEventsHandler(store *trackStore, auth *authManager) http.HandlerFu
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, err := analyticsUserIDFromRequest(r, auth, store)
 		if err != nil {
+			if errors.Is(err, errAuthenticationStorage) {
+				writeSentryInternalError(w, r, err, "failed to authenticate analytics user", "database", "analytics.authenticate_user")
+				return
+			}
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
 		}
@@ -4108,12 +4186,22 @@ func searchHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 			userID, err := auth.authenticateRequest(r)
 			if err == nil {
 				setSentryUser(r.Context(), userID)
-				if user, ok := store.getUser(userID); ok && user.Role == roleAdmin {
+				user, ok, err := store.getUser(userID)
+				if err != nil {
+					writeSentryInternalError(w, r, err, "failed to read user", "database", "search.user")
+					return
+				}
+				if ok && user.Role == roleAdmin {
 					filter.IncludeEmpty = true
 				}
 			}
 		}
-		writeJSON(w, http.StatusOK, store.search(optionalUserIDFromRequest(r, auth), filter))
+		results, err := store.search(optionalUserIDFromRequest(r, auth), filter)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to search", "database", "search.list")
+			return
+		}
+		writeJSON(w, http.StatusOK, results)
 	}
 }
 
@@ -4144,7 +4232,11 @@ func getAuthorByIDHandler(store *trackStore) http.HandlerFunc {
 			http.Error(w, "invalid author id", http.StatusBadRequest)
 			return
 		}
-		a, ok := store.getAuthor(id)
+		a, ok, err := store.getAuthor(id)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to get author", "database", "authors.get")
+			return
+		}
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -4168,16 +4260,16 @@ func updateAuthorHandler(store *trackStore) http.HandlerFunc {
 		}
 
 		a, exists, err := store.updateAuthor(id, req)
-		if !exists {
-			http.NotFound(w, r)
-			return
-		}
 		if err != nil {
 			if errors.Is(err, errInvalidAuthor) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 			writeSentryInternalError(w, r, err, "failed to update author", "database", "authors.update")
+			return
+		}
+		if !exists {
+			http.NotFound(w, r)
 			return
 		}
 		writeJSON(w, http.StatusOK, a)
@@ -4246,7 +4338,11 @@ func loginHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 			return
 		}
 
-		u, ok := store.getUserByEmail(req.Email)
+		u, ok, err := store.getUserByEmail(req.Email)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to login", "database", "login.get_user")
+			return
+		}
 		if !ok || !verifyPassword(req.Password, u.PasswordHash) {
 			http.Error(w, errInvalidCredentials.Error(), http.StatusUnauthorized)
 			return
@@ -4318,7 +4414,11 @@ func meHandler(store *trackStore) http.HandlerFunc {
 			return
 		}
 
-		u, ok := store.getUser(userID)
+		u, ok, err := store.getUser(userID)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to read user", "database", "auth.me_user")
+			return
+		}
 		if !ok {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
@@ -4335,7 +4435,12 @@ func requireAuth(auth *authManager, store *trackStore, next http.Handler) http.H
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
 		}
-		if _, ok := store.getUser(userID); !ok {
+		_, ok, err := store.getUser(userID)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to authenticate user", "database", "auth.require_user")
+			return
+		}
+		if !ok {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
@@ -4354,7 +4459,11 @@ func requireRole(auth *authManager, store *trackStore, role string, next http.Ha
 			return
 		}
 
-		u, ok := store.getUser(userID)
+		u, ok, err := store.getUser(userID)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to authorize user", "database", "auth.require_role_user")
+			return
+		}
 		if !ok {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
@@ -4969,7 +5078,11 @@ func analyticsUserIDFromRequest(r *http.Request, auth *authManager, store *track
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := store.getUser(userID); !ok {
+	_, ok, err := store.getUser(userID)
+	if err != nil {
+		return nil, errors.Join(errAuthenticationStorage, err)
+	}
+	if !ok {
 		return nil, errors.New("authentication required")
 	}
 	setSentryUser(r.Context(), userID)
@@ -6263,6 +6376,7 @@ func redocHandler() http.HandlerFunc {
 var errInvalidTrack = errors.New("invalid track payload")
 var errHTTPServerPanic = errors.New("HTTP server panicked")
 var errRequestBodyTooLarge = errors.New("request body is too large")
+var errAuthenticationStorage = errors.New("authentication storage failure")
 var errInvalidAlbum = errors.New("invalid album payload")
 var errAlbumNotFound = errors.New("album not found")
 var errInvalidAuthor = errors.New("invalid author payload")

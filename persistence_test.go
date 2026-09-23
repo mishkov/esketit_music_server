@@ -252,7 +252,10 @@ func TestSQLiteMigrationsPreserveExistingUnversionedDatabase(t *testing.T) {
 		t.Fatalf("newTrackStore(existing) error = %v", err)
 	}
 	t.Cleanup(func() { _ = store.db.Close() })
-	item, ok := store.getAuthor(41)
+	item, ok, err := store.getAuthor(41)
+	if err != nil {
+		t.Fatalf("getAuthor() error = %v", err)
+	}
 	if !ok || item.CurrentName != "Existing" {
 		t.Fatalf("existing author = %#v, found=%v", item, ok)
 	}
@@ -523,15 +526,24 @@ func TestTrackMovementAndDeletionFailuresRollBackAllRows(t *testing.T) {
 	if _, err := store.db.Exec(`DROP TRIGGER reject_target_album_update`); err != nil {
 		t.Fatal(err)
 	}
-	storedTrack, ok := store.getTrack(trackItem.ID)
+	storedTrack, ok, err := store.getTrack(trackItem.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || storedTrack.AlbumID != sourceAlbum.ID {
 		t.Fatalf("track after failed move = %#v found=%v, want source album %d", storedTrack, ok, sourceAlbum.ID)
 	}
-	storedSource, ok := store.getAlbum(sourceAlbum.ID)
+	storedSource, ok, err := store.getAlbum(sourceAlbum.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || !containsInt64(storedSource.TrackIDs, trackItem.ID) {
 		t.Fatalf("source album after failed move = %#v found=%v", storedSource, ok)
 	}
-	storedTarget, ok := store.getAlbum(targetAlbum.ID)
+	storedTarget, ok, err := store.getAlbum(targetAlbum.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || containsInt64(storedTarget.TrackIDs, trackItem.ID) {
 		t.Fatalf("target album after failed move = %#v found=%v", storedTarget, ok)
 	}
@@ -557,14 +569,20 @@ func TestTrackMovementAndDeletionFailuresRollBackAllRows(t *testing.T) {
 	if deleted, err := store.delete(trackItem.ID); err == nil || deleted {
 		t.Fatalf("delete track deleted=%v error=%v, want injected failure", deleted, err)
 	}
-	if _, ok := store.getTrack(trackItem.ID); !ok {
+	if _, ok, err := store.getTrack(trackItem.ID); err != nil || !ok {
 		t.Fatal("track was removed despite delete rollback")
 	}
-	storedSource, ok = store.getAlbum(sourceAlbum.ID)
+	storedSource, ok, err = store.getAlbum(sourceAlbum.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || !containsInt64(storedSource.TrackIDs, trackItem.ID) {
 		t.Fatalf("album after failed delete = %#v found=%v", storedSource, ok)
 	}
-	page, ok := store.getPlaylistTracks(userItem.ID, playlistItem.ID, 1, 20)
+	page, ok, err := store.getPlaylistTracks(userItem.ID, playlistItem.ID, 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || len(page.Items) != 1 || !page.Items[0].IsAvailable {
 		t.Fatalf("playlist after failed delete = %#v found=%v", page, ok)
 	}
@@ -608,7 +626,10 @@ func TestMultiPlaylistAndPreferenceFailuresRollBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, playlistID := range []int64{first.ID, second.ID} {
-		page, ok := store.getPlaylistTracks(userItem.ID, playlistID, 1, 20)
+		page, ok, err := store.getPlaylistTracks(userItem.ID, playlistID, 1, 20)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if !ok || len(page.Items) != 0 {
 			t.Fatalf("playlist %d after rollback = %#v found=%v, want empty", playlistID, page, ok)
 		}
@@ -623,7 +644,10 @@ func TestMultiPlaylistAndPreferenceFailuresRollBack(t *testing.T) {
 	if err := store.setFavoriteTrack(userItem.ID, trackItem.ID, true); err == nil {
 		t.Fatal("setFavoriteTrack error = nil, want injected failure")
 	}
-	response, ok := store.getTrackResponse(trackItem.ID, userItem.ID)
+	response, ok, err := store.getTrackResponse(trackItem.ID, userItem.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || response.IsFavorite || !response.IsDisliked {
 		t.Fatalf("preference after rollback = %#v found=%v, want disliked only", response, ok)
 	}
@@ -837,7 +861,10 @@ func TestConcurrentTrackAndPlaylistMutationsDoNotLoseUpdates(t *testing.T) {
 	if len(created) != count || len(ids) != count {
 		t.Fatalf("created=%d distinct IDs=%d, want %d", len(created), len(ids), count)
 	}
-	storedAlbum, ok := store.getAlbum(albumItem.ID)
+	storedAlbum, ok, err := store.getAlbum(albumItem.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || len(storedAlbum.TrackIDs) != count {
 		t.Fatalf("album track IDs=%v found=%v, want %d tracks", storedAlbum.TrackIDs, ok, count)
 	}
@@ -859,7 +886,10 @@ func TestConcurrentTrackAndPlaylistMutationsDoNotLoseUpdates(t *testing.T) {
 	for err := range errorsCh {
 		t.Errorf("concurrent playlist mutation: %v", err)
 	}
-	page, ok := store.getPlaylistTracks(userItem.ID, playlistItem.ID, 1, 100)
+	page, ok, err := store.getPlaylistTracks(userItem.ID, playlistItem.ID, 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || len(page.Items) != count {
 		t.Fatalf("playlist items=%d found=%v, want %d", len(page.Items), ok, count)
 	}
@@ -911,7 +941,10 @@ func TestConcurrentFavoriteAndDislikeChangesRemainMutuallyExclusive(t *testing.T
 				t.Fatalf("attempt %d preference mutation: %v", attempt, err)
 			}
 		}
-		response, ok := store.getTrackResponse(trackItem.ID, userItem.ID)
+		response, ok, err := store.getTrackResponse(trackItem.ID, userItem.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if !ok || response.IsFavorite == response.IsDisliked {
 			t.Fatalf("attempt %d preferences favorite=%v disliked=%v found=%v, want exactly one", attempt, response.IsFavorite, response.IsDisliked, ok)
 		}

@@ -43,6 +43,114 @@ func TestHealthzHandler(t *testing.T) {
 	}
 }
 
+func TestDatabaseReadFailuresReturnInternalServerError(t *testing.T) {
+	store := newTestTrackStore(t)
+	userItem, err := store.createUser("reader@example.com", "hash")
+	if err != nil {
+		t.Fatalf("createUser() error = %v", err)
+	}
+	auth := newAuthManager([]byte("read-failure-test-secret"), time.Hour, 24*time.Hour)
+	token, _, err := auth.createAccessToken(userItem.ID)
+	if err != nil {
+		t.Fatalf("createAccessToken() error = %v", err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		handler http.Handler
+		request *http.Request
+	}{
+		{
+			name:    "list albums",
+			handler: listAlbumsHandler(store, nil),
+			request: httptest.NewRequest(http.MethodGet, "/api/albums", nil),
+		},
+		{
+			name:    "get album",
+			handler: getAlbumByIDHandler(store),
+			request: httptest.NewRequest(http.MethodGet, "/api/albums/1", nil),
+		},
+		{
+			name:    "list tracks",
+			handler: listTracksHandler(store, nil),
+			request: httptest.NewRequest(http.MethodGet, "/api/tracks", nil),
+		},
+		{
+			name:    "delete track",
+			handler: deleteTrackHandler(store),
+			request: httptest.NewRequest(http.MethodDelete, "/api/tracks/1", nil),
+		},
+		{
+			name:    "get author",
+			handler: getAuthorByIDHandler(store),
+			request: httptest.NewRequest(http.MethodGet, "/api/authors/1", nil),
+		},
+		{
+			name:    "update author",
+			handler: updateAuthorHandler(store),
+			request: httptest.NewRequest(http.MethodPut, "/api/authors/1", strings.NewReader(`{"currentName":"Changed"}`)),
+		},
+		{
+			name:    "login",
+			handler: loginHandler(store, auth),
+			request: httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"email":"reader@example.com","password":"password"}`)),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			test.handler.ServeHTTP(recorder, test.request)
+			if recorder.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+			}
+		})
+	}
+
+	authenticatedRequest := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	authenticatedRequest.Header.Set("Authorization", "Bearer "+token)
+	authenticatedRecorder := httptest.NewRecorder()
+	requireAuth(auth, store, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(authenticatedRecorder, authenticatedRequest)
+	if authenticatedRecorder.Code != http.StatusInternalServerError {
+		t.Fatalf("authenticated status = %d, want %d; body=%s", authenticatedRecorder.Code, http.StatusInternalServerError, authenticatedRecorder.Body.String())
+	}
+
+	analyticsRequest := httptest.NewRequest(http.MethodPost, "/api/analytics/events", strings.NewReader(`{}`))
+	analyticsRequest.Header.Set("Authorization", "Bearer "+token)
+	analyticsRecorder := httptest.NewRecorder()
+	analyticsEventsHandler(store, auth).ServeHTTP(analyticsRecorder, analyticsRequest)
+	if analyticsRecorder.Code != http.StatusInternalServerError {
+		t.Fatalf("analytics status = %d, want %d; body=%s", analyticsRecorder.Code, http.StatusInternalServerError, analyticsRecorder.Body.String())
+	}
+}
+
+func TestDeleteSongDatabaseFailureLeavesFileUntouched(t *testing.T) {
+	store := newTestTrackStore(t)
+	songsDir := t.TempDir()
+	fileName := "keep.mp3"
+	filePath := filepath.Join(songsDir, fileName)
+	if err := os.WriteFile(filePath, []byte("audio"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodDelete, "/api/songs/"+fileName, nil)
+	recorder := httptest.NewRecorder()
+	deleteSongHandler(store, songsDir).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+	}
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("song file changed after database failure: %v", err)
+	}
+}
+
 func TestCleanupStaleTelegramImportEntriesIsScoped(t *testing.T) {
 	dir := t.TempDir()
 	staleSession := filepath.Join(dir, "AbCdEfGhIjKlMnOpQrStUv")
@@ -476,7 +584,10 @@ func TestCreateUserCreatesSystemPlaylists(t *testing.T) {
 		t.Fatalf("createUser() error = %v", err)
 	}
 
-	playlists := store.listPlaylists(user.ID, playlistListFilter{})
+	playlists, err := store.listPlaylists(user.ID, playlistListFilter{})
+	if err != nil {
+		t.Fatalf("listPlaylists() error = %v", err)
+	}
 	if len(playlists.Items) != 2 {
 		t.Fatalf("playlist count = %d, want 2", len(playlists.Items))
 	}
@@ -516,7 +627,10 @@ func TestDislikePreferenceIsIdempotentAndMutuallyExclusive(t *testing.T) {
 		t.Fatalf("second setDislikedTrack(true) error = %v", err)
 	}
 
-	got, ok := store.getTrackResponse(trackItem.ID, user.ID)
+	got, ok, err := store.getTrackResponse(trackItem.ID, user.ID)
+	if err != nil {
+		t.Fatalf("getTrackResponse() error = %v", err)
+	}
 	if !ok || got.IsFavorite || !got.IsDisliked {
 		t.Fatalf("disliked track response = %#v, ok=%v", got, ok)
 	}
@@ -528,7 +642,10 @@ func TestDislikePreferenceIsIdempotentAndMutuallyExclusive(t *testing.T) {
 	if err := store.setFavoriteTrack(user.ID, trackItem.ID, true); err != nil {
 		t.Fatalf("setFavoriteTrack(true) after dislike error = %v", err)
 	}
-	got, ok = store.getTrackResponse(trackItem.ID, user.ID)
+	got, ok, err = store.getTrackResponse(trackItem.ID, user.ID)
+	if err != nil {
+		t.Fatalf("getTrackResponse() after favorite error = %v", err)
+	}
 	if !ok || !got.IsFavorite || got.IsDisliked {
 		t.Fatalf("favorited track response = %#v, ok=%v", got, ok)
 	}
@@ -565,7 +682,10 @@ func TestDislikeTrackRoutes(t *testing.T) {
 			t.Fatalf("%s status = %d, want %d; body=%s", method, rec.Code, http.StatusNoContent, rec.Body.String())
 		}
 	}
-	got, ok := store.getTrackResponse(trackItem.ID, user.ID)
+	got, ok, err := store.getTrackResponse(trackItem.ID, user.ID)
+	if err != nil {
+		t.Fatalf("getTrackResponse() error = %v", err)
+	}
 	if !ok || got.IsDisliked {
 		t.Fatalf("track after undislike = %#v, ok=%v", got, ok)
 	}
@@ -599,11 +719,17 @@ func TestDislikedTracksRemainInAlbumAndPlaylistResponses(t *testing.T) {
 		t.Fatalf("setDislikedTrack() error = %v", err)
 	}
 
-	albumTracks, ok := store.getAlbumTracks(albumItem.ID, user.ID)
+	albumTracks, ok, err := store.getAlbumTracks(albumItem.ID, user.ID)
+	if err != nil {
+		t.Fatalf("getAlbumTracks() error = %v", err)
+	}
 	if !ok || len(albumTracks) != 1 || !albumTracks[0].IsDisliked {
 		t.Fatalf("album tracks = %#v, ok=%v", albumTracks, ok)
 	}
-	playlistTracks, ok := store.getPlaylistTracks(user.ID, playlistItem.ID, 1, 20)
+	playlistTracks, ok, err := store.getPlaylistTracks(user.ID, playlistItem.ID, 1, 20)
+	if err != nil {
+		t.Fatalf("getPlaylistTracks() error = %v", err)
+	}
 	if !ok || len(playlistTracks.Items) != 1 || !playlistTracks.Items[0].IsDisliked {
 		t.Fatalf("playlist tracks = %#v, ok=%v", playlistTracks.Items, ok)
 	}
@@ -693,7 +819,10 @@ func TestNewTrackStoreBackfillsMissingDislikesPlaylist(t *testing.T) {
 		t.Fatalf("newTrackStore() reload error = %v", err)
 	}
 	t.Cleanup(func() { _ = reloaded.db.Close() })
-	playlists := reloaded.listPlaylists(user.ID, playlistListFilter{})
+	playlists, err := reloaded.listPlaylists(user.ID, playlistListFilter{})
+	if err != nil {
+		t.Fatalf("listPlaylists() reload error = %v", err)
+	}
 	if len(playlists.Items) != 2 || playlists.Items[0].Kind != playlistKindFavorites || playlists.Items[1].Kind != playlistKindDislikes {
 		t.Fatalf("reloaded system playlists = %#v", playlists.Items)
 	}
@@ -771,7 +900,10 @@ func TestDeleteTrackKeepsUnavailablePlaylistEntry(t *testing.T) {
 		t.Fatalf("delete() deleted = false, want true")
 	}
 
-	tracksPage, ok := store.getPlaylistTracks(user.ID, customPlaylist.ID, 1, 20)
+	tracksPage, ok, err := store.getPlaylistTracks(user.ID, customPlaylist.ID, 1, 20)
+	if err != nil {
+		t.Fatalf("getPlaylistTracks() error = %v", err)
+	}
 	if !ok {
 		t.Fatalf("getPlaylistTracks() ok = false, want true")
 	}
@@ -805,7 +937,7 @@ func TestSharedPlaylistTokenLifecycle(t *testing.T) {
 	if shared.ShareToken == "" {
 		t.Fatal("shared.ShareToken = empty, want generated token")
 	}
-	if _, ok := store.getSharedPlaylist(shared.ShareToken); !ok {
+	if _, ok, err := store.getSharedPlaylist(shared.ShareToken); err != nil || !ok {
 		t.Fatal("getSharedPlaylist() ok = false, want true")
 	}
 
@@ -820,10 +952,10 @@ func TestSharedPlaylistTokenLifecycle(t *testing.T) {
 	if public.ShareToken != "" {
 		t.Fatalf("public.ShareToken = %q, want empty", public.ShareToken)
 	}
-	if _, ok := store.getSharedPlaylist(shared.ShareToken); ok {
+	if _, ok, err := store.getSharedPlaylist(shared.ShareToken); err != nil || ok {
 		t.Fatal("old shared token still resolves after playlist became public")
 	}
-	if _, ok := store.getPublicPlaylist(shared.ID); !ok {
+	if _, ok, err := store.getPublicPlaylist(shared.ID); err != nil || !ok {
 		t.Fatal("getPublicPlaylist() ok = false, want true")
 	}
 
@@ -838,7 +970,7 @@ func TestSharedPlaylistTokenLifecycle(t *testing.T) {
 	if sharedAgain.ShareToken == "" {
 		t.Fatal("sharedAgain.ShareToken = empty, want generated token")
 	}
-	if _, ok := store.getSharedPlaylist(sharedAgain.ShareToken); !ok {
+	if _, ok, err := store.getSharedPlaylist(sharedAgain.ShareToken); err != nil || !ok {
 		t.Fatal("new shared token does not resolve")
 	}
 }
@@ -1036,12 +1168,15 @@ func TestListTrackResponsesAppliesPaginationFiltersAndSearch(t *testing.T) {
 		t.Fatalf("create() morning light error = %v", err)
 	}
 
-	page := store.listTrackResponses(0, trackListFilter{
+	page, err := store.listTrackResponses(0, trackListFilter{
 		Page:     2,
 		PageSize: 1,
 		AuthorID: artistOne.ID,
 		Query:    "dr",
 	})
+	if err != nil {
+		t.Fatalf("listTrackResponses() error = %v", err)
+	}
 	if page.Page != 2 {
 		t.Fatalf("page.Page = %d, want 2", page.Page)
 	}
@@ -1058,10 +1193,13 @@ func TestListTrackResponsesAppliesPaginationFiltersAndSearch(t *testing.T) {
 		t.Fatalf("len(page.Items) = %d, want 0", len(page.Items))
 	}
 
-	albumPage := store.listTrackResponses(0, trackListFilter{
+	albumPage, err := store.listTrackResponses(0, trackListFilter{
 		AlbumID: albumOne.ID,
 		Query:   "light",
 	})
+	if err != nil {
+		t.Fatalf("listTrackResponses() album error = %v", err)
+	}
 	if albumPage.TotalItems != 1 {
 		t.Fatalf("albumPage.TotalItems = %d, want 1", albumPage.TotalItems)
 	}
@@ -1118,10 +1256,13 @@ func TestListTrackResponsesSortsByCreatedAtDesc(t *testing.T) {
 		}
 	}
 
-	page := store.listTrackResponses(0, trackListFilter{
+	page, err := store.listTrackResponses(0, trackListFilter{
 		Sort:  trackListSortCreatedAt,
 		Order: sortOrderDesc,
 	})
+	if err != nil {
+		t.Fatalf("listTrackResponses() error = %v", err)
+	}
 	wantIDs := []int64{third.ID, second.ID, first.ID}
 	if len(page.Items) != len(wantIDs) {
 		t.Fatalf("len(page.Items) = %d, want %d", len(page.Items), len(wantIDs))
@@ -1956,7 +2097,10 @@ func TestUploadPlaylistCoverHandlerUpdatesPlaylistCover(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(albumCoversDir, storedName)); err != nil {
 		t.Fatalf("stored playlist cover Stat() error = %v", err)
 	}
-	storedPlaylist, ok := store.getPlaylist(user.ID, playlistItem.ID)
+	storedPlaylist, ok, err := store.getPlaylist(user.ID, playlistItem.ID)
+	if err != nil {
+		t.Fatalf("getPlaylist() error = %v", err)
+	}
 	if !ok {
 		t.Fatalf("getPlaylist() ok = false, want true")
 	}
@@ -2386,7 +2530,10 @@ func TestNewTrackStoreNormalizesStoredBareAudioFilePath(t *testing.T) {
 	}
 	defer store.db.Close()
 
-	got, ok := store.getTrackResponse(trackItem.ID, 0)
+	got, ok, err := store.getTrackResponse(trackItem.ID, 0)
+	if err != nil {
+		t.Fatalf("getTrackResponse() error = %v", err)
+	}
 	if !ok {
 		t.Fatalf("getTrackResponse() ok = false, want true")
 	}
@@ -2470,7 +2617,10 @@ func TestNewTrackStorePersistsAndReloadsSQLiteData(t *testing.T) {
 	}
 	defer reloaded.db.Close()
 
-	reloadedTrack, ok := reloaded.getTrackResponse(trackItem.ID, user.ID)
+	reloadedTrack, ok, err := reloaded.getTrackResponse(trackItem.ID, user.ID)
+	if err != nil {
+		t.Fatalf("getTrackResponse() error = %v", err)
+	}
 	if !ok {
 		t.Fatalf("getTrackResponse() ok = false, want true")
 	}
@@ -2483,11 +2633,17 @@ func TestNewTrackStorePersistsAndReloadsSQLiteData(t *testing.T) {
 	if !reloadedTrack.CreatedAt.Equal(trackItem.CreatedAt) {
 		t.Fatalf("reloaded track CreatedAt = %s, want %s", reloadedTrack.CreatedAt, trackItem.CreatedAt)
 	}
-	reloadedUser, ok := reloaded.getUserByEmail("listener@example.com")
+	reloadedUser, ok, err := reloaded.getUserByEmail("listener@example.com")
+	if err != nil {
+		t.Fatalf("getUserByEmail() error = %v", err)
+	}
 	if !ok || reloadedUser.ID != user.ID {
 		t.Fatalf("reloaded user = %#v, ok=%v", reloadedUser, ok)
 	}
-	tracksPage, ok := reloaded.getPlaylistTracks(user.ID, playlistItem.ID, 1, 20)
+	tracksPage, ok, err := reloaded.getPlaylistTracks(user.ID, playlistItem.ID, 1, 20)
+	if err != nil {
+		t.Fatalf("getPlaylistTracks() error = %v", err)
+	}
 	if !ok || len(tracksPage.Items) != 1 || tracksPage.Items[0].ID != trackItem.ID {
 		t.Fatalf("reloaded playlist tracks = %#v, ok=%v", tracksPage, ok)
 	}
@@ -2559,11 +2715,17 @@ func TestNewTrackStoreMigratesTrackCreatedAtColumn(t *testing.T) {
 	}
 	defer store.db.Close()
 
-	newer, ok := store.getTrackResponse(10, 0)
+	newer, ok, err := store.getTrackResponse(10, 0)
+	if err != nil {
+		t.Fatalf("getTrackResponse(10) error = %v", err)
+	}
 	if !ok {
 		t.Fatal("getTrackResponse(10) ok = false, want true")
 	}
-	older, ok := store.getTrackResponse(5, 0)
+	older, ok, err := store.getTrackResponse(5, 0)
+	if err != nil {
+		t.Fatalf("getTrackResponse(5) error = %v", err)
+	}
 	if !ok {
 		t.Fatal("getTrackResponse(5) ok = false, want true")
 	}
