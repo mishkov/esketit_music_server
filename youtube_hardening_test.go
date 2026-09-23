@@ -14,6 +14,113 @@ import (
 	"time"
 )
 
+func TestYouTubeSkipDatabaseFailureDoesNotAdvanceSession(t *testing.T) {
+	items := []youtubeImportItem{
+		{
+			VideoID:           "first",
+			SourceURL:         "https://www.youtube.com/watch?v=first",
+			OriginalSourceURL: "https://www.youtube.com/watch?v=first",
+			LinkProvider:      "youtube",
+			ParsedTitle:       "First",
+			ParsedAuthorNames: []string{"Artist"},
+		},
+		{
+			VideoID:           "second",
+			SourceURL:         "https://www.youtube.com/watch?v=second",
+			OriginalSourceURL: "https://www.youtube.com/watch?v=second",
+			LinkProvider:      "youtube",
+			ParsedTitle:       "Second",
+			ParsedAuthorNames: []string{"Artist"},
+		},
+	}
+	service, store, _, _ := newYouTubeImportTestService(t, &fakeYouTubeGateway{
+		scanItems: items,
+		scanSource: youtubeImportScanSource{
+			SourceType:   youtubeImportSourcePlaylist,
+			CanonicalURL: "https://www.youtube.com/playlist?list=test",
+		},
+	})
+	t.Cleanup(func() { _ = service.Close() })
+	if _, err := service.StartSession(context.Background(), 1, items[0].SourceURL, nil, false, ""); err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if _, err := service.SkipCurrent(1); err == nil {
+		t.Fatal("SkipCurrent() error = nil, want database failure")
+	}
+	service.mu.Lock()
+	session := service.sessions[1]
+	if session == nil {
+		service.mu.Unlock()
+		t.Fatal("session was removed after database failure")
+	}
+	currentIndex := session.CurrentIndex
+	skippedCount := len(session.SkippedItems)
+	service.mu.Unlock()
+	if currentIndex != 0 || skippedCount != 0 {
+		t.Fatalf("session changed after database failure: currentIndex=%d skipped=%d", currentIndex, skippedCount)
+	}
+}
+
+func TestYouTubeAddDatabaseFailureDoesNotDownloadOrAdvance(t *testing.T) {
+	items := []youtubeImportItem{
+		{
+			VideoID:           "first-add",
+			SourceURL:         "https://www.youtube.com/watch?v=first-add",
+			OriginalSourceURL: "https://www.youtube.com/watch?v=first-add",
+			LinkProvider:      "youtube",
+			ParsedTitle:       "First",
+			ParsedAuthorNames: []string{"Artist"},
+		},
+		{
+			VideoID:           "second-add",
+			SourceURL:         "https://www.youtube.com/watch?v=second-add",
+			OriginalSourceURL: "https://www.youtube.com/watch?v=second-add",
+			LinkProvider:      "youtube",
+			ParsedTitle:       "Second",
+			ParsedAuthorNames: []string{"Artist"},
+		},
+	}
+	service, store, songsDir, _ := newYouTubeImportTestService(t, &fakeYouTubeGateway{
+		scanItems:    items,
+		downloadData: []byte("audio"),
+		scanSource: youtubeImportScanSource{
+			SourceType:   youtubeImportSourcePlaylist,
+			CanonicalURL: "https://www.youtube.com/playlist?list=add-test",
+		},
+	})
+	t.Cleanup(func() { _ = service.Close() })
+	authorItem, albumItem := seedTrackDependencies(t, store)
+	if _, err := service.StartSession(context.Background(), 1, items[0].SourceURL, nil, false, ""); err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if _, _, err := service.AddCurrent(context.Background(), 1, youtubeCreateRequest(authorItem, albumItem, items[0].ParsedTitle)); err == nil {
+		t.Fatal("AddCurrent() error = nil, want database failure")
+	}
+	entries, err := os.ReadDir(songsDir)
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("songs directory changed after database failure: %#v", entries)
+	}
+	service.mu.Lock()
+	session := service.sessions[1]
+	currentIndex := session.CurrentIndex
+	savedCount := session.SavedCount
+	service.mu.Unlock()
+	if currentIndex != 0 || savedCount != 0 {
+		t.Fatalf("session changed after database failure: currentIndex=%d saved=%d", currentIndex, savedCount)
+	}
+}
+
 func TestYouTubeCloseWaitsForMutationsAndRejectsNewOnes(t *testing.T) {
 	service := newYouTubeImportService(
 		youtubeImportConfig{},
@@ -306,7 +413,7 @@ func TestYouTubeCrossUserDuplicateSourceHasSingleAtomicWinner(t *testing.T) {
 	if !errors.Is(loserErr, errYouTubeCurrentConflict) {
 		t.Fatalf("loser error = %v, want duplicate-source conflict", loserErr)
 	}
-	if tracks := store.list(); len(tracks) != 1 {
+	if tracks, err := store.list(); err != nil || len(tracks) != 1 {
 		t.Fatalf("stored tracks = %d, want exactly one", len(tracks))
 	}
 	entries, err := os.ReadDir(songsDir)
@@ -351,10 +458,13 @@ func TestYouTubePublicationDatabaseFailureRollsBackAndRemovesPublishedFile(t *te
 	if _, _, err := service.AddCurrent(context.Background(), 1, youtubeCreateRequest(artist, albumItem, item.ParsedTitle)); err == nil {
 		t.Fatal("AddCurrent error = nil, want injected persistence failure")
 	}
-	if tracks := store.list(); len(tracks) != 0 {
+	if tracks, err := store.list(); err != nil || len(tracks) != 0 {
 		t.Fatalf("tracks after failed publication = %#v, want none", tracks)
 	}
-	storedAlbum, ok := store.getAlbum(albumItem.ID)
+	storedAlbum, ok, err := store.getAlbum(albumItem.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || len(storedAlbum.TrackIDs) != 0 {
 		t.Fatalf("album after failed publication = %#v found=%v", storedAlbum, ok)
 	}

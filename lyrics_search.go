@@ -279,7 +279,12 @@ func lyricsSearchHandler(store *trackStore, service *lyricsSearchService) http.H
 			http.Error(w, "invalid track id", http.StatusBadRequest)
 			return
 		}
-		if _, ok := store.get(trackID); !ok {
+		_, ok, err := store.get(trackID)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to get track", "database", "lyrics.search_track")
+			return
+		}
+		if !ok {
 			http.NotFound(w, r)
 			return
 		}

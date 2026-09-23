@@ -281,10 +281,13 @@ func TestTelegramPublicationDatabaseFailureRollsBackAndRemovesPromotedFile(t *te
 	}); err == nil {
 		t.Fatal("SaveCurrent error = nil, want injected persistence failure")
 	}
-	if tracks := store.list(); len(tracks) != 0 {
+	if tracks, err := store.list(); err != nil || len(tracks) != 0 {
 		t.Fatalf("tracks after failed publication = %#v, want none", tracks)
 	}
-	storedAlbum, ok := store.getAlbum(albumItem.ID)
+	storedAlbum, ok, err := store.getAlbum(albumItem.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || len(storedAlbum.TrackIDs) != 0 {
 		t.Fatalf("album after failed publication = %#v found=%v", storedAlbum, ok)
 	}

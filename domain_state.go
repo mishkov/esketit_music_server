@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 )
@@ -111,10 +110,6 @@ func (s *trackStore) readStateContext(ctx context.Context, domains stateDomain) 
 	return loadDomainState(ctx, s, newDomainRepositories(s.db), domains)
 }
 
-func (s *trackStore) logReadFailure(operation string, err error) {
-	log.Printf("%s: %v", operation, err)
-}
-
 func (s *trackStore) withinStateTransaction(domains stateDomain, operation func(*domainState) error) error {
 	return s.withinStateTransactionContext(context.Background(), domains, operation)
 }
@@ -129,49 +124,45 @@ func (s *trackStore) withinStateTransactionContext(ctx context.Context, domains 
 	})
 }
 
-func (s *trackStore) list() []track {
+func (s *trackStore) list() ([]track, error) {
 	state, err := s.readState(stateTracks)
 	if err != nil {
-		s.logReadFailure("list tracks", err)
-		return nil
+		return nil, fmt.Errorf("list tracks: %w", err)
 	}
-	return state.list()
+	return state.list(), nil
 }
 
-func (s *trackStore) listAlbums(filter albumListFilter) paginatedAlbums {
+func (s *trackStore) listAlbums(filter albumListFilter) (paginatedAlbums, error) {
 	state, err := s.readState(stateAlbums)
 	if err != nil {
-		s.logReadFailure("list albums", err)
-		return paginatedAlbums{}
+		return paginatedAlbums{}, fmt.Errorf("list albums: %w", err)
 	}
-	return state.listAlbums(filter)
+	return state.listAlbums(filter), nil
 }
 
-func (s *trackStore) getAlbum(id int64) (album, bool) {
+func (s *trackStore) getAlbum(id int64) (album, bool, error) {
 	item, ok, err := s.catalogRepository.FindAlbumByID(context.Background(), id)
 	if err != nil {
-		s.logReadFailure("get album", err)
-		return album{}, false
+		return album{}, false, fmt.Errorf("get album: %w", err)
 	}
-	return item, ok
+	return item, ok, nil
 }
 
-func (s *trackStore) getAlbumTracks(id, userID int64) ([]trackResponse, bool) {
+func (s *trackStore) getAlbumTracks(id, userID int64) ([]trackResponse, bool, error) {
 	state, err := s.readState(stateTracks | stateAlbums | statePlaylists)
 	if err != nil {
-		s.logReadFailure("get album tracks", err)
-		return nil, false
+		return nil, false, fmt.Errorf("get album tracks: %w", err)
 	}
-	return state.getAlbumTracks(id, userID)
+	items, ok := state.getAlbumTracks(id, userID)
+	return items, ok, nil
 }
 
-func (s *trackStore) get(id int64) (track, bool) {
+func (s *trackStore) get(id int64) (track, bool, error) {
 	item, ok, err := s.catalogRepository.FindTrackByID(context.Background(), id)
 	if err != nil {
-		s.logReadFailure("get track", err)
-		return track{}, false
+		return track{}, false, fmt.Errorf("get track: %w", err)
 	}
-	return item, ok
+	return item, ok, nil
 }
 
 func (s *trackStore) createAlbum(req upsertAlbumRequest) (result album, returnErr error) {
@@ -232,22 +223,21 @@ func (s *trackStore) delete(id int64) (deleted bool, returnErr error) {
 	return
 }
 
-func (s *trackStore) listPlaylists(userID int64, filter playlistListFilter) paginatedPlaylists {
+func (s *trackStore) listPlaylists(userID int64, filter playlistListFilter) (paginatedPlaylists, error) {
 	state, err := s.readState(statePlaylists)
 	if err != nil {
-		s.logReadFailure("list playlists", err)
-		return paginatedPlaylists{}
+		return paginatedPlaylists{}, fmt.Errorf("list playlists: %w", err)
 	}
-	return state.listPlaylists(userID, filter)
+	return state.listPlaylists(userID, filter), nil
 }
 
-func (s *trackStore) getPlaylist(userID, playlistID int64) (playlistResponse, bool) {
+func (s *trackStore) getPlaylist(userID, playlistID int64) (playlistResponse, bool, error) {
 	state, err := s.readState(statePlaylists)
 	if err != nil {
-		s.logReadFailure("get playlist", err)
-		return playlistResponse{}, false
+		return playlistResponse{}, false, fmt.Errorf("get playlist: %w", err)
 	}
-	return state.getPlaylist(userID, playlistID)
+	item, ok := state.getPlaylist(userID, playlistID)
+	return item, ok, nil
 }
 
 func (s *trackStore) createPlaylist(userID int64, req upsertPlaylistRequest) (result playlistResponse, returnErr error) {
@@ -294,55 +284,57 @@ func (s *trackStore) deletePlaylist(userID, playlistID int64) (deleted bool, ret
 	return
 }
 
-func (s *trackStore) playlistReadState(operation string) (*domainState, bool) {
+func (s *trackStore) playlistReadState(operation string) (*domainState, error) {
 	state, err := s.readState(stateTracks | stateAlbums | statePlaylists)
 	if err != nil {
-		s.logReadFailure(operation, err)
-		return nil, false
+		return nil, fmt.Errorf("%s: %w", operation, err)
 	}
-	return state, true
+	return state, nil
 }
 
-func (s *trackStore) getPlaylistTracks(userID, playlistID, page, pageSize int64) (paginatedTracks, bool) {
-	state, ok := s.playlistReadState("get playlist tracks")
-	if !ok {
-		return paginatedTracks{}, false
+func (s *trackStore) getPlaylistTracks(userID, playlistID, page, pageSize int64) (paginatedTracks, bool, error) {
+	state, err := s.playlistReadState("get playlist tracks")
+	if err != nil {
+		return paginatedTracks{}, false, err
 	}
-	return state.getPlaylistTracks(userID, playlistID, page, pageSize)
+	items, ok := state.getPlaylistTracks(userID, playlistID, page, pageSize)
+	return items, ok, nil
 }
 
-func (s *trackStore) getPublicPlaylist(playlistID int64) (playlistResponse, bool) {
+func (s *trackStore) getPublicPlaylist(playlistID int64) (playlistResponse, bool, error) {
 	state, err := s.readState(statePlaylists)
 	if err != nil {
-		s.logReadFailure("get public playlist", err)
-		return playlistResponse{}, false
+		return playlistResponse{}, false, fmt.Errorf("get public playlist: %w", err)
 	}
-	return state.getPublicPlaylist(playlistID)
+	item, ok := state.getPublicPlaylist(playlistID)
+	return item, ok, nil
 }
 
-func (s *trackStore) getPublicPlaylistTracks(playlistID, userID, page, pageSize int64) (paginatedTracks, bool) {
-	state, ok := s.playlistReadState("get public playlist tracks")
-	if !ok {
-		return paginatedTracks{}, false
+func (s *trackStore) getPublicPlaylistTracks(playlistID, userID, page, pageSize int64) (paginatedTracks, bool, error) {
+	state, err := s.playlistReadState("get public playlist tracks")
+	if err != nil {
+		return paginatedTracks{}, false, err
 	}
-	return state.getPublicPlaylistTracks(playlistID, userID, page, pageSize)
+	items, ok := state.getPublicPlaylistTracks(playlistID, userID, page, pageSize)
+	return items, ok, nil
 }
 
-func (s *trackStore) getSharedPlaylist(token string) (playlistResponse, bool) {
+func (s *trackStore) getSharedPlaylist(token string) (playlistResponse, bool, error) {
 	state, err := s.readState(statePlaylists)
 	if err != nil {
-		s.logReadFailure("get shared playlist", err)
-		return playlistResponse{}, false
+		return playlistResponse{}, false, fmt.Errorf("get shared playlist: %w", err)
 	}
-	return state.getSharedPlaylist(token)
+	item, ok := state.getSharedPlaylist(token)
+	return item, ok, nil
 }
 
-func (s *trackStore) getSharedPlaylistTracks(token string, userID, page, pageSize int64) (paginatedTracks, bool) {
-	state, ok := s.playlistReadState("get shared playlist tracks")
-	if !ok {
-		return paginatedTracks{}, false
+func (s *trackStore) getSharedPlaylistTracks(token string, userID, page, pageSize int64) (paginatedTracks, bool, error) {
+	state, err := s.playlistReadState("get shared playlist tracks")
+	if err != nil {
+		return paginatedTracks{}, false, err
 	}
-	return state.getSharedPlaylistTracks(token, userID, page, pageSize)
+	items, ok := state.getSharedPlaylistTracks(token, userID, page, pageSize)
+	return items, ok, nil
 }
 
 func (s *trackStore) addTrackToPlaylists(userID, trackID int64, playlistIDs []int64) error {
@@ -397,22 +389,20 @@ func (s *trackStore) listAuthors(filter authorListFilter) ([]author, error) {
 	return state.listAuthors(filter)
 }
 
-func (s *trackStore) search(userID int64, filter searchListFilter) paginatedSearchResults {
+func (s *trackStore) search(userID int64, filter searchListFilter) (paginatedSearchResults, error) {
 	state, err := s.readState(stateCatalog | statePlaylists)
 	if err != nil {
-		s.logReadFailure("search", err)
-		return paginatedSearchResults{}
+		return paginatedSearchResults{}, fmt.Errorf("search: %w", err)
 	}
-	return state.search(userID, filter)
+	return state.search(userID, filter), nil
 }
 
-func (s *trackStore) getAuthor(id int64) (author, bool) {
+func (s *trackStore) getAuthor(id int64) (author, bool, error) {
 	item, ok, err := s.authorRepository.FindByID(context.Background(), id)
 	if err != nil {
-		s.logReadFailure("get author", err)
-		return author{}, false
+		return author{}, false, fmt.Errorf("get author: %w", err)
 	}
-	return item, ok
+	return item, ok, nil
 }
 
 func (s *trackStore) createAuthor(req upsertAuthorRequest) (result author, returnErr error) {
@@ -451,22 +441,20 @@ func (s *trackStore) createUser(email, passwordHash string) (result user, return
 	return
 }
 
-func (s *trackStore) getUserByEmail(email string) (user, bool) {
+func (s *trackStore) getUserByEmail(email string) (user, bool, error) {
 	item, ok, err := s.userRepository.FindByEmail(context.Background(), email)
 	if err != nil {
-		s.logReadFailure("get user by email", err)
-		return user{}, false
+		return user{}, false, fmt.Errorf("get user by email: %w", err)
 	}
-	return item, ok
+	return item, ok, nil
 }
 
-func (s *trackStore) getUser(id int64) (user, bool) {
+func (s *trackStore) getUser(id int64) (user, bool, error) {
 	item, ok, err := s.userRepository.FindByID(context.Background(), id)
 	if err != nil {
-		s.logReadFailure("get user", err)
-		return user{}, false
+		return user{}, false, fmt.Errorf("get user: %w", err)
 	}
-	return item, ok
+	return item, ok, nil
 }
 
 func (s *trackStore) createRefreshSession(userID int64, expiresAt time.Time) (result refreshSession, token string, returnErr error) {
@@ -496,80 +484,76 @@ func (s *trackStore) deleteRefreshSession(rawToken string) (deleted bool, return
 	return
 }
 
-func (s *trackStore) listTrackResponses(userID int64, filter trackListFilter) paginatedTracks {
+func (s *trackStore) listTrackResponses(userID int64, filter trackListFilter) (paginatedTracks, error) {
 	state, err := s.readState(stateTracks | stateAlbums | statePlaylists)
 	if err != nil {
-		s.logReadFailure("list track responses", err)
-		return paginatedTracks{}
+		return paginatedTracks{}, fmt.Errorf("list track responses: %w", err)
 	}
-	return state.listTrackResponses(userID, filter)
+	return state.listTrackResponses(userID, filter), nil
 }
 
-func (s *trackStore) getTrackResponse(trackID, userID int64) (trackResponse, bool) {
+func (s *trackStore) getTrackResponse(trackID, userID int64) (trackResponse, bool, error) {
 	state, err := s.readState(stateTracks | stateAlbums | statePlaylists)
 	if err != nil {
-		s.logReadFailure("get track response", err)
-		return trackResponse{}, false
+		return trackResponse{}, false, fmt.Errorf("get track response: %w", err)
 	}
-	return state.getTrackResponse(trackID, userID)
+	item, ok := state.getTrackResponse(trackID, userID)
+	return item, ok, nil
 }
 
-func (s *trackStore) songFileReferenced(fileName string) (bool, int64) {
+func (s *trackStore) songFileReferenced(fileName string) (bool, int64, error) {
 	state, err := s.readState(stateTracks)
 	if err != nil {
-		s.logReadFailure("check song reference", err)
-		return false, 0
+		return false, 0, fmt.Errorf("check song reference: %w", err)
 	}
-	return state.songFileReferenced(fileName)
+	inUse, trackID := state.songFileReferenced(fileName)
+	return inUse, trackID, nil
 }
 
-func (s *trackStore) referencedSongFiles() map[string]struct{} {
+func (s *trackStore) referencedSongFiles() (map[string]struct{}, error) {
 	state, err := s.readState(stateTracks)
 	if err != nil {
-		s.logReadFailure("list song references", err)
-		return map[string]struct{}{}
+		return nil, fmt.Errorf("list song references: %w", err)
 	}
-	return state.referencedSongFiles()
+	return state.referencedSongFiles(), nil
 }
 
-func (s *trackStore) toTrackResponse(t track, isFavorite, isDisliked, isAvailable bool) trackResponse {
+func (s *trackStore) toTrackResponse(t track, isFavorite, isDisliked, isAvailable bool) (trackResponse, error) {
 	state, err := s.readState(stateAlbums)
 	if err != nil {
-		s.logReadFailure("build track response", err)
-		return toTrackResponse(t, isFavorite, isAvailable)
+		return trackResponse{}, fmt.Errorf("build track response: %w", err)
 	}
-	return state.toTrackResponse(t, isFavorite, isDisliked, isAvailable)
+	return state.toTrackResponse(t, isFavorite, isDisliked, isAvailable), nil
 }
 
-func (s *trackStore) getTrack(trackID int64) (track, bool) {
+func (s *trackStore) getTrack(trackID int64) (track, bool, error) {
 	item, ok, err := s.catalogRepository.FindTrackByID(context.Background(), trackID)
 	if err != nil {
-		s.logReadFailure("get import track", err)
-		return track{}, false
+		return track{}, false, fmt.Errorf("get import track: %w", err)
 	}
-	return cloneTrack(item), ok
+	return cloneTrack(item), ok, nil
 }
 
-func (s *trackStore) getTrackAlbumOrder(trackID int64) (int, bool) {
+func (s *trackStore) getTrackAlbumOrder(trackID int64) (int, bool, error) {
 	state, err := s.readState(stateTracks | stateAlbums)
 	if err != nil {
-		s.logReadFailure("get track album order", err)
-		return 0, false
+		return 0, false, fmt.Errorf("get track album order: %w", err)
 	}
-	return state.getTrackAlbumOrder(trackID)
+	order, ok := state.getTrackAlbumOrder(trackID)
+	return order, ok, nil
 }
 
-func (s *trackStore) findTrackBySourceMetadata(target sourceMetadata) (track, bool) {
+func (s *trackStore) findTrackBySourceMetadata(target sourceMetadata) (track, bool, error) {
 	return s.findTrackBySourceMetadataContext(context.Background(), target)
 }
 
-func (s *trackStore) findTrackBySourceMetadataContext(ctx context.Context, target sourceMetadata) (track, bool) {
+func (s *trackStore) findTrackBySourceMetadataContext(ctx context.Context, target sourceMetadata) (track, bool, error) {
 	state, err := s.readStateContext(ctx, stateTracks)
 	if err != nil {
-		s.logReadFailure("find track source metadata", err)
-		return track{}, false
+		return track{}, false, fmt.Errorf("find track source metadata: %w", err)
 	}
-	return state.findTrackBySourceMetadata(target)
+	item, ok := state.findTrackBySourceMetadata(target)
+	return item, ok, nil
 }
 
 func (s *trackStore) createTrackIfSourceAbsent(req upsertTrackRequest, target sourceMetadata, publishAudio func() error) (result track, returnErr error) {
@@ -577,7 +561,9 @@ func (s *trackStore) createTrackIfSourceAbsent(req upsertTrackRequest, target so
 }
 
 func (s *trackStore) createTrackIfSourceAbsentContext(ctx context.Context, req upsertTrackRequest, target sourceMetadata, publishAudio func() error) (result track, returnErr error) {
-	if _, exists := s.findTrackBySourceMetadataContext(ctx, target); exists {
+	if _, exists, err := s.findTrackBySourceMetadataContext(ctx, target); err != nil {
+		return track{}, err
+	} else if exists {
 		return track{}, errYouTubeCurrentConflict
 	}
 	if publishAudio != nil {
@@ -619,11 +605,10 @@ func (s *trackStore) attachTrackImportMetadataIfSourceAbsentContext(ctx context.
 	return
 }
 
-func (s *trackStore) youtubeImportSuggestions(item youtubeImportItem) []youtubeImportSuggestion {
+func (s *trackStore) youtubeImportSuggestions(item youtubeImportItem) ([]youtubeImportSuggestion, error) {
 	state, err := s.readState(stateCatalog)
 	if err != nil {
-		s.logReadFailure("build YouTube import suggestions", err)
-		return nil
+		return nil, fmt.Errorf("build YouTube import suggestions: %w", err)
 	}
-	return state.youtubeImportSuggestions(item)
+	return state.youtubeImportSuggestions(item), nil
 }

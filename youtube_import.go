@@ -1202,6 +1202,10 @@ func (s *youtubeImportService) StartSession(ctx context.Context, userID int64, r
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}
+	suggestions, err := s.youtubeImportSuggestionsForSessionIndex(session, session.CurrentIndex)
+	if err != nil {
+		return youtubeImportSessionDTO{}, err
+	}
 
 	if err := ctx.Err(); err != nil {
 		return youtubeImportSessionDTO{}, err
@@ -1220,13 +1224,14 @@ func (s *youtubeImportService) StartSession(ctx context.Context, userID int64, r
 		replacedSessionCleanupErr = s.cleanupSessionFilesLocked(existing)
 	}
 	s.sessions[userID] = session
+	result = s.buildSessionDTOLocked(session, suggestions)
 	s.mu.Unlock()
 	committedCookies = true
 	if replacedSessionCleanupErr != nil {
 		captureSentryError(ctx, replacedSessionCleanupErr, "youtube", "import.start.cleanup")
 	}
 
-	return s.CurrentSession(userID)
+	return result, nil
 }
 
 func (s *youtubeImportService) writeSessionCookies(userID int64, rawCookies string) (string, func() error, error) {
@@ -1274,7 +1279,11 @@ func (s *youtubeImportService) CurrentSession(userID int64) (youtubeImportSessio
 	if !ok {
 		return youtubeImportSessionDTO{}, errYouTubeSessionNotFound
 	}
-	return s.buildSessionDTOLocked(session), nil
+	suggestions, err := s.youtubeImportSuggestionsForSessionIndex(session, session.CurrentIndex)
+	if err != nil {
+		return youtubeImportSessionDTO{}, err
+	}
+	return s.buildSessionDTOLocked(session, suggestions), nil
 }
 
 func (s *youtubeImportService) SkipCurrent(userID int64) (youtubeImportSessionDTO, error) {
@@ -1309,9 +1318,14 @@ func (s *youtubeImportService) skipCurrent(ctx context.Context, userID int64) (y
 	}
 	item, ok := session.currentItem()
 	if !ok {
-		result := s.buildSessionDTOLocked(session)
+		result := s.buildSessionDTOLocked(session, nil)
 		s.mu.Unlock()
 		return result, nil
+	}
+	nextSuggestions, err := s.youtubeImportSuggestionsForSessionIndex(session, session.CurrentIndex+1)
+	if err != nil {
+		s.mu.Unlock()
+		return youtubeImportSessionDTO{}, err
 	}
 	session.SkippedItems = append(session.SkippedItems, youtubeSkippedItem{
 		VideoID:   item.VideoID,
@@ -1325,7 +1339,7 @@ func (s *youtubeImportService) skipCurrent(ctx context.Context, userID int64) (y
 		session.Status = youtubeImportStatusCompleted
 		cleanupErr = s.cleanupSessionFilesLocked(session)
 	}
-	result := s.buildSessionDTOLocked(session)
+	result := s.buildSessionDTOLocked(session, nextSuggestions)
 	s.mu.Unlock()
 	if cleanupErr != nil {
 		captureSentryError(ctx, cleanupErr, "youtube", "import.skip.cleanup")
@@ -1369,10 +1383,16 @@ func (s *youtubeImportService) AddCurrent(ctx context.Context, userID int64, req
 	if err != nil {
 		return youtubeImportSessionDTO{}, track{}, err
 	}
+	nextSuggestions, err := s.youtubeImportSuggestionsForSessionIndex(session, itemIndex+1)
+	if err != nil {
+		return youtubeImportSessionDTO{}, track{}, err
+	}
 
 	switch strings.ToLower(strings.TrimSpace(req.Mode)) {
 	case youtubeAddModeCreate:
-		if _, exists := s.store.findTrackBySourceMetadataContext(ctx, generatedSourceMetadata[0]); exists {
+		if _, exists, err := s.store.findTrackBySourceMetadataContext(ctx, generatedSourceMetadata[0]); err != nil {
+			return youtubeImportSessionDTO{}, track{}, err
+		} else if exists {
 			return youtubeImportSessionDTO{}, track{}, errYouTubeCurrentConflict
 		}
 
@@ -1429,7 +1449,7 @@ func (s *youtubeImportService) AddCurrent(ctx context.Context, userID int64, req
 			return youtubeImportSessionDTO{}, track{}, err
 		}
 		committed = true
-		return s.advanceSaved(ctx, userID, sessionID, itemIndex, createdTrack)
+		return s.advanceSaved(ctx, userID, sessionID, itemIndex, createdTrack, nextSuggestions)
 	case youtubeAddModeAttach:
 		if err := s.validateCurrentSession(userID, sessionID, itemIndex); err != nil {
 			return youtubeImportSessionDTO{}, track{}, err
@@ -1444,7 +1464,7 @@ func (s *youtubeImportService) AddCurrent(ctx context.Context, userID int64, req
 		if !exists {
 			return youtubeImportSessionDTO{}, track{}, errTrackNotFound
 		}
-		return s.advanceSaved(ctx, userID, sessionID, itemIndex, updatedTrack)
+		return s.advanceSaved(ctx, userID, sessionID, itemIndex, updatedTrack, nextSuggestions)
 	default:
 		return youtubeImportSessionDTO{}, track{}, errYouTubeUnsupportedMode
 	}
@@ -1467,7 +1487,7 @@ func (s *youtubeImportService) validateCurrentSession(userID int64, expectedSess
 	return nil
 }
 
-func (s *youtubeImportService) advanceSaved(ctx context.Context, userID int64, expectedSessionID string, expectedIndex int, savedTrack track) (youtubeImportSessionDTO, track, error) {
+func (s *youtubeImportService) advanceSaved(ctx context.Context, userID int64, expectedSessionID string, expectedIndex int, savedTrack track, nextSuggestions []youtubeImportSuggestion) (youtubeImportSessionDTO, track, error) {
 	s.mu.Lock()
 	session, ok := s.sessions[userID]
 	if !ok {
@@ -1486,7 +1506,7 @@ func (s *youtubeImportService) advanceSaved(ctx context.Context, userID int64, e
 		session.Status = youtubeImportStatusCompleted
 		cleanupErr = s.cleanupSessionFilesLocked(session)
 	}
-	result := s.buildSessionDTOLocked(session)
+	result := s.buildSessionDTOLocked(session, nextSuggestions)
 	s.mu.Unlock()
 	if cleanupErr != nil {
 		captureSentryError(ctx, cleanupErr, "youtube", "import.add.cleanup")
@@ -1540,7 +1560,14 @@ func (s *youtubeImportService) cleanupSessionFilesLocked(session *youtubeImportS
 	return nil
 }
 
-func (s *youtubeImportService) buildSessionDTOLocked(session *youtubeImportSession) youtubeImportSessionDTO {
+func (s *youtubeImportService) youtubeImportSuggestionsForSessionIndex(session *youtubeImportSession, index int) ([]youtubeImportSuggestion, error) {
+	if session == nil || index < 0 || index >= len(session.Items) {
+		return nil, nil
+	}
+	return s.store.youtubeImportSuggestions(session.Items[index])
+}
+
+func (s *youtubeImportService) buildSessionDTOLocked(session *youtubeImportSession, suggestions []youtubeImportSuggestion) youtubeImportSessionDTO {
 	progress := youtubeImportProgressDTO{
 		Total:     len(session.Items),
 		Processed: session.CurrentIndex,
@@ -1572,7 +1599,7 @@ func (s *youtubeImportService) buildSessionDTOLocked(session *youtubeImportSessi
 		ParsedReleaseDate: cloneTimePointer(item.ParsedReleaseDate),
 		CoverImageURL:     item.CoverImageURL,
 		DurationSeconds:   item.DurationSeconds,
-		Suggestions:       s.store.youtubeImportSuggestions(item),
+		Suggestions:       suggestions,
 	}
 	return dto
 }
