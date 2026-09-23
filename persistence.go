@@ -65,6 +65,24 @@ type LyricsRepository interface {
 	DeleteByTrackID(context.Context, int64) error
 }
 
+// ReadRepository contains query-shaped operations that do not belong to a
+// single mutable aggregate. Keeping them behind the storage boundary avoids
+// rebuilding the whole catalog in memory for ordinary API reads.
+type ReadRepository interface {
+	ListAlbumsPage(context.Context, albumListFilter) ([]album, int, error)
+	ListTracksPage(context.Context, trackListFilter) ([]track, int, error)
+	ListPlaylistsPage(context.Context, int64, playlistListFilter) ([]playlist, int, error)
+	ListTracksByIDs(context.Context, []int64) ([]track, error)
+	ListAlbumsByIDs(context.Context, []int64) ([]album, error)
+	ListAuthorsByIDs(context.Context, []int64) ([]author, error)
+	ListPlaylistsByIDs(context.Context, []int64) ([]playlist, error)
+	ListPreferencePlaylists(context.Context, int64) ([]playlist, error)
+	FindPlaylistByShareToken(context.Context, string) (playlist, bool, error)
+	SearchPage(context.Context, int64, searchListFilter) ([]searchReference, int, error)
+	ListTrackAudioReferences(context.Context) ([]trackAudioReference, error)
+	ListTracksBySourceProvider(context.Context, string) ([]track, error)
+}
+
 type metadataRepository interface {
 	AllocateID(context.Context, string) (int64, error)
 }
@@ -77,12 +95,14 @@ type domainRepositories struct {
 	playlists PlaylistRepository
 	lyrics    LyricsRepository
 	metadata  metadataRepository
+	reads     ReadRepository
 }
 
 // unitOfWork keeps *sql.Tx inside the SQLite adapter. Callers receive only
 // domain repositories bound to the same transaction.
 type unitOfWork interface {
 	WithinTransaction(context.Context, func(domainRepositories) error) error
+	WithinReadTransaction(context.Context, func(domainRepositories) error) error
 }
 
 type sqlExecutor interface {
@@ -122,6 +142,28 @@ func (u *sqliteUnitOfWork) WithinTransaction(ctx context.Context, operation func
 	defer func() {
 		if !committed {
 			joinRollbackError(&returnErr, tx, "domain write")
+		}
+	}()
+
+	if err := operation(newDomainRepositories(tx)); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return translateSQLiteError(err)
+	}
+	committed = true
+	return nil
+}
+
+func (u *sqliteUnitOfWork) WithinReadTransaction(ctx context.Context, operation func(domainRepositories) error) (returnErr error) {
+	tx, err := u.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return translateSQLiteError(err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			joinRollbackError(&returnErr, tx, "domain read")
 		}
 	}()
 
@@ -861,5 +903,6 @@ func newDomainRepositories(q sqlExecutor) domainRepositories {
 		playlists: sqlitePlaylistRepository{base},
 		lyrics:    sqliteLyricsRepository{base},
 		metadata:  base,
+		reads:     base,
 	}
 }

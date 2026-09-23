@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -38,38 +39,27 @@ const (
 )
 
 func loadDomainState(ctx context.Context, store *trackStore, repositories domainRepositories, domains stateDomain) (*domainState, error) {
-	state := &domainState{
-		trackStore: store, ctx: ctx, repositories: repositories,
-		tracks: make(map[int64]track), albums: make(map[int64]album), authors: make(map[int64]author),
-		users: make(map[int64]user), usersByEmail: make(map[string]int64),
-		playlists: make(map[int64]playlist), lyricsByTrack: make(map[int64]lyrics),
-	}
+	state := newDomainStateView(ctx, store, repositories)
 	if domains&stateTracks != 0 {
 		items, err := repositories.catalog.ListTracks(ctx)
 		if err != nil {
 			return nil, err
 		}
-		for _, item := range items {
-			state.tracks[item.ID] = item
-		}
+		addTracksToState(state, items)
 	}
 	if domains&stateAlbums != 0 {
 		items, err := repositories.catalog.ListAlbums(ctx)
 		if err != nil {
 			return nil, err
 		}
-		for _, item := range items {
-			state.albums[item.ID] = item
-		}
+		addAlbumsToState(state, items)
 	}
 	if domains&stateAuthors != 0 {
 		items, err := repositories.authors.List(ctx)
 		if err != nil {
 			return nil, err
 		}
-		for _, item := range items {
-			state.authors[item.ID] = item
-		}
+		addAuthorsToState(state, items)
 	}
 	if domains&stateUsers != 0 {
 		items, err := repositories.users.List(ctx)
@@ -86,9 +76,7 @@ func loadDomainState(ctx context.Context, store *trackStore, repositories domain
 		if err != nil {
 			return nil, err
 		}
-		for _, item := range items {
-			state.playlists[item.ID] = item
-		}
+		addPlaylistsToState(state, items)
 	}
 	if domains&stateLyrics != 0 {
 		items, err := repositories.lyrics.List(ctx)
@@ -102,12 +90,81 @@ func loadDomainState(ctx context.Context, store *trackStore, repositories domain
 	return state, nil
 }
 
-func (s *trackStore) readState(domains stateDomain) (*domainState, error) {
-	return s.readStateContext(context.Background(), domains)
+func newDomainStateView(ctx context.Context, store *trackStore, repositories domainRepositories) *domainState {
+	return &domainState{
+		trackStore: store, ctx: ctx, repositories: repositories,
+		tracks: make(map[int64]track), albums: make(map[int64]album), authors: make(map[int64]author),
+		users: make(map[int64]user), usersByEmail: make(map[string]int64),
+		playlists: make(map[int64]playlist), lyricsByTrack: make(map[int64]lyrics),
+	}
 }
 
-func (s *trackStore) readStateContext(ctx context.Context, domains stateDomain) (*domainState, error) {
-	return loadDomainState(ctx, s, newDomainRepositories(s.db), domains)
+func addTracksToState(state *domainState, items []track) {
+	for _, item := range items {
+		state.tracks[item.ID] = item
+	}
+}
+
+func addAlbumsToState(state *domainState, items []album) {
+	for _, item := range items {
+		state.albums[item.ID] = item
+	}
+}
+
+func addAuthorsToState(state *domainState, items []author) {
+	for _, item := range items {
+		state.authors[item.ID] = item
+	}
+}
+
+func addPlaylistsToState(state *domainState, items []playlist) {
+	for _, item := range items {
+		state.playlists[item.ID] = item
+	}
+}
+
+func paginationMetadata(requestedPage, requestedPageSize, totalItems int) (int, int, int) {
+	page := normalizePage(requestedPage)
+	pageSize := normalizePageSize(requestedPageSize)
+	totalPages := 0
+	if totalItems > 0 {
+		totalPages = (totalItems + pageSize - 1) / pageSize
+	}
+	return page, pageSize, totalPages
+}
+
+func buildPlaylistResponse(item playlist) playlistResponse {
+	return playlistResponse{
+		ID: item.ID, UserID: item.UserID, Name: item.Name, Description: item.Description,
+		CoverImagePath: item.CoverImagePath, Visibility: item.Visibility,
+		TrackCount: len(item.TrackItems), System: item.System, Kind: item.Kind,
+		IsFavorites: item.Kind == playlistKindFavorites, ShareToken: item.ShareToken,
+	}
+}
+
+func cloneAlbumForRead(item album) album {
+	item.AuthorIDs = append([]int64(nil), item.AuthorIDs...)
+	item.TrackIDs = append([]int64(nil), item.TrackIDs...)
+	item.AdditionalInfo = normalizeAdditionalInfo(item.AdditionalInfo)
+	return item
+}
+
+func (s *trackStore) withinReadState(domains stateDomain, operation func(*domainState) error) error {
+	ctx := context.Background()
+	return s.unitOfWork.WithinReadTransaction(ctx, func(repositories domainRepositories) error {
+		state, err := loadDomainState(ctx, s, repositories, domains)
+		if err != nil {
+			return err
+		}
+		return operation(state)
+	})
+}
+
+func (s *trackStore) withinReadTransaction(operation func(context.Context, domainRepositories) error) error {
+	ctx := context.Background()
+	return s.unitOfWork.WithinReadTransaction(ctx, func(repositories domainRepositories) error {
+		return operation(ctx, repositories)
+	})
 }
 
 func (s *trackStore) withinStateTransaction(domains stateDomain, operation func(*domainState) error) error {
@@ -125,19 +182,26 @@ func (s *trackStore) withinStateTransactionContext(ctx context.Context, domains 
 }
 
 func (s *trackStore) list() ([]track, error) {
-	state, err := s.readState(stateTracks)
+	items, err := s.catalogRepository.ListTracks(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("list tracks: %w", err)
 	}
-	return state.list(), nil
+	return items, nil
 }
 
 func (s *trackStore) listAlbums(filter albumListFilter) (paginatedAlbums, error) {
-	state, err := s.readState(stateAlbums)
+	var items []album
+	var total int
+	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		var err error
+		items, total, err = repositories.reads.ListAlbumsPage(ctx, filter)
+		return err
+	})
 	if err != nil {
 		return paginatedAlbums{}, fmt.Errorf("list albums: %w", err)
 	}
-	return state.listAlbums(filter), nil
+	page, pageSize, totalPages := paginationMetadata(filter.Page, filter.PageSize, total)
+	return paginatedAlbums{Items: items, Page: page, PageSize: pageSize, TotalItems: total, TotalPages: totalPages}, nil
 }
 
 func (s *trackStore) getAlbum(id int64) (album, bool, error) {
@@ -149,12 +213,33 @@ func (s *trackStore) getAlbum(id int64) (album, bool, error) {
 }
 
 func (s *trackStore) getAlbumTracks(id, userID int64) ([]trackResponse, bool, error) {
-	state, err := s.readState(stateTracks | stateAlbums | statePlaylists)
+	var items []trackResponse
+	var found bool
+	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		albumItem, ok, err := repositories.catalog.FindAlbumByID(ctx, id)
+		if err != nil || !ok {
+			return err
+		}
+		found = true
+		tracks, err := repositories.reads.ListTracksByIDs(ctx, albumItem.TrackIDs)
+		if err != nil {
+			return err
+		}
+		preferences, err := repositories.reads.ListPreferencePlaylists(ctx, userID)
+		if err != nil {
+			return err
+		}
+		state := newDomainStateView(ctx, s, repositories)
+		addAlbumsToState(state, []album{albumItem})
+		addTracksToState(state, tracks)
+		addPlaylistsToState(state, preferences)
+		items, _ = state.getAlbumTracks(id, userID)
+		return nil
+	})
 	if err != nil {
 		return nil, false, fmt.Errorf("get album tracks: %w", err)
 	}
-	items, ok := state.getAlbumTracks(id, userID)
-	return items, ok, nil
+	return items, found, nil
 }
 
 func (s *trackStore) get(id int64) (track, bool, error) {
@@ -224,20 +309,33 @@ func (s *trackStore) delete(id int64) (deleted bool, returnErr error) {
 }
 
 func (s *trackStore) listPlaylists(userID int64, filter playlistListFilter) (paginatedPlaylists, error) {
-	state, err := s.readState(statePlaylists)
+	var playlists []playlist
+	var total int
+	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		var err error
+		playlists, total, err = repositories.reads.ListPlaylistsPage(ctx, userID, filter)
+		return err
+	})
 	if err != nil {
 		return paginatedPlaylists{}, fmt.Errorf("list playlists: %w", err)
 	}
-	return state.listPlaylists(userID, filter), nil
+	items := make([]playlistResponse, 0, len(playlists))
+	for _, item := range playlists {
+		items = append(items, buildPlaylistResponse(item))
+	}
+	page, pageSize, totalPages := paginationMetadata(filter.Page, filter.PageSize, total)
+	return paginatedPlaylists{Items: items, Page: page, PageSize: pageSize, TotalItems: total, TotalPages: totalPages}, nil
 }
 
 func (s *trackStore) getPlaylist(userID, playlistID int64) (playlistResponse, bool, error) {
-	state, err := s.readState(statePlaylists)
+	item, ok, err := s.playlistRepository.FindByID(context.Background(), playlistID)
 	if err != nil {
 		return playlistResponse{}, false, fmt.Errorf("get playlist: %w", err)
 	}
-	item, ok := state.getPlaylist(userID, playlistID)
-	return item, ok, nil
+	if !ok || item.UserID != userID {
+		return playlistResponse{}, false, nil
+	}
+	return buildPlaylistResponse(item), true, nil
 }
 
 func (s *trackStore) createPlaylist(userID int64, req upsertPlaylistRequest) (result playlistResponse, returnErr error) {
@@ -259,11 +357,17 @@ func (s *trackStore) updatePlaylist(userID, playlistID int64, req upsertPlaylist
 }
 
 func (s *trackStore) validatePlaylistCoverUploadTarget(userID, playlistID int64) (bool, error) {
-	state, err := s.readState(statePlaylists)
+	item, ok, err := s.playlistRepository.FindByID(context.Background(), playlistID)
 	if err != nil {
 		return false, err
 	}
-	return state.validatePlaylistCoverUploadTarget(userID, playlistID)
+	if !ok || item.UserID != userID {
+		return false, nil
+	}
+	if item.System {
+		return true, errSystemPlaylistImmutable
+	}
+	return true, nil
 }
 
 func (s *trackStore) updatePlaylistCoverImage(userID, playlistID int64, path string) (result playlistResponse, found bool, returnErr error) {
@@ -284,57 +388,128 @@ func (s *trackStore) deletePlaylist(userID, playlistID int64) (deleted bool, ret
 	return
 }
 
-func (s *trackStore) playlistReadState(operation string) (*domainState, error) {
-	state, err := s.readState(stateTracks | stateAlbums | statePlaylists)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", operation, err)
-	}
-	return state, nil
-}
-
 func (s *trackStore) getPlaylistTracks(userID, playlistID, page, pageSize int64) (paginatedTracks, bool, error) {
-	state, err := s.playlistReadState("get playlist tracks")
-	if err != nil {
-		return paginatedTracks{}, false, err
-	}
-	items, ok := state.getPlaylistTracks(userID, playlistID, page, pageSize)
-	return items, ok, nil
+	return s.readPlaylistTracks("get playlist tracks", userID, page, pageSize, func(ctx context.Context, repositories domainRepositories) (playlist, bool, error) {
+		item, ok, err := repositories.playlists.FindByID(ctx, playlistID)
+		if err != nil || !ok || item.UserID != userID {
+			return playlist{}, false, err
+		}
+		return item, true, nil
+	})
 }
 
 func (s *trackStore) getPublicPlaylist(playlistID int64) (playlistResponse, bool, error) {
-	state, err := s.readState(statePlaylists)
+	item, ok, err := s.playlistRepository.FindByID(context.Background(), playlistID)
 	if err != nil {
 		return playlistResponse{}, false, fmt.Errorf("get public playlist: %w", err)
 	}
-	item, ok := state.getPublicPlaylist(playlistID)
-	return item, ok, nil
+	if !ok || item.Visibility != playlistVisibilityPublic {
+		return playlistResponse{}, false, nil
+	}
+	return publicPlaylistResponse(buildPlaylistResponse(item)), true, nil
 }
 
 func (s *trackStore) getPublicPlaylistTracks(playlistID, userID, page, pageSize int64) (paginatedTracks, bool, error) {
-	state, err := s.playlistReadState("get public playlist tracks")
-	if err != nil {
-		return paginatedTracks{}, false, err
-	}
-	items, ok := state.getPublicPlaylistTracks(playlistID, userID, page, pageSize)
-	return items, ok, nil
+	return s.readPlaylistTracks("get public playlist tracks", userID, page, pageSize, func(ctx context.Context, repositories domainRepositories) (playlist, bool, error) {
+		item, ok, err := repositories.playlists.FindByID(ctx, playlistID)
+		if err != nil || !ok || item.Visibility != playlistVisibilityPublic {
+			return playlist{}, false, err
+		}
+		return item, true, nil
+	})
 }
 
 func (s *trackStore) getSharedPlaylist(token string) (playlistResponse, bool, error) {
-	state, err := s.readState(statePlaylists)
+	var item playlist
+	var found bool
+	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		var err error
+		item, found, err = repositories.reads.FindPlaylistByShareToken(ctx, token)
+		return err
+	})
 	if err != nil {
 		return playlistResponse{}, false, fmt.Errorf("get shared playlist: %w", err)
 	}
-	item, ok := state.getSharedPlaylist(token)
-	return item, ok, nil
+	if !found {
+		return playlistResponse{}, false, nil
+	}
+	return publicPlaylistResponse(buildPlaylistResponse(item)), true, nil
 }
 
 func (s *trackStore) getSharedPlaylistTracks(token string, userID, page, pageSize int64) (paginatedTracks, bool, error) {
-	state, err := s.playlistReadState("get shared playlist tracks")
+	return s.readPlaylistTracks("get shared playlist tracks", userID, page, pageSize, func(ctx context.Context, repositories domainRepositories) (playlist, bool, error) {
+		return repositories.reads.FindPlaylistByShareToken(ctx, token)
+	})
+}
+
+type playlistReadTarget func(context.Context, domainRepositories) (playlist, bool, error)
+
+func (s *trackStore) readPlaylistTracks(operation string, userID, page, pageSize int64, find playlistReadTarget) (paginatedTracks, bool, error) {
+	var result paginatedTracks
+	var found bool
+	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		playlistItem, ok, err := find(ctx, repositories)
+		if err != nil || !ok {
+			return err
+		}
+		found = true
+		normalizedPage, normalizedPageSize, totalPages := paginationMetadata(int(page), int(pageSize), len(playlistItem.TrackItems))
+		start := (normalizedPage - 1) * normalizedPageSize
+		if start > len(playlistItem.TrackItems) {
+			start = len(playlistItem.TrackItems)
+		}
+		end := start + normalizedPageSize
+		if end > len(playlistItem.TrackItems) {
+			end = len(playlistItem.TrackItems)
+		}
+		pageItems := playlistItem.TrackItems[start:end]
+		trackIDs := make([]int64, 0, len(pageItems))
+		for _, item := range pageItems {
+			trackIDs = append(trackIDs, item.TrackID)
+		}
+		tracks, err := repositories.reads.ListTracksByIDs(ctx, trackIDs)
+		if err != nil {
+			return err
+		}
+		albumIDs := make([]int64, 0, len(pageItems))
+		currentTracks := make(map[int64]track, len(tracks))
+		for _, item := range tracks {
+			currentTracks[item.ID] = item
+			albumIDs = append(albumIDs, item.AlbumID)
+		}
+		for _, item := range pageItems {
+			if _, ok := currentTracks[item.TrackID]; !ok && item.UnavailableTrack != nil {
+				albumIDs = append(albumIDs, item.UnavailableTrack.AlbumID)
+			}
+		}
+		albums, err := repositories.reads.ListAlbumsByIDs(ctx, albumIDs)
+		if err != nil {
+			return err
+		}
+		preferences, err := repositories.reads.ListPreferencePlaylists(ctx, userID)
+		if err != nil {
+			return err
+		}
+		state := newDomainStateView(ctx, s, repositories)
+		addTracksToState(state, tracks)
+		addAlbumsToState(state, albums)
+		addPlaylistsToState(state, preferences)
+		favoriteIDs := state.favoriteTrackSetLocked(userID)
+		dislikedIDs := state.dislikedTrackSetLocked(userID)
+		responses := make([]trackResponse, 0, len(pageItems))
+		for _, item := range pageItems {
+			responses = append(responses, state.buildPlaylistTrackResponseLocked(item, favoriteIDs, dislikedIDs))
+		}
+		result = paginatedTracks{
+			Items: responses, Page: normalizedPage, PageSize: normalizedPageSize,
+			TotalItems: len(playlistItem.TrackItems), TotalPages: totalPages,
+		}
+		return nil
+	})
 	if err != nil {
-		return paginatedTracks{}, false, err
+		return paginatedTracks{}, false, fmt.Errorf("%s: %w", operation, err)
 	}
-	items, ok := state.getSharedPlaylistTracks(token, userID, page, pageSize)
-	return items, ok, nil
+	return result, found, nil
 }
 
 func (s *trackStore) addTrackToPlaylists(userID, trackID int64, playlistIDs []int64) error {
@@ -365,11 +540,13 @@ func (s *trackStore) setDislikedTrack(userID, trackID int64, disliked bool) erro
 }
 
 func (s *trackStore) nextAutoplayTracks(userID int64, req autoplayNextRequest) (autoplayNextResponse, error) {
-	state, err := s.readState(stateCatalog | stateUsers | statePlaylists)
-	if err != nil {
-		return autoplayNextResponse{}, err
-	}
-	return state.nextAutoplayTracks(userID, req)
+	var result autoplayNextResponse
+	err := s.withinReadState(stateCatalog|stateUsers|statePlaylists, func(state *domainState) error {
+		var err error
+		result, err = state.nextAutoplayTracks(userID, req)
+		return err
+	})
+	return result, err
 }
 
 func (s *trackStore) reorderPlaylistTracks(userID, playlistID int64, trackIDs []int64) (found bool, returnErr error) {
@@ -382,19 +559,109 @@ func (s *trackStore) reorderPlaylistTracks(userID, playlistID int64, trackIDs []
 }
 
 func (s *trackStore) listAuthors(filter authorListFilter) ([]author, error) {
-	state, err := s.readState(stateAuthors)
-	if err != nil {
-		return nil, err
-	}
-	return state.listAuthors(filter)
+	var items []author
+	err := s.withinReadState(stateAuthors, func(state *domainState) error {
+		var err error
+		items, err = state.listAuthors(filter)
+		return err
+	})
+	return items, err
 }
 
 func (s *trackStore) search(userID int64, filter searchListFilter) (paginatedSearchResults, error) {
-	state, err := s.readState(stateCatalog | statePlaylists)
+	var items []searchResultItem
+	var total int
+	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		refs, count, err := repositories.reads.SearchPage(ctx, userID, filter)
+		if err != nil {
+			return err
+		}
+		total = count
+		authorIDs := make([]int64, 0, len(refs))
+		albumIDs := make([]int64, 0, len(refs))
+		trackIDs := make([]int64, 0, len(refs))
+		playlistIDs := make([]int64, 0, len(refs))
+		for _, ref := range refs {
+			switch ref.Type {
+			case "author":
+				authorIDs = append(authorIDs, ref.ID)
+			case "album":
+				albumIDs = append(albumIDs, ref.ID)
+			case "track":
+				trackIDs = append(trackIDs, ref.ID)
+			case "playlist":
+				playlistIDs = append(playlistIDs, ref.ID)
+			}
+		}
+		tracks, err := repositories.reads.ListTracksByIDs(ctx, trackIDs)
+		if err != nil {
+			return err
+		}
+		for _, item := range tracks {
+			albumIDs = append(albumIDs, item.AlbumID)
+			authorIDs = append(authorIDs, item.AuthorIDs...)
+		}
+		albums, err := repositories.reads.ListAlbumsByIDs(ctx, albumIDs)
+		if err != nil {
+			return err
+		}
+		authors, err := repositories.reads.ListAuthorsByIDs(ctx, authorIDs)
+		if err != nil {
+			return err
+		}
+		playlists, err := repositories.reads.ListPlaylistsByIDs(ctx, playlistIDs)
+		if err != nil {
+			return err
+		}
+		preferences, err := repositories.reads.ListPreferencePlaylists(ctx, userID)
+		if err != nil {
+			return err
+		}
+		state := newDomainStateView(ctx, s, repositories)
+		addTracksToState(state, tracks)
+		addAlbumsToState(state, albums)
+		addAuthorsToState(state, authors)
+		addPlaylistsToState(state, playlists)
+		addPlaylistsToState(state, preferences)
+		favoriteIDs := state.favoriteTrackSetLocked(userID)
+		dislikedIDs := state.dislikedTrackSetLocked(userID)
+		items = make([]searchResultItem, 0, len(refs))
+		for _, ref := range refs {
+			switch ref.Type {
+			case "author":
+				if item, ok := state.authors[ref.ID]; ok {
+					copy := cloneAuthor(item)
+					items = append(items, searchResultItem{Type: ref.Type, Author: &copy})
+				}
+			case "album":
+				if item, ok := state.albums[ref.ID]; ok {
+					copy := cloneAlbumForRead(item)
+					items = append(items, searchResultItem{Type: ref.Type, Album: &copy})
+				}
+			case "track":
+				if item, ok := state.tracks[ref.ID]; ok {
+					_, favorite := favoriteIDs[item.ID]
+					_, disliked := dislikedIDs[item.ID]
+					copy := state.toSearchTrackResponseLocked(item, favorite, disliked)
+					items = append(items, searchResultItem{Type: ref.Type, Track: &copy})
+				}
+			case "playlist":
+				if item, ok := state.playlists[ref.ID]; ok {
+					copy := buildPlaylistResponse(item)
+					if item.UserID != userID {
+						copy = publicPlaylistResponse(copy)
+					}
+					items = append(items, searchResultItem{Type: ref.Type, Playlist: &copy})
+				}
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return paginatedSearchResults{}, fmt.Errorf("search: %w", err)
 	}
-	return state.search(userID, filter), nil
+	page, pageSize, totalPages := paginationMetadata(filter.Page, filter.PageSize, total)
+	return paginatedSearchResults{Items: items, Page: page, PageSize: pageSize, TotalItems: total, TotalPages: totalPages}, nil
 }
 
 func (s *trackStore) getAuthor(id int64) (author, bool, error) {
@@ -485,45 +752,134 @@ func (s *trackStore) deleteRefreshSession(rawToken string) (deleted bool, return
 }
 
 func (s *trackStore) listTrackResponses(userID int64, filter trackListFilter) (paginatedTracks, error) {
-	state, err := s.readState(stateTracks | stateAlbums | statePlaylists)
+	var responses []trackResponse
+	var total int
+	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		tracks, count, err := repositories.reads.ListTracksPage(ctx, filter)
+		if err != nil {
+			return err
+		}
+		total = count
+		albumIDs := make([]int64, 0, len(tracks))
+		for _, item := range tracks {
+			albumIDs = append(albumIDs, item.AlbumID)
+		}
+		albums, err := repositories.reads.ListAlbumsByIDs(ctx, albumIDs)
+		if err != nil {
+			return err
+		}
+		preferences, err := repositories.reads.ListPreferencePlaylists(ctx, userID)
+		if err != nil {
+			return err
+		}
+		state := newDomainStateView(ctx, s, repositories)
+		addAlbumsToState(state, albums)
+		addPlaylistsToState(state, preferences)
+		favoriteIDs := state.favoriteTrackSetLocked(userID)
+		dislikedIDs := state.dislikedTrackSetLocked(userID)
+		responses = make([]trackResponse, 0, len(tracks))
+		for _, item := range tracks {
+			_, favorite := favoriteIDs[item.ID]
+			_, disliked := dislikedIDs[item.ID]
+			responses = append(responses, state.toTrackResponseLocked(item, favorite, disliked, true))
+		}
+		return nil
+	})
 	if err != nil {
 		return paginatedTracks{}, fmt.Errorf("list track responses: %w", err)
 	}
-	return state.listTrackResponses(userID, filter), nil
+	page, pageSize, totalPages := paginationMetadata(filter.Page, filter.PageSize, total)
+	return paginatedTracks{Items: responses, Page: page, PageSize: pageSize, TotalItems: total, TotalPages: totalPages}, nil
 }
 
 func (s *trackStore) getTrackResponse(trackID, userID int64) (trackResponse, bool, error) {
-	state, err := s.readState(stateTracks | stateAlbums | statePlaylists)
+	var response trackResponse
+	var found bool
+	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		item, ok, err := repositories.catalog.FindTrackByID(ctx, trackID)
+		if err != nil || !ok {
+			return err
+		}
+		found = true
+		albumItem, albumFound, err := repositories.catalog.FindAlbumByID(ctx, item.AlbumID)
+		if err != nil {
+			return err
+		}
+		preferences, err := repositories.reads.ListPreferencePlaylists(ctx, userID)
+		if err != nil {
+			return err
+		}
+		state := newDomainStateView(ctx, s, repositories)
+		if albumFound {
+			addAlbumsToState(state, []album{albumItem})
+		}
+		addPlaylistsToState(state, preferences)
+		_, favorite := state.favoriteTrackSetLocked(userID)[trackID]
+		_, disliked := state.dislikedTrackSetLocked(userID)[trackID]
+		response = state.toTrackResponseLocked(item, favorite, disliked, true)
+		return nil
+	})
 	if err != nil {
 		return trackResponse{}, false, fmt.Errorf("get track response: %w", err)
 	}
-	item, ok := state.getTrackResponse(trackID, userID)
-	return item, ok, nil
+	return response, found, nil
 }
 
 func (s *trackStore) songFileReferenced(fileName string) (bool, int64, error) {
-	state, err := s.readState(stateTracks)
+	var references []trackAudioReference
+	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		var err error
+		references, err = repositories.reads.ListTrackAudioReferences(ctx)
+		return err
+	})
 	if err != nil {
 		return false, 0, fmt.Errorf("check song reference: %w", err)
 	}
-	inUse, trackID := state.songFileReferenced(fileName)
-	return inUse, trackID, nil
+	for _, item := range references {
+		if trackReferencesSongFile(item.AudioFilePath, fileName) {
+			return true, item.ID, nil
+		}
+	}
+	return false, 0, nil
 }
 
 func (s *trackStore) referencedSongFiles() (map[string]struct{}, error) {
-	state, err := s.readState(stateTracks)
+	var references []trackAudioReference
+	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		var err error
+		references, err = repositories.reads.ListTrackAudioReferences(ctx)
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list song references: %w", err)
 	}
-	return state.referencedSongFiles(), nil
+	result := make(map[string]struct{}, len(references))
+	for _, item := range references {
+		if fileName, ok := extractReferencedSongFileName(item.AudioFilePath); ok {
+			result[fileName] = struct{}{}
+		}
+	}
+	return result, nil
 }
 
 func (s *trackStore) toTrackResponse(t track, isFavorite, isDisliked, isAvailable bool) (trackResponse, error) {
-	state, err := s.readState(stateAlbums)
+	var response trackResponse
+	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		state := newDomainStateView(ctx, s, repositories)
+		albumItem, ok, err := repositories.catalog.FindAlbumByID(ctx, t.AlbumID)
+		if err != nil {
+			return err
+		}
+		if ok {
+			addAlbumsToState(state, []album{albumItem})
+		}
+		response = state.toTrackResponseLocked(t, isFavorite, isDisliked, isAvailable)
+		return nil
+	})
 	if err != nil {
 		return trackResponse{}, fmt.Errorf("build track response: %w", err)
 	}
-	return state.toTrackResponse(t, isFavorite, isDisliked, isAvailable), nil
+	return response, nil
 }
 
 func (s *trackStore) getTrack(trackID int64) (track, bool, error) {
@@ -535,12 +891,29 @@ func (s *trackStore) getTrack(trackID int64) (track, bool, error) {
 }
 
 func (s *trackStore) getTrackAlbumOrder(trackID int64) (int, bool, error) {
-	state, err := s.readState(stateTracks | stateAlbums)
+	var order int
+	var found bool
+	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		item, ok, err := repositories.catalog.FindTrackByID(ctx, trackID)
+		if err != nil || !ok {
+			return err
+		}
+		albumItem, ok, err := repositories.catalog.FindAlbumByID(ctx, item.AlbumID)
+		if err != nil || !ok {
+			return err
+		}
+		for index, existingTrackID := range albumItem.TrackIDs {
+			if existingTrackID == trackID {
+				order, found = index, true
+				break
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return 0, false, fmt.Errorf("get track album order: %w", err)
 	}
-	order, ok := state.getTrackAlbumOrder(trackID)
-	return order, ok, nil
+	return order, found, nil
 }
 
 func (s *trackStore) findTrackBySourceMetadata(target sourceMetadata) (track, bool, error) {
@@ -548,12 +921,26 @@ func (s *trackStore) findTrackBySourceMetadata(target sourceMetadata) (track, bo
 }
 
 func (s *trackStore) findTrackBySourceMetadataContext(ctx context.Context, target sourceMetadata) (track, bool, error) {
-	state, err := s.readStateContext(ctx, stateTracks)
+	provider, ok := target["provider"].(string)
+	if !ok || strings.TrimSpace(provider) == "" {
+		return track{}, false, nil
+	}
+	var item track
+	var found bool
+	err := s.unitOfWork.WithinReadTransaction(ctx, func(repositories domainRepositories) error {
+		tracks, err := repositories.reads.ListTracksBySourceProvider(ctx, provider)
+		if err != nil {
+			return err
+		}
+		state := newDomainStateView(ctx, s, repositories)
+		addTracksToState(state, tracks)
+		item, found = state.findTrackBySourceMetadata(target)
+		return nil
+	})
 	if err != nil {
 		return track{}, false, fmt.Errorf("find track source metadata: %w", err)
 	}
-	item, ok := state.findTrackBySourceMetadata(target)
-	return item, ok, nil
+	return item, found, nil
 }
 
 func (s *trackStore) createTrackIfSourceAbsent(req upsertTrackRequest, target sourceMetadata, publishAudio func() error) (result track, returnErr error) {
@@ -606,9 +993,13 @@ func (s *trackStore) attachTrackImportMetadataIfSourceAbsentContext(ctx context.
 }
 
 func (s *trackStore) youtubeImportSuggestions(item youtubeImportItem) ([]youtubeImportSuggestion, error) {
-	state, err := s.readState(stateCatalog)
+	var suggestions []youtubeImportSuggestion
+	err := s.withinReadState(stateCatalog, func(state *domainState) error {
+		suggestions = state.youtubeImportSuggestions(item)
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("build YouTube import suggestions: %w", err)
 	}
-	return state.youtubeImportSuggestions(item), nil
+	return suggestions, nil
 }
