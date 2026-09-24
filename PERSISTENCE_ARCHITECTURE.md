@@ -11,6 +11,7 @@ signatures, while persistence is delegated through these domain boundaries:
 - `PlaylistRepository`
 - `LyricsRepository`
 - `ReadRepository` (cross-aggregate filtering, pagination, and projections)
+- `AccessControlRepository` (roles, permissions, assignments, and audit events)
 
 The SQLite implementations accept `context.Context` and contain SQL encoding,
 row scanning, constraint translation, and driver-specific behavior. The unit of
@@ -36,6 +37,25 @@ Mutations issue explicit inserts, updates, and deletes for affected rows only.
 Operations spanning domains use repositories bound to one unit-of-work
 transaction. SQLite rollback replaces the former map snapshot/restore logic.
 
+## Access control
+
+Authorization is permission-based. Users may have any number of roles, roles
+may have any number of permissions, and effective permissions are the distinct
+union across every assigned role. These relationships are stored in
+`user_roles` and `role_permissions`; authorization never depends on a role
+embedded in the user row or on an in-memory permission cache.
+
+Permission definitions correspond to concrete server actions and are seeded by
+schema migration. They are read-only through the management API because adding
+an arbitrary database permission cannot create an authorization check in code.
+Roles and both assignment relationships are managed transactionally.
+
+The built-in `admin` and `listener` roles establish registration defaults. They
+cannot be renamed or deleted, but their permission assignments are editable.
+Every access-control mutation is recorded in
+`access_control_audit_events`. Transactions reject any change that would leave
+the system without a user who has `access_control.manage`.
+
 ## Transaction boundaries
 
 - User creation advances the user and playlist counters, inserts the user, and
@@ -49,6 +69,8 @@ transaction. SQLite rollback replaces the former map snapshot/restore logic.
 - Refresh rotation removes expired sessions, removes the old session, and
   inserts the replacement as one session-domain transaction.
 - Lyrics and their embedded synchronized lines are written atomically.
+- Role assignments, permission assignments, their lockout check, and audit
+  event insertion commit atomically.
 
 ## ID allocation
 

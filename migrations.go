@@ -23,6 +23,7 @@ func defaultSchemaMigrations() []schemaMigration {
 		{version: 3, name: "unique system playlists", apply: migrateUniqueSystemPlaylists},
 		{version: 4, name: "repository query indexes", apply: migrateRepositoryIndexes},
 		{version: 5, name: "normalized system playlist keys", apply: migrateUniqueSystemPlaylists},
+		{version: 6, name: "role based access control", apply: migrateRoleBasedAccessControl},
 	}
 }
 
@@ -341,6 +342,97 @@ func migrateRepositoryIndexes(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+func migrateRoleBasedAccessControl(ctx context.Context, tx *sql.Tx) error {
+	statements := []string{
+		`CREATE TABLE roles (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+			description TEXT NOT NULL,
+			system INTEGER NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE permissions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			code TEXT NOT NULL UNIQUE,
+			description TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE user_roles (
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+			assigned_at TEXT NOT NULL,
+			assigned_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+			PRIMARY KEY (user_id, role_id)
+		)`,
+		`CREATE TABLE role_permissions (
+			role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+			permission_id INTEGER NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
+			PRIMARY KEY (role_id, permission_id)
+		)`,
+		`CREATE TABLE access_control_audit_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+			action TEXT NOT NULL,
+			target_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+			target_role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL,
+			target_permission_id INTEGER REFERENCES permissions(id) ON DELETE SET NULL,
+			details_json TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX idx_user_roles_role_id ON user_roles (role_id, user_id)`,
+		`CREATE INDEX idx_role_permissions_permission_id ON role_permissions (permission_id, role_id)`,
+		`CREATE INDEX idx_access_control_audit_created_at ON access_control_audit_events (created_at DESC, id DESC)`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+
+	now := formatSQLiteTime(time.Now().UTC())
+	for _, role := range defaultRBACRoles() {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO roles (name, description, system, created_at) VALUES (?, ?, 1, ?)`, role.Name, role.Description, now); err != nil {
+			return err
+		}
+	}
+	for _, permission := range definedPermissions() {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO permissions (code, description, created_at) VALUES (?, ?, ?)`, permission.Code, permission.Description, now); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO role_permissions (role_id, permission_id)
+		SELECT roles.id, permissions.id FROM roles CROSS JOIN permissions WHERE roles.name = ?`, roleAdmin); err != nil {
+		return err
+	}
+	for _, code := range defaultListenerPermissionCodes() {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO role_permissions (role_id, permission_id)
+			SELECT roles.id, permissions.id FROM roles, permissions WHERE roles.name = ? AND permissions.code = ?`, roleListener, code); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by_user_id)
+		SELECT users.id, roles.id, ?, NULL
+		FROM users
+		JOIN roles ON roles.name = CASE WHEN LOWER(TRIM(users.role)) = ? THEN ? ELSE ? END`, now, roleAdmin, roleAdmin, roleListener); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO user_roles (user_id, role_id, assigned_at, assigned_by_user_id)
+		SELECT (SELECT MIN(id) FROM users), roles.id, ?, NULL
+		FROM roles
+		WHERE roles.name = ?
+			AND EXISTS (SELECT 1 FROM users)
+			AND NOT EXISTS (
+				SELECT 1 FROM user_roles JOIN roles assigned_role ON assigned_role.id = user_roles.role_id
+				WHERE assigned_role.name = ?
+			)`, now, roleAdmin, roleAdmin); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE users DROP COLUMN role`); err != nil {
+		return err
+	}
+	return nil
+}
+
 func runSQLiteStartupRepairs(ctx context.Context, db *sql.DB) (returnErr error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -453,7 +545,10 @@ func validateSQLiteRelationships(ctx context.Context, tx *sql.Tx) error {
 		{"authors", `SELECT id FROM authors WHERE id <= 0 OR TRIM(current_name) = '' OR json_valid(photos_json) = 0 ORDER BY id LIMIT 1`},
 		{"albums", `SELECT id FROM albums WHERE id <= 0 OR TRIM(title) = '' OR TRIM(release_date) = '' OR json_valid(author_ids_json) = 0 OR json_valid(track_ids_json) = 0 OR json_valid(additional_info_json) = 0 ORDER BY id LIMIT 1`},
 		{"tracks", `SELECT id FROM tracks WHERE id <= 0 OR TRIM(name) = '' OR TRIM(audio_file_path) = '' OR TRIM(created_at) = '' OR json_valid(author_ids_json) = 0 OR json_valid(additional_info_json) = 0 OR json_valid(source_metadata_json) = 0 ORDER BY id LIMIT 1`},
-		{"users", `SELECT id FROM users WHERE id <= 0 OR TRIM(email) = '' OR TRIM(role) = '' OR TRIM(password_hash) = '' OR TRIM(created_at) = '' ORDER BY id LIMIT 1`},
+		{"users", `SELECT id FROM users WHERE id <= 0 OR TRIM(email) = '' OR TRIM(password_hash) = '' OR TRIM(created_at) = '' ORDER BY id LIMIT 1`},
+		{"roles", `SELECT id FROM roles WHERE id <= 0 OR TRIM(name) = '' OR system NOT IN (0, 1) OR TRIM(created_at) = '' ORDER BY id LIMIT 1`},
+		{"permissions", `SELECT id FROM permissions WHERE id <= 0 OR TRIM(code) = '' OR TRIM(created_at) = '' ORDER BY id LIMIT 1`},
+		{"roles", `SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM roles WHERE name = 'admin' AND system = 1) OR NOT EXISTS (SELECT 1 FROM roles WHERE name = 'listener' AND system = 1)`},
 		{"refresh_sessions", `SELECT rowid FROM refresh_sessions WHERE TRIM(id) = '' OR TRIM(token_hash) = '' OR TRIM(created_at) = '' OR TRIM(expires_at) = '' ORDER BY rowid LIMIT 1`},
 		{"playlists", `SELECT id FROM playlists WHERE id <= 0 OR TRIM(name) = '' OR json_valid(track_items_json) = 0 ORDER BY id LIMIT 1`},
 		{"lyrics", `SELECT id FROM lyrics WHERE id <= 0 OR TRIM(type) = '' OR TRIM(updated_at) = '' OR TRIM(created_at) = '' OR json_valid(lines_json) = 0 ORDER BY id LIMIT 1`},
@@ -473,6 +568,27 @@ func validateSQLiteRelationships(ctx context.Context, tx *sql.Tx) error {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("validate SQLite %s: %w", check.domain, err)
 		}
+	}
+	for _, definition := range definedPermissions() {
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM permissions WHERE code = ?)`, definition.Code).Scan(&exists); err != nil {
+			return fmt.Errorf("validate SQLite permission %s: %w", definition.Code, err)
+		}
+		if exists == 0 {
+			return fmt.Errorf("missing SQLite permission %s", definition.Code)
+		}
+	}
+	var usersExist, managersExist int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM users), EXISTS (
+		SELECT 1 FROM user_roles
+		JOIN role_permissions ON role_permissions.role_id = user_roles.role_id
+		JOIN permissions ON permissions.id = role_permissions.permission_id
+		WHERE permissions.code = ?
+	)`, permissionAccessControlManage).Scan(&usersExist, &managersExist); err != nil {
+		return fmt.Errorf("validate SQLite access-control manager: %w", err)
+	}
+	if usersExist != 0 && managersExist == 0 {
+		return errors.New("invalid SQLite access control: no user can manage access control")
 	}
 	return nil
 }

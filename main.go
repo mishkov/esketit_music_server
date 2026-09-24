@@ -296,16 +296,16 @@ type upsertAuthorRequest struct {
 type user struct {
 	ID           int64     `json:"id"`
 	Email        string    `json:"email"`
-	Role         string    `json:"role"`
 	PasswordHash string    `json:"passwordHash"`
 	CreatedAt    time.Time `json:"createdAt"`
 }
 
 type publicUser struct {
-	ID        int64     `json:"id"`
-	Email     string    `json:"email"`
-	Role      string    `json:"role"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID          int64        `json:"id"`
+	Email       string       `json:"email"`
+	CreatedAt   time.Time    `json:"createdAt"`
+	Roles       []accessRole `json:"roles"`
+	Permissions []permission `json:"permissions"`
 }
 
 type refreshSession struct {
@@ -378,6 +378,7 @@ type trackStore struct {
 	catalogRepository  CatalogRepository
 	playlistRepository PlaylistRepository
 	lyricsRepository   LyricsRepository
+	accessRepository   AccessControlRepository
 }
 
 type paginatedAlbums struct {
@@ -707,67 +708,75 @@ func run() (runErr error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthzHandler())
 	mux.HandleFunc("GET /api/songs", listSongsHandler(songsDir))
-	mux.Handle("POST /api/songs", requireRole(auth, store, roleAdmin, uploadSongHandler(songsDir)))
-	mux.Handle("GET /api/songs/unused", requireRole(auth, store, roleAdmin, listUnusedSongsHandler(store, songsDir)))
+	mux.Handle("POST /api/songs", requirePermission(auth, store, permissionSongsUpload, uploadSongHandler(songsDir)))
+	mux.Handle("GET /api/songs/unused", requirePermission(auth, store, permissionSongsCleanup, listUnusedSongsHandler(store, songsDir)))
 	mux.HandleFunc("GET /api/songs/", getSongHandler(songsDir))
-	mux.Handle("DELETE /api/songs/", requireRole(auth, store, roleAdmin, deleteSongHandler(store, songsDir)))
+	mux.Handle("DELETE /api/songs/", requirePermission(auth, store, permissionSongsCleanup, deleteSongHandler(store, songsDir)))
 	mux.HandleFunc("GET /api/album-covers/", getAlbumCoverHandler(albumCoversDir))
 	mux.HandleFunc("GET /api/albums", listAlbumsHandler(store, auth))
 	mux.HandleFunc("GET /api/search", searchHandler(store, auth))
-	mux.Handle("POST /api/albums", requireRole(auth, store, roleAdmin, createAlbumHandler(store)))
+	mux.Handle("POST /api/albums", requirePermission(auth, store, permissionAlbumsCreate, createAlbumHandler(store)))
 	mux.HandleFunc("GET /api/albums/", getAlbumByRouteHandler(store, auth))
-	mux.Handle("PUT /api/albums/", requireRole(auth, store, roleAdmin, updateAlbumByRouteHandler(store)))
-	mux.Handle("DELETE /api/albums/", requireRole(auth, store, roleAdmin, deleteAlbumByRouteHandler(store)))
-	mux.Handle("POST /api/album-covers", requireRole(auth, store, roleAdmin, uploadAlbumCoverHandler(albumCoversDir)))
-	mux.Handle("GET /api/album-covers/suggestions", requireRole(auth, store, roleAdmin, albumCoverSuggestionsHandler(albumCoverService)))
-	mux.Handle("POST /api/album-covers/import", requireRole(auth, store, roleAdmin, importAlbumCoverHandler(albumCoverService)))
-	mux.Handle("GET /api/playlists", requireAuth(auth, store, listPlaylistsHandler(store)))
-	mux.Handle("POST /api/playlists", requireAuth(auth, store, createPlaylistHandler(store)))
-	mux.Handle("POST /api/playlists/", requireAuth(auth, store, uploadPlaylistCoverByRouteHandler(store, albumCoversDir)))
-	mux.Handle("GET /api/playlists/", requireAuth(auth, store, getPlaylistByRouteHandler(store)))
-	mux.Handle("PUT /api/playlists/", requireAuth(auth, store, updatePlaylistByRouteHandler(store)))
-	mux.Handle("DELETE /api/playlists/", requireAuth(auth, store, deletePlaylistByRouteHandler(store)))
+	mux.Handle("PUT /api/albums/", requirePermission(auth, store, permissionAlbumsUpdate, updateAlbumByRouteHandler(store)))
+	mux.Handle("DELETE /api/albums/", requirePermission(auth, store, permissionAlbumsDelete, deleteAlbumByRouteHandler(store)))
+	mux.Handle("POST /api/album-covers", requirePermission(auth, store, permissionAlbumCoversManage, uploadAlbumCoverHandler(albumCoversDir)))
+	mux.Handle("GET /api/album-covers/suggestions", requirePermission(auth, store, permissionAlbumCoversManage, albumCoverSuggestionsHandler(albumCoverService)))
+	mux.Handle("POST /api/album-covers/import", requirePermission(auth, store, permissionAlbumCoversManage, importAlbumCoverHandler(albumCoverService)))
+	mux.Handle("GET /api/playlists", requirePermission(auth, store, permissionPlaylistsRead, listPlaylistsHandler(store)))
+	mux.Handle("POST /api/playlists", requirePermission(auth, store, permissionPlaylistsCreate, createPlaylistHandler(store)))
+	mux.Handle("POST /api/playlists/", requirePermission(auth, store, permissionPlaylistsUpdate, uploadPlaylistCoverByRouteHandler(store, albumCoversDir)))
+	mux.Handle("GET /api/playlists/", requirePermission(auth, store, permissionPlaylistsRead, getPlaylistByRouteHandler(store)))
+	mux.Handle("PUT /api/playlists/", requirePermission(auth, store, permissionPlaylistsUpdate, updatePlaylistByRouteHandler(store)))
+	mux.Handle("DELETE /api/playlists/", requirePermission(auth, store, permissionPlaylistsDelete, deletePlaylistByRouteHandler(store)))
 	mux.HandleFunc("GET /api/public/playlists/", getPublicPlaylistByRouteHandler(store, auth))
 	mux.HandleFunc("GET /api/shared/playlists/", getSharedPlaylistByRouteHandler(store, auth))
-	mux.Handle("POST /api/autoplay/next", requireAuth(auth, store, autoplayNextHandler(store)))
+	mux.Handle("POST /api/autoplay/next", requirePermission(auth, store, permissionAutoplayUse, autoplayNextHandler(store)))
 	mux.HandleFunc("POST /api/analytics/events", analyticsEventsHandler(store, auth))
 	mux.HandleFunc("GET /api/tracks", listTracksHandler(store, auth))
-	mux.Handle("POST /api/tracks", requireRole(auth, store, roleAdmin, createTrackHandler(store)))
+	mux.Handle("POST /api/tracks", requirePermission(auth, store, permissionTracksCreate, createTrackHandler(store)))
 	mux.Handle("GET /api/tracks/", getTrackByRouteHandler(store, auth))
 	mux.Handle("POST /api/tracks/", postTrackByRouteHandler(store, auth, lyricsSearchService))
 	mux.Handle("PUT /api/tracks/", putTrackByRouteHandler(store, auth))
 	mux.Handle("DELETE /api/tracks/", deleteTrackByRouteHandler(store, auth))
 	mux.HandleFunc("GET /api/authors", listAuthorsHandler(store))
-	mux.Handle("POST /api/authors", requireRole(auth, store, roleAdmin, createAuthorHandler(store)))
+	mux.Handle("POST /api/authors", requirePermission(auth, store, permissionAuthorsCreate, createAuthorHandler(store)))
 	mux.HandleFunc("GET /api/authors/", getAuthorByIDHandler(store))
-	mux.Handle("PUT /api/authors/", requireRole(auth, store, roleAdmin, updateAuthorHandler(store)))
-	mux.Handle("DELETE /api/authors/", requireRole(auth, store, roleAdmin, deleteAuthorHandler(store)))
+	mux.Handle("PUT /api/authors/", requirePermission(auth, store, permissionAuthorsUpdate, updateAuthorHandler(store)))
+	mux.Handle("DELETE /api/authors/", requirePermission(auth, store, permissionAuthorsDelete, deleteAuthorHandler(store)))
 	mux.HandleFunc("GET /api/author-photos/", getAuthorPhotoHandler(authorPhotosDir))
-	mux.Handle("POST /api/author-photos", requireRole(auth, store, roleAdmin, uploadAuthorPhotoHandler(authorPhotosDir)))
+	mux.Handle("POST /api/author-photos", requirePermission(auth, store, permissionAuthorPhotosUpload, uploadAuthorPhotoHandler(authorPhotosDir)))
 	mux.HandleFunc("POST /api/auth/register", registerHandler(store, auth))
 	mux.HandleFunc("POST /api/auth/login", loginHandler(store, auth))
 	mux.HandleFunc("POST /api/auth/refresh", refreshHandler(store, auth))
 	mux.HandleFunc("POST /api/auth/logout", logoutHandler(store))
-	mux.Handle("GET /api/auth/me", requireAuth(auth, store, meHandler(store)))
-	mux.Handle("GET /api/telegram/status", requireRole(auth, store, roleAdmin, telegramStatusHandler(telegramImport)))
-	mux.Handle("POST /api/telegram/auth/request", requireRole(auth, store, roleAdmin, telegramAuthRequestHandler(telegramImport)))
-	mux.Handle("POST /api/telegram/auth/confirm", requireRole(auth, store, roleAdmin, telegramAuthConfirmHandler(telegramImport)))
-	mux.Handle("POST /api/telegram/auth/password", requireRole(auth, store, roleAdmin, telegramAuthPasswordHandler(telegramImport)))
-	mux.Handle("POST /api/telegram/import-sessions", requireRole(auth, store, roleAdmin, telegramStartImportHandler(telegramImport)))
-	mux.Handle("GET /api/telegram/import-sessions/current", requireRole(auth, store, roleAdmin, telegramCurrentImportHandler(telegramImport)))
-	mux.Handle("POST /api/telegram/import-sessions/current/skip", requireRole(auth, store, roleAdmin, telegramSkipImportHandler(telegramImport)))
-	mux.Handle("POST /api/telegram/import-sessions/current/save", requireRole(auth, store, roleAdmin, telegramSaveImportHandler(telegramImport)))
-	mux.Handle("DELETE /api/telegram/import-sessions/current", requireRole(auth, store, roleAdmin, telegramCancelImportHandler(telegramImport)))
-	mux.Handle("GET /api/telegram/import-sessions/current/audio", requireRole(auth, store, roleAdmin, telegramCurrentAudioHandler(telegramImport)))
-	mux.Handle("GET /api/telegram/import-sessions/current/skipped-report", requireRole(auth, store, roleAdmin, telegramSkippedReportHandler(telegramImport)))
-	mux.Handle("POST /api/youtube/import-sessions", requireRole(auth, store, roleAdmin, youtubeStartImportHandler(youtubeImport)))
-	mux.Handle("GET /api/youtube/import-sessions/current", requireRole(auth, store, roleAdmin, youtubeCurrentImportHandler(youtubeImport)))
-	mux.Handle("POST /api/youtube/import-sessions/current/skip", requireRole(auth, store, roleAdmin, youtubeSkipImportHandler(youtubeImport)))
-	mux.Handle("POST /api/youtube/import-sessions/current/add", requireRole(auth, store, roleAdmin, youtubeAddImportHandler(youtubeImport)))
-	mux.Handle("DELETE /api/youtube/import-sessions/current", requireRole(auth, store, roleAdmin, youtubeCancelImportHandler(youtubeImport)))
-	mux.Handle("GET /api/youtube/cookies/status", requireRole(auth, store, roleAdmin, youtubeCookiesStatusHandler(youtubeCookieStore)))
-	mux.Handle("POST /api/youtube/cookies", requireRole(auth, store, roleAdmin, youtubeCookiesUploadHandler(youtubeCookieStore)))
-	mux.Handle("DELETE /api/youtube/cookies", requireRole(auth, store, roleAdmin, youtubeCookiesDeleteHandler(youtubeCookieStore)))
+	mux.Handle("GET /api/auth/me", requirePermission(auth, store, permissionAccountReadSelf, meHandler(store)))
+	mux.Handle("GET /api/telegram/status", requirePermission(auth, store, permissionTelegramManage, telegramStatusHandler(telegramImport)))
+	mux.Handle("POST /api/telegram/auth/request", requirePermission(auth, store, permissionTelegramManage, telegramAuthRequestHandler(telegramImport)))
+	mux.Handle("POST /api/telegram/auth/confirm", requirePermission(auth, store, permissionTelegramManage, telegramAuthConfirmHandler(telegramImport)))
+	mux.Handle("POST /api/telegram/auth/password", requirePermission(auth, store, permissionTelegramManage, telegramAuthPasswordHandler(telegramImport)))
+	mux.Handle("POST /api/telegram/import-sessions", requirePermission(auth, store, permissionTelegramManage, telegramStartImportHandler(telegramImport)))
+	mux.Handle("GET /api/telegram/import-sessions/current", requirePermission(auth, store, permissionTelegramManage, telegramCurrentImportHandler(telegramImport)))
+	mux.Handle("POST /api/telegram/import-sessions/current/skip", requirePermission(auth, store, permissionTelegramManage, telegramSkipImportHandler(telegramImport)))
+	mux.Handle("POST /api/telegram/import-sessions/current/save", requirePermission(auth, store, permissionTelegramManage, telegramSaveImportHandler(telegramImport)))
+	mux.Handle("DELETE /api/telegram/import-sessions/current", requirePermission(auth, store, permissionTelegramManage, telegramCancelImportHandler(telegramImport)))
+	mux.Handle("GET /api/telegram/import-sessions/current/audio", requirePermission(auth, store, permissionTelegramManage, telegramCurrentAudioHandler(telegramImport)))
+	mux.Handle("GET /api/telegram/import-sessions/current/skipped-report", requirePermission(auth, store, permissionTelegramManage, telegramSkippedReportHandler(telegramImport)))
+	mux.Handle("POST /api/youtube/import-sessions", requirePermission(auth, store, permissionYouTubeManage, youtubeStartImportHandler(youtubeImport)))
+	mux.Handle("GET /api/youtube/import-sessions/current", requirePermission(auth, store, permissionYouTubeManage, youtubeCurrentImportHandler(youtubeImport)))
+	mux.Handle("POST /api/youtube/import-sessions/current/skip", requirePermission(auth, store, permissionYouTubeManage, youtubeSkipImportHandler(youtubeImport)))
+	mux.Handle("POST /api/youtube/import-sessions/current/add", requirePermission(auth, store, permissionYouTubeManage, youtubeAddImportHandler(youtubeImport)))
+	mux.Handle("DELETE /api/youtube/import-sessions/current", requirePermission(auth, store, permissionYouTubeManage, youtubeCancelImportHandler(youtubeImport)))
+	mux.Handle("GET /api/youtube/cookies/status", requirePermission(auth, store, permissionYouTubeManage, youtubeCookiesStatusHandler(youtubeCookieStore)))
+	mux.Handle("POST /api/youtube/cookies", requirePermission(auth, store, permissionYouTubeManage, youtubeCookiesUploadHandler(youtubeCookieStore)))
+	mux.Handle("DELETE /api/youtube/cookies", requirePermission(auth, store, permissionYouTubeManage, youtubeCookiesDeleteHandler(youtubeCookieStore)))
+	mux.Handle("GET /api/access-control/users", requirePermission(auth, store, permissionAccessControlManage, listAccessControlUsersHandler(store)))
+	mux.Handle("PUT /api/access-control/users/", requirePermission(auth, store, permissionAccessControlManage, replaceUserRolesHandler(store)))
+	mux.Handle("GET /api/access-control/roles", requirePermission(auth, store, permissionAccessControlManage, listAccessRolesHandler(store)))
+	mux.Handle("POST /api/access-control/roles", requirePermission(auth, store, permissionAccessControlManage, createAccessRoleHandler(store)))
+	mux.Handle("PUT /api/access-control/roles/", requirePermission(auth, store, permissionAccessControlManage, updateAccessRoleByRouteHandler(store)))
+	mux.Handle("DELETE /api/access-control/roles/", requirePermission(auth, store, permissionAccessControlManage, deleteAccessRoleHandler(store)))
+	mux.Handle("GET /api/access-control/permissions", requirePermission(auth, store, permissionAccessControlManage, listPermissionsHandler(store)))
+	mux.Handle("GET /api/access-control/audit-events", requirePermission(auth, store, permissionAccessControlManage, listAccessAuditEventsHandler(store)))
 	mux.HandleFunc("GET /api/openapi.yaml", serveOpenAPIHandler())
 	mux.HandleFunc("GET /api/docs", swaggerUIHandler())
 	mux.HandleFunc("GET /api/redoc", redocHandler())
@@ -1151,6 +1160,7 @@ func newTrackStore(path string) (*trackStore, error) {
 	s.catalogRepository = repositories.catalog
 	s.playlistRepository = repositories.playlists
 	s.lyricsRepository = repositories.lyrics
+	s.accessRepository = repositories.access
 
 	if err := s.initSQLiteSchema(); err != nil {
 		return nil, closeDatabaseAfterError(db, err)
@@ -2513,9 +2523,9 @@ func (s *domainState) createUser(email, passwordHash string) (user, error) {
 		return user{}, errEmailAlreadyExists
 	}
 
-	role := roleListener
+	roleName := roleListener
 	if len(s.users) == 0 {
-		role = roleAdmin
+		roleName = roleAdmin
 	}
 	userID, err := s.repositories.metadata.AllocateID(s.ctx, "next_user_id")
 	if err != nil {
@@ -2524,7 +2534,6 @@ func (s *domainState) createUser(email, passwordHash string) (user, error) {
 	u := user{
 		ID:           userID,
 		Email:        email,
-		Role:         role,
 		PasswordHash: passwordHash,
 		CreatedAt:    time.Now().UTC(),
 	}
@@ -2549,6 +2558,15 @@ func (s *domainState) createUser(email, passwordHash string) (user, error) {
 		return user{}, err
 	}
 	if err := s.repositories.playlists.Insert(s.ctx, dislikesPlaylist); err != nil {
+		return user{}, err
+	}
+	if err := s.repositories.access.AssignUserRoleByName(s.ctx, u.ID, roleName, nil, time.Now().UTC()); err != nil {
+		return user{}, err
+	}
+	if err := s.repositories.access.InsertAuditEvent(s.ctx, accessControlAuditEvent{
+		Action: "user.roles.initialize", TargetUserID: &u.ID,
+		Details: map[string]any{"role": roleName}, CreatedAt: time.Now().UTC(),
+	}); err != nil {
 		return user{}, err
 	}
 	return u, nil
@@ -3261,12 +3279,12 @@ func listAlbumsHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 			userID, err := auth.authenticateRequest(r)
 			if err == nil {
 				setSentryUser(r.Context(), userID)
-				user, ok, err := store.getUser(userID)
+				allowed, err := store.userHasPermission(userID, permissionCatalogUnpublishedRead)
 				if err != nil {
-					writeSentryInternalError(w, r, err, "failed to read user", "database", "albums.list_user")
+					writeSentryInternalError(w, r, err, "failed to read catalog permission", "database", "albums.list_permission")
 					return
 				}
-				if ok && user.Role == roleAdmin {
+				if allowed {
 					filter.IncludeEmpty = true
 				}
 			}
@@ -3921,11 +3939,11 @@ func deleteTrackHandler(store *trackStore) http.HandlerFunc {
 func postTrackByRouteHandler(store *trackStore, auth *authManager, lyricsSearch *lyricsSearchService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/lyrics/search") {
-			requireRole(auth, store, roleAdmin, lyricsSearchHandler(store, lyricsSearch)).ServeHTTP(w, r)
+			requirePermission(auth, store, permissionLyricsManage, lyricsSearchHandler(store, lyricsSearch)).ServeHTTP(w, r)
 			return
 		}
 		if strings.HasSuffix(r.URL.Path, "/playlists") {
-			requireAuth(auth, store, addTrackToPlaylistsHandler(store)).ServeHTTP(w, r)
+			requirePermission(auth, store, permissionPlaylistsUpdate, addTrackToPlaylistsHandler(store)).ServeHTTP(w, r)
 			return
 		}
 		http.NotFound(w, r)
@@ -3936,13 +3954,13 @@ func putTrackByRouteHandler(store *trackStore, auth *authManager) http.HandlerFu
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/lyrics"):
-			requireRole(auth, store, roleAdmin, putTrackLyricsHandler(store)).ServeHTTP(w, r)
+			requirePermission(auth, store, permissionLyricsManage, putTrackLyricsHandler(store)).ServeHTTP(w, r)
 		case strings.HasSuffix(r.URL.Path, "/favorite"):
-			requireAuth(auth, store, favoriteTrackHandler(store, true)).ServeHTTP(w, r)
+			requirePermission(auth, store, permissionPreferencesUpdate, favoriteTrackHandler(store, true)).ServeHTTP(w, r)
 		case strings.HasSuffix(r.URL.Path, "/dislike"):
-			requireAuth(auth, store, dislikeTrackHandler(store, true)).ServeHTTP(w, r)
+			requirePermission(auth, store, permissionPreferencesUpdate, dislikeTrackHandler(store, true)).ServeHTTP(w, r)
 		default:
-			requireRole(auth, store, roleAdmin, updateTrackHandler(store)).ServeHTTP(w, r)
+			requirePermission(auth, store, permissionTracksUpdate, updateTrackHandler(store)).ServeHTTP(w, r)
 		}
 	}
 }
@@ -3951,15 +3969,15 @@ func deleteTrackByRouteHandler(store *trackStore, auth *authManager) http.Handle
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/lyrics"):
-			requireRole(auth, store, roleAdmin, deleteTrackLyricsHandler(store)).ServeHTTP(w, r)
+			requirePermission(auth, store, permissionLyricsManage, deleteTrackLyricsHandler(store)).ServeHTTP(w, r)
 		case strings.HasSuffix(r.URL.Path, "/favorite"):
-			requireAuth(auth, store, favoriteTrackHandler(store, false)).ServeHTTP(w, r)
+			requirePermission(auth, store, permissionPreferencesUpdate, favoriteTrackHandler(store, false)).ServeHTTP(w, r)
 		case strings.HasSuffix(r.URL.Path, "/dislike"):
-			requireAuth(auth, store, dislikeTrackHandler(store, false)).ServeHTTP(w, r)
+			requirePermission(auth, store, permissionPreferencesUpdate, dislikeTrackHandler(store, false)).ServeHTTP(w, r)
 		case strings.Contains(r.URL.Path, "/playlists/"):
-			requireAuth(auth, store, removeTrackFromPlaylistHandler(store)).ServeHTTP(w, r)
+			requirePermission(auth, store, permissionPlaylistsUpdate, removeTrackFromPlaylistHandler(store)).ServeHTTP(w, r)
 		default:
-			requireRole(auth, store, roleAdmin, deleteTrackHandler(store)).ServeHTTP(w, r)
+			requirePermission(auth, store, permissionTracksDelete, deleteTrackHandler(store)).ServeHTTP(w, r)
 		}
 	}
 }
@@ -4186,12 +4204,12 @@ func searchHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 			userID, err := auth.authenticateRequest(r)
 			if err == nil {
 				setSentryUser(r.Context(), userID)
-				user, ok, err := store.getUser(userID)
+				allowed, err := store.userHasPermission(userID, permissionCatalogUnpublishedRead)
 				if err != nil {
-					writeSentryInternalError(w, r, err, "failed to read user", "database", "search.user")
+					writeSentryInternalError(w, r, err, "failed to read catalog permission", "database", "search.permission")
 					return
 				}
-				if ok && user.Role == roleAdmin {
+				if allowed {
 					filter.IncludeEmpty = true
 				}
 			}
@@ -4372,6 +4390,11 @@ func refreshHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 			return
 		}
 		setSentryUser(r.Context(), u.ID)
+		profile, err := store.getUserAccessProfile(u.ID)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to read user access", "database", "refresh.user_access")
+			return
+		}
 
 		accessToken, accessExpiresAt, err := auth.createAccessToken(u.ID)
 		if err != nil {
@@ -4380,7 +4403,7 @@ func refreshHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 		}
 
 		writeJSON(w, http.StatusOK, authResponse{
-			User:                  toPublicUser(u),
+			User:                  toPublicUser(u, profile),
 			AccessToken:           accessToken,
 			AccessTokenExpiresAt:  accessExpiresAt,
 			RefreshToken:          rawToken,
@@ -4424,7 +4447,12 @@ func meHandler(store *trackStore) http.HandlerFunc {
 			return
 		}
 
-		writeJSON(w, http.StatusOK, toPublicUser(u))
+		profile, err := store.getUserAccessProfile(u.ID)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to read user access", "database", "auth.me_access")
+			return
+		}
+		writeJSON(w, http.StatusOK, toPublicUser(u, profile))
 	}
 }
 
@@ -4451,7 +4479,7 @@ func requireAuth(auth *authManager, store *trackStore, next http.Handler) http.H
 	})
 }
 
-func requireRole(auth *authManager, store *trackStore, role string, next http.Handler) http.Handler {
+func requirePermission(auth *authManager, store *trackStore, permissionCode string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		userID, err := auth.authenticateRequest(r)
 		if err != nil {
@@ -4459,16 +4487,21 @@ func requireRole(auth *authManager, store *trackStore, role string, next http.Ha
 			return
 		}
 
-		u, ok, err := store.getUser(userID)
+		_, ok, err := store.getUser(userID)
 		if err != nil {
-			writeSentryInternalError(w, r, err, "failed to authorize user", "database", "auth.require_role_user")
+			writeSentryInternalError(w, r, err, "failed to authorize user", "database", "auth.require_permission_user")
 			return
 		}
 		if !ok {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
-		if u.Role != role {
+		allowed, err := store.userHasPermission(userID, permissionCode)
+		if err != nil {
+			writeSentryInternalError(w, r, err, "failed to authorize permission", "database", "auth.require_permission")
+			return
+		}
+		if !allowed {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -4480,6 +4513,11 @@ func requireRole(auth *authManager, store *trackStore, role string, next http.Ha
 }
 
 func writeAuthResponse(w http.ResponseWriter, r *http.Request, status int, auth *authManager, store *trackStore, u user) {
+	profile, err := store.getUserAccessProfile(u.ID)
+	if err != nil {
+		writeSentryInternalError(w, r, err, "failed to read user access", "database", "auth.user_access")
+		return
+	}
 	accessToken, accessExpiresAt, err := auth.createAccessToken(u.ID)
 	if err != nil {
 		writeSentryInternalError(w, r, fmt.Errorf("create access token: %w", err), "failed to issue access token", "auth", "login.issue_access_token")
@@ -4493,7 +4531,7 @@ func writeAuthResponse(w http.ResponseWriter, r *http.Request, status int, auth 
 	}
 
 	writeJSON(w, status, authResponse{
-		User:                  toPublicUser(u),
+		User:                  toPublicUser(u, profile),
 		AccessToken:           accessToken,
 		AccessTokenExpiresAt:  accessExpiresAt,
 		RefreshToken:          refreshToken,
@@ -4949,23 +4987,13 @@ func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
-func toPublicUser(u user) publicUser {
+func toPublicUser(u user, profile userAccessProfile) publicUser {
 	return publicUser{
-		ID:        u.ID,
-		Email:     u.Email,
-		Role:      u.Role,
-		CreatedAt: u.CreatedAt,
-	}
-}
-
-func normalizeRole(role string) string {
-	switch strings.ToLower(strings.TrimSpace(role)) {
-	case roleAdmin:
-		return roleAdmin
-	case roleListener:
-		return roleListener
-	default:
-		return ""
+		ID:          u.ID,
+		Email:       u.Email,
+		CreatedAt:   u.CreatedAt,
+		Roles:       profile.Roles,
+		Permissions: profile.Permissions,
 	}
 }
 
