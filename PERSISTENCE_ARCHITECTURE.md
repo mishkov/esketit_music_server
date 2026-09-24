@@ -10,6 +10,7 @@ signatures, while persistence is delegated through these domain boundaries:
 - `CatalogRepository` (albums and tracks share transaction requirements)
 - `PlaylistRepository`
 - `LyricsRepository`
+- `ReadRepository` (cross-aggregate filtering, pagination, and projections)
 
 The SQLite implementations accept `context.Context` and contain SQL encoding,
 row scanning, constraint translation, and driver-specific behavior. The unit of
@@ -22,6 +23,14 @@ work supplies all repositories bound to one transaction without exposing
 are read from repositories for each operation. Algorithms that correlate
 multiple denormalized rows may construct a request-local `domainState`; it is
 discarded when the operation returns and is never an application cache.
+
+Normal API reads use scoped SQL queries. Filters, counts, ordering, and
+pagination execute in SQLite before rows are decoded. Multi-table responses
+run inside one read-only unit-of-work transaction, so their tracks, albums,
+authors, playlists, and preference flags come from one database snapshot.
+Only operations whose result inherently depends on the complete catalog, such
+as autoplay candidate selection and import suggestion scoring, load broad
+request-local state; those loads also use a consistent read transaction.
 
 Mutations issue explicit inserts, updates, and deletes for affected rows only.
 Operations spanning domains use repositories bound to one unit-of-work
