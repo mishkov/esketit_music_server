@@ -1652,13 +1652,8 @@ func TestSearchHandlerUsesOptionalAuthForFavoritesAndAdminAlbumVisibility(t *tes
 		t.Fatalf("createUser() admin error = %v", err)
 	}
 
-	listener.Role = roleListener
-	admin.Role = roleAdmin
-	for _, item := range []user{listener, admin} {
-		if _, err := store.db.Exec(`UPDATE users SET role = ? WHERE id = ?`, item.Role, item.ID); err != nil {
-			t.Fatalf("update user role: %v", err)
-		}
-	}
+	setTestUserRole(t, store, listener.ID, roleListener)
+	setTestUserRole(t, store, admin.ID, roleAdmin)
 
 	if err := store.setFavoriteTrack(listener.ID, trackItem.ID, true); err != nil {
 		t.Fatalf("setFavoriteTrack() error = %v", err)
@@ -1768,13 +1763,8 @@ func TestListAlbumsHandlerHidesEmptyAlbumsForNonAdmin(t *testing.T) {
 		t.Fatalf("createUser() admin error = %v", err)
 	}
 
-	listener.Role = roleListener
-	admin.Role = roleAdmin
-	for _, item := range []user{listener, admin} {
-		if _, err := store.db.Exec(`UPDATE users SET role = ? WHERE id = ?`, item.Role, item.ID); err != nil {
-			t.Fatalf("update user role: %v", err)
-		}
-	}
+	setTestUserRole(t, store, listener.ID, roleListener)
+	setTestUserRole(t, store, admin.ID, roleAdmin)
 
 	t.Run("anonymous", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/albums", nil)
@@ -2917,6 +2907,30 @@ func newTestTrackStore(t *testing.T) *trackStore {
 		t.Fatalf("newTrackStore() error = %v", err)
 	}
 	return store
+}
+
+func setTestUserRole(t *testing.T, store *trackStore, userID int64, roleName string) {
+	t.Helper()
+	tx, err := store.db.Begin()
+	if err != nil {
+		t.Fatalf("begin role assignment: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`DELETE FROM user_roles WHERE user_id = ?`, userID); err != nil {
+		t.Fatalf("clear user roles: %v", err)
+	}
+	result, err := tx.Exec(`INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by_user_id)
+		SELECT ?, roles.id, ?, NULL FROM roles WHERE roles.name = ?`, userID, formatSQLiteTime(time.Now().UTC()), roleName)
+	if err != nil {
+		t.Fatalf("assign user role: %v", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 1 {
+		t.Fatalf("assign user role affected = %d, err = %v", affected, err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit role assignment: %v", err)
+	}
 }
 
 func testPlaylistByKind(t *testing.T, store *trackStore, userID int64, kind string) (playlist, bool) {

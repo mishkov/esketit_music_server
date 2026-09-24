@@ -83,6 +83,29 @@ type ReadRepository interface {
 	ListTracksBySourceProvider(context.Context, string) ([]track, error)
 }
 
+type AccessControlRepository interface {
+	ListRoles(context.Context) ([]accessRole, error)
+	FindRoleByID(context.Context, int64) (accessRole, bool, error)
+	InsertRole(context.Context, string, string, time.Time) (accessRole, error)
+	UpdateRole(context.Context, accessRole) error
+	DeleteRole(context.Context, int64) error
+	ListPermissions(context.Context) ([]permission, error)
+	ListRolePermissions(context.Context, int64) ([]permission, error)
+	ListUserRoles(context.Context, int64) ([]accessRole, error)
+	ListEffectivePermissions(context.Context, int64) ([]permission, error)
+	ListAllUserRoles(context.Context) ([]userRoleAssignment, error)
+	ListAllEffectivePermissions(context.Context) ([]userPermissionAssignment, error)
+	UserHasPermission(context.Context, int64, string) (bool, error)
+	CountRolesByIDs(context.Context, []int64) (int, error)
+	CountPermissionsByIDs(context.Context, []int64) (int, error)
+	CountUsersWithPermission(context.Context, string) (int, error)
+	ReplaceUserRoles(context.Context, int64, []int64, int64, time.Time) error
+	ReplaceRolePermissions(context.Context, int64, []int64) error
+	AssignUserRoleByName(context.Context, int64, string, *int64, time.Time) error
+	InsertAuditEvent(context.Context, accessControlAuditEvent) error
+	ListAuditEvents(context.Context, int) ([]accessControlAuditEvent, error)
+}
+
 type metadataRepository interface {
 	AllocateID(context.Context, string) (int64, error)
 }
@@ -96,6 +119,7 @@ type domainRepositories struct {
 	lyrics    LyricsRepository
 	metadata  metadataRepository
 	reads     ReadRepository
+	access    AccessControlRepository
 }
 
 // unitOfWork keeps *sql.Tx inside the SQLite adapter. Callers receive only
@@ -208,7 +232,7 @@ func (r *sqliteRepositories) AllocateID(ctx context.Context, key string) (int64,
 }
 
 func (r *sqliteRepositories) List(ctx context.Context) (items []user, returnErr error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT id, email, role, password_hash, created_at FROM users ORDER BY id`)
+	rows, err := r.q.QueryContext(ctx, `SELECT id, email, password_hash, created_at FROM users ORDER BY id`)
 	if err != nil {
 		return nil, translateSQLiteError(err)
 	}
@@ -230,7 +254,7 @@ type rowScanner interface {
 func scanUser(row rowScanner) (user, error) {
 	var item user
 	var createdAt string
-	if err := row.Scan(&item.ID, &item.Email, &item.Role, &item.PasswordHash, &createdAt); err != nil {
+	if err := row.Scan(&item.ID, &item.Email, &item.PasswordHash, &createdAt); err != nil {
 		return user{}, translateSQLiteError(err)
 	}
 	parsed, err := parseSQLiteTime(createdAt)
@@ -242,7 +266,7 @@ func scanUser(row rowScanner) (user, error) {
 }
 
 func (r *sqliteRepositories) FindByID(ctx context.Context, id int64) (user, bool, error) {
-	item, err := scanUser(r.q.QueryRowContext(ctx, `SELECT id, email, role, password_hash, created_at FROM users WHERE id = ?`, id))
+	item, err := scanUser(r.q.QueryRowContext(ctx, `SELECT id, email, password_hash, created_at FROM users WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return user{}, false, nil
 	}
@@ -250,7 +274,7 @@ func (r *sqliteRepositories) FindByID(ctx context.Context, id int64) (user, bool
 }
 
 func (r *sqliteRepositories) FindByEmail(ctx context.Context, email string) (user, bool, error) {
-	item, err := scanUser(r.q.QueryRowContext(ctx, `SELECT id, email, role, password_hash, created_at FROM users WHERE email = ?`, normalizeEmail(email)))
+	item, err := scanUser(r.q.QueryRowContext(ctx, `SELECT id, email, password_hash, created_at FROM users WHERE email = ?`, normalizeEmail(email)))
 	if errors.Is(err, sql.ErrNoRows) {
 		return user{}, false, nil
 	}
@@ -265,14 +289,14 @@ func (r *sqliteRepositories) Count(ctx context.Context) (int, error) {
 
 func (r *sqliteRepositories) Insert(ctx context.Context, item user) error {
 	createdAt := formatSQLiteTime(item.CreatedAt)
-	_, err := r.q.ExecContext(ctx, `INSERT INTO users (id, email, role, password_hash, created_at) VALUES (?, ?, ?, ?, ?)`,
-		item.ID, item.Email, item.Role, item.PasswordHash, createdAt)
+	_, err := r.q.ExecContext(ctx, `INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)`,
+		item.ID, item.Email, item.PasswordHash, createdAt)
 	return translateSQLiteError(err)
 }
 
 func (r *sqliteRepositories) Update(ctx context.Context, item user) error {
-	result, err := r.q.ExecContext(ctx, `UPDATE users SET email = ?, role = ?, password_hash = ?, created_at = ? WHERE id = ?`,
-		item.Email, item.Role, item.PasswordHash, formatSQLiteTime(item.CreatedAt), item.ID)
+	result, err := r.q.ExecContext(ctx, `UPDATE users SET email = ?, password_hash = ?, created_at = ? WHERE id = ?`,
+		item.Email, item.PasswordHash, formatSQLiteTime(item.CreatedAt), item.ID)
 	if err != nil {
 		return translateSQLiteError(err)
 	}
@@ -904,5 +928,6 @@ func newDomainRepositories(q sqlExecutor) domainRepositories {
 		lyrics:    sqliteLyricsRepository{base},
 		metadata:  base,
 		reads:     base,
+		access:    base,
 	}
 }

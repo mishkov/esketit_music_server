@@ -306,10 +306,7 @@ func newAdminOnlyTestHandler(t *testing.T, next http.Handler) http.Handler {
 		t.Fatalf("createUser() error = %v", err)
 	}
 
-	admin.Role = roleAdmin
-	if _, err := store.db.Exec(`UPDATE users SET role = ? WHERE id = ?`, admin.Role, admin.ID); err != nil {
-		t.Fatalf("update admin role: %v", err)
-	}
+	setTestUserRole(t, store, admin.ID, roleAdmin)
 
 	token, _, err := auth.createAccessToken(admin.ID)
 	if err != nil {
@@ -320,7 +317,7 @@ func newAdminOnlyTestHandler(t *testing.T, next http.Handler) http.Handler {
 		req := r.Clone(r.Context())
 		req.Header = r.Header.Clone()
 		req.Header.Set("Authorization", "Bearer "+token)
-		requireRole(auth, store, roleAdmin, next).ServeHTTP(w, req)
+		requirePermission(auth, store, permissionAlbumCoversManage, next).ServeHTTP(w, req)
 	})
 }
 
