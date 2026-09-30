@@ -10,31 +10,38 @@ import (
 )
 
 const (
-	permissionAccountReadSelf        = "account.read_self"
-	permissionPlaylistsRead          = "playlists.read"
-	permissionPlaylistsCreate        = "playlists.create"
-	permissionPlaylistsUpdate        = "playlists.update"
-	permissionPlaylistsDelete        = "playlists.delete"
-	permissionPreferencesUpdate      = "preferences.update"
-	permissionAutoplayUse            = "autoplay.use"
-	permissionCatalogUnpublishedRead = "catalog.unpublished.read"
-	permissionSongsUpload            = "songs.upload"
-	permissionSongsCleanup           = "songs.cleanup"
-	permissionAlbumsCreate           = "albums.create"
-	permissionAlbumsUpdate           = "albums.update"
-	permissionAlbumsDelete           = "albums.delete"
-	permissionAlbumCoversManage      = "album_covers.manage"
-	permissionTracksCreate           = "tracks.create"
-	permissionTracksUpdate           = "tracks.update"
-	permissionTracksDelete           = "tracks.delete"
-	permissionLyricsManage           = "lyrics.manage"
-	permissionAuthorsCreate          = "authors.create"
-	permissionAuthorsUpdate          = "authors.update"
-	permissionAuthorsDelete          = "authors.delete"
-	permissionAuthorPhotosUpload     = "author_photos.upload"
-	permissionTelegramManage         = "integrations.telegram.manage"
-	permissionYouTubeManage          = "integrations.youtube.manage"
-	permissionAccessControlManage    = "access_control.manage"
+	permissionAccountReadSelf          = "account.read_self"
+	permissionPlaylistsRead            = "playlists.read"
+	permissionPlaylistsCreate          = "playlists.create"
+	permissionPlaylistsUpdate          = "playlists.update"
+	permissionPlaylistsDelete          = "playlists.delete"
+	permissionPreferencesUpdate        = "preferences.update"
+	permissionAutoplayUse              = "autoplay.use"
+	permissionCatalogUnpublishedRead   = "catalog.unpublished.read"
+	permissionSongsUpload              = "songs.upload"
+	permissionSongsCleanup             = "songs.cleanup"
+	permissionAlbumsCreate             = "albums.create"
+	permissionAlbumsUpdate             = "albums.update"
+	permissionAlbumsDelete             = "albums.delete"
+	permissionAlbumCoversManage        = "album_covers.manage"
+	permissionTracksCreate             = "tracks.create"
+	permissionTracksUpdate             = "tracks.update"
+	permissionTracksDelete             = "tracks.delete"
+	permissionLyricsManage             = "lyrics.manage"
+	permissionAuthorsCreate            = "authors.create"
+	permissionAuthorsSubmit            = "authors.submit"
+	permissionAuthorsUpdate            = "authors.update"
+	permissionAuthorsDelete            = "authors.delete"
+	permissionAlbumsSubmit             = "albums.submit"
+	permissionTracksSubmit             = "tracks.submit"
+	permissionAuthorPhotosUpload       = "author_photos.upload"
+	permissionTelegramManage           = "integrations.telegram.manage"
+	permissionYouTubeManage            = "integrations.youtube.manage"
+	permissionAccessControlManage      = "access_control.manage"
+	permissionCatalogSubmissionsRead   = "catalog_submissions.read_own"
+	permissionCatalogSubmissionsUpdate = "catalog_submissions.update_own"
+	permissionCatalogSubmissionsCancel = "catalog_submissions.cancel_own"
+	permissionCatalogSubmissionsReview = "catalog_submissions.review"
 )
 
 var (
@@ -148,12 +155,19 @@ func definedPermissions() []permissionDefinition {
 		{permissionTracksDelete, "Delete tracks"},
 		{permissionLyricsManage, "Search, update, and delete track lyrics"},
 		{permissionAuthorsCreate, "Create authors"},
+		{permissionAuthorsSubmit, "Submit authors for catalog review"},
 		{permissionAuthorsUpdate, "Update authors"},
 		{permissionAuthorsDelete, "Delete authors"},
+		{permissionAlbumsSubmit, "Submit albums for catalog review"},
+		{permissionTracksSubmit, "Submit tracks and lyrics for catalog review"},
 		{permissionAuthorPhotosUpload, "Upload author photos"},
 		{permissionTelegramManage, "Manage Telegram authorization and imports"},
 		{permissionYouTubeManage, "Manage YouTube imports and cookies"},
 		{permissionAccessControlManage, "Manage users, roles, and permissions"},
+		{permissionCatalogSubmissionsRead, "Read personal catalog submissions and feedback"},
+		{permissionCatalogSubmissionsUpdate, "Update and resubmit personal catalog submissions"},
+		{permissionCatalogSubmissionsCancel, "Cancel personal catalog submissions"},
+		{permissionCatalogSubmissionsReview, "Review catalog submissions from other users"},
 	}
 }
 
@@ -166,6 +180,12 @@ func defaultListenerPermissionCodes() []string {
 		permissionPlaylistsDelete,
 		permissionPreferencesUpdate,
 		permissionAutoplayUse,
+		permissionAuthorsSubmit,
+		permissionAlbumsSubmit,
+		permissionTracksSubmit,
+		permissionCatalogSubmissionsRead,
+		permissionCatalogSubmissionsUpdate,
+		permissionCatalogSubmissionsCancel,
 	}
 }
 

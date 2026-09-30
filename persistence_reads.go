@@ -57,9 +57,9 @@ func init() {
 }
 
 const (
-	albumColumns    = `id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json`
-	trackColumns    = `id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at`
-	authorColumns   = `id, current_name, photos_json`
+	albumColumns    = `id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json, publication_status, requested_by_user_id`
+	trackColumns    = `id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at, publication_status, requested_by_user_id`
+	authorColumns   = `id, current_name, photos_json, publication_status, requested_by_user_id`
 	playlistColumns = `id, user_id, name, description, cover_image_path, visibility, share_token, track_items_json, system, kind`
 )
 
@@ -87,10 +87,27 @@ func (r *sqliteRepositories) ListAlbumsPage(ctx context.Context, filter albumLis
 }
 
 func albumReadFilter(filter albumListFilter) (string, []any) {
-	predicates := make([]string, 0, 4)
-	args := make([]any, 0, 4)
+	predicates := make([]string, 0, 5)
+	args := make([]any, 0, 8)
+	predicates = append(predicates, catalogSQLVisibility("albums", filter.ViewerUserID, &args))
 	if filter.AuthorID > 0 {
-		predicates = append(predicates, `EXISTS (SELECT 1 FROM json_each(albums.author_ids_json) WHERE CAST(value AS INTEGER) = ?)`)
+		visibleTrackArgs := make([]any, 0, 3)
+		visibleTrack := catalogSQLVisibility("author_track", filter.ViewerUserID, &visibleTrackArgs)
+		ownedDraftArgs := make([]any, 0, 2)
+		ownedDraft := catalogSQLOwnedDraft("albums", filter.ViewerUserID, &ownedDraftArgs)
+		predicates = append(predicates, `(EXISTS (
+			SELECT 1 FROM tracks author_track
+			JOIN json_each(author_track.author_ids_json) track_author
+			WHERE author_track.album_id = albums.id
+				AND CAST(track_author.value AS INTEGER) = ?
+				AND `+visibleTrack+`
+		) OR (`+ownedDraft+` AND EXISTS (
+			SELECT 1 FROM json_each(albums.author_ids_json) album_author
+			WHERE CAST(album_author.value AS INTEGER) = ?
+		)))`)
+		args = append(args, filter.AuthorID)
+		args = append(args, visibleTrackArgs...)
+		args = append(args, ownedDraftArgs...)
 		args = append(args, filter.AuthorID)
 	}
 	if filter.IsPublished != nil {
@@ -98,7 +115,17 @@ func albumReadFilter(filter albumListFilter) (string, []any) {
 		args = append(args, boolToSQLiteInt(*filter.IsPublished))
 	}
 	if !filter.IncludeEmpty {
-		predicates = append(predicates, `json_array_length(track_ids_json) > 0`)
+		visibleTrackArgs := make([]any, 0, 2)
+		visibleTrack := catalogSQLVisibility("visible_track", filter.ViewerUserID, &visibleTrackArgs)
+		ownedDraftArgs := make([]any, 0, 2)
+		ownedDraft := catalogSQLOwnedDraft("albums", filter.ViewerUserID, &ownedDraftArgs)
+		predicates = append(predicates, `(EXISTS (
+			SELECT 1 FROM json_each(albums.track_ids_json) album_track
+			JOIN tracks visible_track ON visible_track.id = CAST(album_track.value AS INTEGER)
+			WHERE `+visibleTrack+`
+		) OR `+ownedDraft+`)`)
+		args = append(args, visibleTrackArgs...)
+		args = append(args, ownedDraftArgs...)
 	}
 	if query := strings.ToLower(strings.TrimSpace(filter.Query)); query != "" {
 		predicates = append(predicates, `instr(esketit_unicode_fold(title), ?) > 0`)
@@ -142,8 +169,9 @@ func (r *sqliteRepositories) ListTracksPage(ctx context.Context, filter trackLis
 }
 
 func trackReadFilter(filter trackListFilter) (string, []any) {
-	predicates := make([]string, 0, 3)
-	args := make([]any, 0, 3)
+	predicates := make([]string, 0, 4)
+	args := make([]any, 0, 5)
+	predicates = append(predicates, catalogSQLVisibility("tracks", filter.ViewerUserID, &args))
 	if filter.AuthorID > 0 {
 		predicates = append(predicates, `EXISTS (SELECT 1 FROM json_each(tracks.author_ids_json) WHERE CAST(value AS INTEGER) = ?)`)
 		args = append(args, filter.AuthorID)
@@ -310,15 +338,35 @@ func (r *sqliteRepositories) SearchPage(ctx context.Context, userID int64, filte
 	query := strings.ToLower(strings.TrimSpace(filter.Query))
 	parts := make([]string, 0, 4)
 	args := make([]any, 0, 12)
-	parts = append(parts, `SELECT 'author' AS item_type, id, current_name AS item_name FROM authors WHERE (? = '' OR instr(esketit_unicode_fold(current_name), ?) > 0)`)
+	authorVisibilityArgs := make([]any, 0, 2)
+	authorVisibility := catalogSQLVisibility("authors", userID, &authorVisibilityArgs)
+	parts = append(parts, `SELECT 'author' AS item_type, id, current_name AS item_name FROM authors WHERE `+authorVisibility+` AND (? = '' OR instr(esketit_unicode_fold(current_name), ?) > 0)`)
+	args = append(args, authorVisibilityArgs...)
 	args = append(args, query, query)
+	albumVisibilityArgs := make([]any, 0, 2)
+	albumVisibility := catalogSQLVisibility("albums", userID, &albumVisibilityArgs)
+	albumEmptyArgs := make([]any, 0, 2)
 	albumEmptyPredicate := ""
 	if !filter.IncludeEmpty {
-		albumEmptyPredicate = ` AND json_array_length(track_ids_json) > 0`
+		visibleTrackArgs := make([]any, 0, 2)
+		visibleTrack := catalogSQLVisibility("search_album_track", userID, &visibleTrackArgs)
+		ownedDraftArgs := make([]any, 0, 2)
+		ownedDraft := catalogSQLOwnedDraft("albums", userID, &ownedDraftArgs)
+		albumEmptyPredicate = ` AND (EXISTS (
+			SELECT 1 FROM json_each(albums.track_ids_json) search_album_item
+			JOIN tracks search_album_track ON search_album_track.id = CAST(search_album_item.value AS INTEGER)
+			WHERE ` + visibleTrack + `) OR ` + ownedDraft + `)`
+		albumEmptyArgs = append(albumEmptyArgs, visibleTrackArgs...)
+		albumEmptyArgs = append(albumEmptyArgs, ownedDraftArgs...)
 	}
-	parts = append(parts, `SELECT 'album' AS item_type, id, title AS item_name FROM albums WHERE (? = '' OR instr(esketit_unicode_fold(title), ?) > 0)`+albumEmptyPredicate)
+	parts = append(parts, `SELECT 'album' AS item_type, id, title AS item_name FROM albums WHERE `+albumVisibility+` AND (? = '' OR instr(esketit_unicode_fold(title), ?) > 0)`+albumEmptyPredicate)
+	args = append(args, albumVisibilityArgs...)
 	args = append(args, query, query)
-	parts = append(parts, `SELECT 'track' AS item_type, id, name AS item_name FROM tracks WHERE (? = '' OR instr(esketit_unicode_fold(name), ?) > 0)`)
+	args = append(args, albumEmptyArgs...)
+	trackVisibilityArgs := make([]any, 0, 2)
+	trackVisibility := catalogSQLVisibility("tracks", userID, &trackVisibilityArgs)
+	parts = append(parts, `SELECT 'track' AS item_type, id, name AS item_name FROM tracks WHERE `+trackVisibility+` AND (? = '' OR instr(esketit_unicode_fold(name), ?) > 0)`)
+	args = append(args, trackVisibilityArgs...)
 	args = append(args, query, query)
 	parts = append(parts, `SELECT 'playlist' AS item_type, id, name AS item_name FROM playlists WHERE (visibility = ? OR (? > 0 AND user_id = ?)) AND (? = '' OR instr(esketit_unicode_fold(name), ?) > 0 OR instr(esketit_unicode_fold(description), ?) > 0)`)
 	args = append(args, playlistVisibilityPublic, userID, userID, query, query, query)
@@ -342,6 +390,16 @@ func (r *sqliteRepositories) SearchPage(ctx context.Context, userID int64, filte
 		items = append(items, item)
 	}
 	return items, total, translateSQLiteError(rows.Err())
+}
+
+func catalogSQLVisibility(table string, viewerUserID int64, args *[]any) string {
+	*args = append(*args, viewerUserID, viewerUserID)
+	return `(` + table + `.publication_status = 'published' OR (? > 0 AND ` + table + `.requested_by_user_id = ? AND ` + table + `.publication_status IN ('pending_review', 'changes_requested')))`
+}
+
+func catalogSQLOwnedDraft(table string, viewerUserID int64, args *[]any) string {
+	*args = append(*args, viewerUserID, viewerUserID)
+	return `(? > 0 AND ` + table + `.requested_by_user_id = ? AND ` + table + `.publication_status IN ('pending_review', 'changes_requested'))`
 }
 
 func (r *sqliteRepositories) ListTrackAudioReferences(ctx context.Context) ([]trackAudioReference, error) {

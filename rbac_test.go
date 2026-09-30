@@ -90,6 +90,17 @@ func TestNewUsersReceiveDefaultDatabaseRoles(t *testing.T) {
 	if !profileHasPermission(listenerProfile, permissionPlaylistsUpdate) {
 		t.Fatalf("listener lacks default playlist permission: %#v", listenerProfile)
 	}
+	for _, code := range []string{
+		permissionAuthorsSubmit, permissionAlbumsSubmit, permissionTracksSubmit,
+		permissionCatalogSubmissionsRead, permissionCatalogSubmissionsUpdate, permissionCatalogSubmissionsCancel,
+	} {
+		if !profileHasPermission(listenerProfile, code) {
+			t.Fatalf("listener lacks default catalog submission permission %q: %#v", code, listenerProfile)
+		}
+	}
+	if profileHasPermission(listenerProfile, permissionCatalogSubmissionsReview) {
+		t.Fatalf("listener unexpectedly has catalog review permission: %#v", listenerProfile)
+	}
 }
 
 func TestPermissionMiddlewareUsesCurrentDatabaseAssignments(t *testing.T) {

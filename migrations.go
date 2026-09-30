@@ -24,6 +24,7 @@ func defaultSchemaMigrations() []schemaMigration {
 		{version: 4, name: "repository query indexes", apply: migrateRepositoryIndexes},
 		{version: 5, name: "normalized system playlist keys", apply: migrateUniqueSystemPlaylists},
 		{version: 6, name: "role based access control", apply: migrateRoleBasedAccessControl},
+		{version: 7, name: "catalog submission approval workflow", apply: migrateCatalogSubmissionWorkflow},
 	}
 }
 
@@ -433,6 +434,101 @@ func migrateRoleBasedAccessControl(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+func migrateCatalogSubmissionWorkflow(ctx context.Context, tx *sql.Tx) error {
+	statements := []string{
+		`ALTER TABLE authors ADD COLUMN publication_status TEXT NOT NULL DEFAULT 'published'
+			CHECK (publication_status IN ('published', 'pending_review', 'changes_requested'))`,
+		`ALTER TABLE authors ADD COLUMN requested_by_user_id INTEGER REFERENCES users(id) ON DELETE RESTRICT`,
+		`ALTER TABLE albums ADD COLUMN publication_status TEXT NOT NULL DEFAULT 'published'
+			CHECK (publication_status IN ('published', 'pending_review', 'changes_requested'))`,
+		`ALTER TABLE albums ADD COLUMN requested_by_user_id INTEGER REFERENCES users(id) ON DELETE RESTRICT`,
+		`ALTER TABLE tracks ADD COLUMN publication_status TEXT NOT NULL DEFAULT 'published'
+			CHECK (publication_status IN ('published', 'pending_review', 'changes_requested'))`,
+		`ALTER TABLE tracks ADD COLUMN requested_by_user_id INTEGER REFERENCES users(id) ON DELETE RESTRICT`,
+		`CREATE TABLE catalog_submissions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			entity_type TEXT NOT NULL CHECK (entity_type IN ('author', 'album', 'track')),
+			entity_id INTEGER NOT NULL,
+			requester_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+			status TEXT NOT NULL CHECK (status IN ('pending_review', 'changes_requested', 'approved', 'rejected', 'cancelled')),
+			snapshot_json TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			submitted_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			decided_at TEXT,
+			decided_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+			UNIQUE (entity_type, entity_id)
+		)`,
+		`CREATE TABLE catalog_submission_feedback (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			submission_id INTEGER NOT NULL REFERENCES catalog_submissions(id) ON DELETE CASCADE,
+			reviewer_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+			kind TEXT NOT NULL CHECK (kind IN ('changes_requested', 'rejected')),
+			message TEXT NOT NULL,
+			rating_penalty INTEGER NOT NULL DEFAULT 0 CHECK (rating_penalty >= 0),
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE import_rating_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			submission_id INTEGER REFERENCES catalog_submissions(id) ON DELETE SET NULL,
+			actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+			event_key TEXT NOT NULL UNIQUE,
+			kind TEXT NOT NULL CHECK (kind IN ('track_approved', 'lyrics_bonus', 'review_penalty')),
+			delta INTEGER NOT NULL,
+			reason TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE catalog_review_leases (
+			requester_user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+			reviewer_user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+			lease_token TEXT NOT NULL UNIQUE,
+			acquired_at TEXT NOT NULL,
+			heartbeat_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE catalog_submission_uploads (
+			token TEXT PRIMARY KEY,
+			requester_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			stored_file_name TEXT NOT NULL UNIQUE,
+			original_file_name TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			claimed_track_id INTEGER UNIQUE REFERENCES tracks(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX idx_authors_publication ON authors (publication_status, requested_by_user_id, id)`,
+		`CREATE INDEX idx_albums_publication ON albums (publication_status, requested_by_user_id, id)`,
+		`CREATE INDEX idx_tracks_publication ON tracks (publication_status, requested_by_user_id, id)`,
+		`CREATE INDEX idx_catalog_submissions_requester_status ON catalog_submissions (requester_user_id, status, submitted_at, id)`,
+		`CREATE INDEX idx_catalog_submissions_review_queue ON catalog_submissions (status, requester_user_id, submitted_at, id)`,
+		`CREATE INDEX idx_catalog_submission_feedback_submission ON catalog_submission_feedback (submission_id, created_at, id)`,
+		`CREATE INDEX idx_import_rating_events_user ON import_rating_events (user_id, created_at, id)`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+
+	now := formatSQLiteTime(time.Now().UTC())
+	for _, definition := range definedPermissions() {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO permissions (code, description, created_at) VALUES (?, ?, ?)`,
+			definition.Code, definition.Description, now); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO role_permissions (role_id, permission_id)
+		SELECT roles.id, permissions.id FROM roles CROSS JOIN permissions WHERE roles.name = ?`, roleAdmin); err != nil {
+		return err
+	}
+	for _, code := range defaultListenerPermissionCodes() {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO role_permissions (role_id, permission_id)
+			SELECT roles.id, permissions.id FROM roles, permissions WHERE roles.name = ? AND permissions.code = ?`, roleListener, code); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func runSQLiteStartupRepairs(ctx context.Context, db *sql.DB) (returnErr error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -542,9 +638,9 @@ func validateSQLiteRelationships(ctx context.Context, tx *sql.Tx) error {
 		domain string
 		query  string
 	}{
-		{"authors", `SELECT id FROM authors WHERE id <= 0 OR TRIM(current_name) = '' OR json_valid(photos_json) = 0 ORDER BY id LIMIT 1`},
-		{"albums", `SELECT id FROM albums WHERE id <= 0 OR TRIM(title) = '' OR TRIM(release_date) = '' OR json_valid(author_ids_json) = 0 OR json_valid(track_ids_json) = 0 OR json_valid(additional_info_json) = 0 ORDER BY id LIMIT 1`},
-		{"tracks", `SELECT id FROM tracks WHERE id <= 0 OR TRIM(name) = '' OR TRIM(audio_file_path) = '' OR TRIM(created_at) = '' OR json_valid(author_ids_json) = 0 OR json_valid(additional_info_json) = 0 OR json_valid(source_metadata_json) = 0 ORDER BY id LIMIT 1`},
+		{"authors", `SELECT id FROM authors WHERE id <= 0 OR TRIM(current_name) = '' OR json_valid(photos_json) = 0 OR (publication_status = 'published') != (requested_by_user_id IS NULL) ORDER BY id LIMIT 1`},
+		{"albums", `SELECT id FROM albums WHERE id <= 0 OR TRIM(title) = '' OR TRIM(release_date) = '' OR json_valid(author_ids_json) = 0 OR json_valid(track_ids_json) = 0 OR json_valid(additional_info_json) = 0 OR (publication_status = 'published') != (requested_by_user_id IS NULL) ORDER BY id LIMIT 1`},
+		{"tracks", `SELECT id FROM tracks WHERE id <= 0 OR TRIM(name) = '' OR TRIM(audio_file_path) = '' OR TRIM(created_at) = '' OR json_valid(author_ids_json) = 0 OR json_valid(additional_info_json) = 0 OR json_valid(source_metadata_json) = 0 OR (publication_status = 'published') != (requested_by_user_id IS NULL) ORDER BY id LIMIT 1`},
 		{"users", `SELECT id FROM users WHERE id <= 0 OR TRIM(email) = '' OR TRIM(password_hash) = '' OR TRIM(created_at) = '' ORDER BY id LIMIT 1`},
 		{"roles", `SELECT id FROM roles WHERE id <= 0 OR TRIM(name) = '' OR system NOT IN (0, 1) OR TRIM(created_at) = '' ORDER BY id LIMIT 1`},
 		{"permissions", `SELECT id FROM permissions WHERE id <= 0 OR TRIM(code) = '' OR TRIM(created_at) = '' ORDER BY id LIMIT 1`},
@@ -558,6 +654,31 @@ func validateSQLiteRelationships(ctx context.Context, tx *sql.Tx) error {
 		{"refresh_sessions", `SELECT refresh_sessions.rowid FROM refresh_sessions LEFT JOIN users ON users.id = refresh_sessions.user_id WHERE users.id IS NULL ORDER BY refresh_sessions.rowid LIMIT 1`},
 		{"playlists", `SELECT playlists.id FROM playlists LEFT JOIN users ON users.id = playlists.user_id WHERE users.id IS NULL ORDER BY playlists.id LIMIT 1`},
 		{"lyrics", `SELECT lyrics.id FROM lyrics LEFT JOIN tracks ON tracks.id = lyrics.track_id WHERE tracks.id IS NULL ORDER BY lyrics.id LIMIT 1`},
+		{"catalog_submissions", `SELECT id FROM catalog_submissions WHERE id <= 0 OR entity_id <= 0 OR requester_user_id <= 0 OR json_valid(snapshot_json) = 0 OR TRIM(created_at) = '' OR TRIM(submitted_at) = '' OR TRIM(updated_at) = '' ORDER BY id LIMIT 1`},
+		{"catalog_submission_feedback", `SELECT id FROM catalog_submission_feedback WHERE id <= 0 OR TRIM(message) = '' OR rating_penalty < 0 OR TRIM(created_at) = '' ORDER BY id LIMIT 1`},
+		{"catalog_review_leases", `SELECT requester_user_id FROM catalog_review_leases WHERE requester_user_id = reviewer_user_id OR TRIM(lease_token) = '' OR TRIM(acquired_at) = '' OR TRIM(heartbeat_at) = '' OR TRIM(expires_at) = '' ORDER BY requester_user_id LIMIT 1`},
+		{"catalog_submission_uploads", `SELECT rowid FROM catalog_submission_uploads WHERE TRIM(token) = '' OR TRIM(stored_file_name) = '' OR TRIM(original_file_name) = '' OR TRIM(created_at) = '' ORDER BY rowid LIMIT 1`},
+		{"catalog_submissions", `SELECT catalog_submissions.id FROM catalog_submissions
+			WHERE status IN ('pending_review', 'changes_requested') AND NOT (
+				(entity_type = 'author' AND EXISTS (SELECT 1 FROM authors WHERE authors.id = entity_id AND authors.requested_by_user_id = requester_user_id AND authors.publication_status = status)) OR
+				(entity_type = 'album' AND EXISTS (SELECT 1 FROM albums WHERE albums.id = entity_id AND albums.requested_by_user_id = requester_user_id AND albums.publication_status = status)) OR
+				(entity_type = 'track' AND EXISTS (SELECT 1 FROM tracks WHERE tracks.id = entity_id AND tracks.requested_by_user_id = requester_user_id AND tracks.publication_status = status))
+			) ORDER BY id LIMIT 1`},
+		{"catalog_submissions", `SELECT catalog_submissions.id FROM catalog_submissions
+			WHERE status = 'approved' AND (
+				(entity_type = 'author' AND EXISTS (SELECT 1 FROM authors WHERE authors.id = entity_id AND (authors.publication_status != 'published' OR authors.requested_by_user_id IS NOT NULL))) OR
+				(entity_type = 'album' AND EXISTS (SELECT 1 FROM albums WHERE albums.id = entity_id AND (albums.publication_status != 'published' OR albums.requested_by_user_id IS NOT NULL))) OR
+				(entity_type = 'track' AND EXISTS (SELECT 1 FROM tracks WHERE tracks.id = entity_id AND (tracks.publication_status != 'published' OR tracks.requested_by_user_id IS NOT NULL)))
+			) ORDER BY id LIMIT 1`},
+		{"catalog_submissions", `SELECT catalog_submissions.id FROM catalog_submissions
+			WHERE status IN ('rejected', 'cancelled') AND (
+				(entity_type = 'author' AND EXISTS (SELECT 1 FROM authors WHERE authors.id = entity_id)) OR
+				(entity_type = 'album' AND EXISTS (SELECT 1 FROM albums WHERE albums.id = entity_id)) OR
+				(entity_type = 'track' AND EXISTS (SELECT 1 FROM tracks WHERE tracks.id = entity_id))
+			) ORDER BY id LIMIT 1`},
+		{"authors", `SELECT authors.id FROM authors WHERE publication_status != 'published' AND NOT EXISTS (SELECT 1 FROM catalog_submissions WHERE entity_type = 'author' AND entity_id = authors.id) ORDER BY authors.id LIMIT 1`},
+		{"albums", `SELECT albums.id FROM albums WHERE publication_status != 'published' AND NOT EXISTS (SELECT 1 FROM catalog_submissions WHERE entity_type = 'album' AND entity_id = albums.id) ORDER BY albums.id LIMIT 1`},
+		{"tracks", `SELECT tracks.id FROM tracks WHERE publication_status != 'published' AND NOT EXISTS (SELECT 1 FROM catalog_submissions WHERE entity_type = 'track' AND entity_id = tracks.id) ORDER BY tracks.id LIMIT 1`},
 	}
 	for _, check := range checks {
 		var id int64

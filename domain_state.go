@@ -195,7 +195,16 @@ func (s *trackStore) listAlbums(filter albumListFilter) (paginatedAlbums, error)
 	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
 		var err error
 		items, total, err = repositories.reads.ListAlbumsPage(ctx, filter)
-		return err
+		if err != nil {
+			return err
+		}
+		for index := range items {
+			items[index], err = sanitizeAlbumForViewer(ctx, repositories, items[index], filter.ViewerUserID)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return paginatedAlbums{}, fmt.Errorf("list albums: %w", err)
@@ -212,16 +221,36 @@ func (s *trackStore) getAlbum(id int64) (album, bool, error) {
 	return item, ok, nil
 }
 
+func (s *trackStore) getVisibleAlbum(id, viewerUserID int64) (album, bool, error) {
+	var result album
+	var found bool
+	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		item, ok, err := repositories.catalog.FindAlbumByID(ctx, id)
+		if err != nil || !ok || !catalogEntityVisible(item.PublicationStatus, item.RequestedByUserID, viewerUserID) {
+			return err
+		}
+		result, err = sanitizeAlbumForViewer(ctx, repositories, item, viewerUserID)
+		found = err == nil
+		return err
+	})
+	return result, found, err
+}
+
 func (s *trackStore) getAlbumTracks(id, userID int64) ([]trackResponse, bool, error) {
 	var items []trackResponse
 	var found bool
 	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
 		albumItem, ok, err := repositories.catalog.FindAlbumByID(ctx, id)
-		if err != nil || !ok {
+		if err != nil || !ok || !catalogEntityVisible(albumItem.PublicationStatus, albumItem.RequestedByUserID, userID) {
 			return err
 		}
 		found = true
 		tracks, err := repositories.reads.ListTracksByIDs(ctx, albumItem.TrackIDs)
+		if err != nil {
+			return err
+		}
+		tracks = visibleTracksForViewer(tracks, userID)
+		albumItem, err = sanitizeAlbumWithTracks(albumItem, tracks)
 		if err != nil {
 			return err
 		}
@@ -252,6 +281,11 @@ func (s *trackStore) get(id int64) (track, bool, error) {
 
 func (s *trackStore) createAlbum(req upsertAlbumRequest) (result album, returnErr error) {
 	returnErr = s.withinStateTransaction(stateCatalog, func(state *domainState) error {
+		for _, trackID := range normalizeTrackIDs(req.TrackIDs) {
+			if item, ok := state.tracks[trackID]; ok && normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished {
+				return fmt.Errorf("%w: pending tracks must be managed through catalog submissions", errCatalogSubmissionState)
+			}
+		}
 		var err error
 		result, err = state.createAlbum(req)
 		return err
@@ -261,6 +295,25 @@ func (s *trackStore) createAlbum(req upsertAlbumRequest) (result album, returnEr
 
 func (s *trackStore) updateAlbum(id int64, req upsertAlbumRequest) (result album, found bool, returnErr error) {
 	returnErr = s.withinStateTransaction(stateCatalog, func(state *domainState) error {
+		current, exists := state.albums[id]
+		if !exists {
+			return nil
+		}
+		if normalizePublicationStatus(current.PublicationStatus) != catalogPublicationPublished {
+			return fmt.Errorf("%w: pending albums must be managed through catalog submissions", errCatalogSubmissionState)
+		}
+		requestedTrackIDs := normalizeTrackIDs(req.TrackIDs)
+		for _, trackID := range requestedTrackIDs {
+			if item, ok := state.tracks[trackID]; ok && normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished && !containsInt64(current.TrackIDs, trackID) {
+				return fmt.Errorf("%w: pending tracks must be managed through catalog submissions", errCatalogSubmissionState)
+			}
+		}
+		for _, trackID := range current.TrackIDs {
+			if item, ok := state.tracks[trackID]; ok && normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished && !containsInt64(requestedTrackIDs, trackID) {
+				requestedTrackIDs = append(requestedTrackIDs, trackID)
+			}
+		}
+		req.TrackIDs = requestedTrackIDs
 		var err error
 		result, found, err = state.updateAlbum(id, req)
 		return err
@@ -270,6 +323,9 @@ func (s *trackStore) updateAlbum(id int64, req upsertAlbumRequest) (result album
 
 func (s *trackStore) deleteAlbum(id int64) (deleted bool, returnErr error) {
 	returnErr = s.withinStateTransaction(stateAlbums, func(state *domainState) error {
+		if item, ok := state.albums[id]; ok && normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished {
+			return fmt.Errorf("%w: pending albums must be managed through catalog submissions", errCatalogSubmissionState)
+		}
 		var err error
 		deleted, err = state.deleteAlbum(id)
 		return err
@@ -283,6 +339,9 @@ func (s *trackStore) create(req upsertTrackRequest) (result track, returnErr err
 
 func (s *trackStore) createWithContext(ctx context.Context, req upsertTrackRequest) (result track, returnErr error) {
 	returnErr = s.withinStateTransactionContext(ctx, stateCatalog, func(state *domainState) error {
+		if err := validatePublishedTrackReferences(state, req.AuthorIDs, req.AlbumID); err != nil {
+			return err
+		}
 		var err error
 		result, err = state.create(req)
 		return err
@@ -292,6 +351,16 @@ func (s *trackStore) createWithContext(ctx context.Context, req upsertTrackReque
 
 func (s *trackStore) update(id int64, req upsertTrackRequest) (result track, found bool, returnErr error) {
 	returnErr = s.withinStateTransaction(stateCatalog, func(state *domainState) error {
+		current, exists := state.tracks[id]
+		if !exists {
+			return nil
+		}
+		if normalizePublicationStatus(current.PublicationStatus) != catalogPublicationPublished {
+			return fmt.Errorf("%w: pending tracks must be managed through catalog submissions", errCatalogSubmissionState)
+		}
+		if err := validatePublishedTrackReferences(state, req.AuthorIDs, req.AlbumID); err != nil {
+			return err
+		}
 		var err error
 		result, found, err = state.update(id, req)
 		return err
@@ -301,11 +370,27 @@ func (s *trackStore) update(id int64, req upsertTrackRequest) (result track, fou
 
 func (s *trackStore) delete(id int64) (deleted bool, returnErr error) {
 	returnErr = s.withinStateTransaction(stateAll, func(state *domainState) error {
+		if item, ok := state.tracks[id]; ok && normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished {
+			return fmt.Errorf("%w: pending tracks must be managed through catalog submissions", errCatalogSubmissionState)
+		}
 		var err error
 		deleted, err = state.delete(id)
 		return err
 	})
 	return
+}
+
+func validatePublishedTrackReferences(state *domainState, authorIDs []int64, albumID int64) error {
+	albumItem, ok := state.albums[albumID]
+	if ok && normalizePublicationStatus(albumItem.PublicationStatus) != catalogPublicationPublished {
+		return fmt.Errorf("%w: published tracks cannot reference a pending album", errCatalogSubmissionState)
+	}
+	for _, authorID := range normalizeAuthorIDs(authorIDs) {
+		if item, ok := state.authors[authorID]; ok && normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished {
+			return fmt.Errorf("%w: published tracks cannot reference a pending author", errCatalogSubmissionState)
+		}
+	}
+	return nil
 }
 
 func (s *trackStore) listPlaylists(userID int64, filter playlistListFilter) (paginatedPlaylists, error) {
@@ -389,7 +474,7 @@ func (s *trackStore) deletePlaylist(userID, playlistID int64) (deleted bool, ret
 }
 
 func (s *trackStore) getPlaylistTracks(userID, playlistID, page, pageSize int64) (paginatedTracks, bool, error) {
-	return s.readPlaylistTracks("get playlist tracks", userID, page, pageSize, func(ctx context.Context, repositories domainRepositories) (playlist, bool, error) {
+	return s.readPlaylistTracks("get playlist tracks", userID, page, pageSize, true, func(ctx context.Context, repositories domainRepositories) (playlist, bool, error) {
 		item, ok, err := repositories.playlists.FindByID(ctx, playlistID)
 		if err != nil || !ok || item.UserID != userID {
 			return playlist{}, false, err
@@ -399,18 +484,23 @@ func (s *trackStore) getPlaylistTracks(userID, playlistID, page, pageSize int64)
 }
 
 func (s *trackStore) getPublicPlaylist(playlistID int64) (playlistResponse, bool, error) {
-	item, ok, err := s.playlistRepository.FindByID(context.Background(), playlistID)
-	if err != nil {
-		return playlistResponse{}, false, fmt.Errorf("get public playlist: %w", err)
-	}
-	if !ok || item.Visibility != playlistVisibilityPublic {
-		return playlistResponse{}, false, nil
-	}
-	return publicPlaylistResponse(buildPlaylistResponse(item)), true, nil
+	var result playlistResponse
+	var found bool
+	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		item, ok, err := repositories.playlists.FindByID(ctx, playlistID)
+		if err != nil || !ok || item.Visibility != playlistVisibilityPublic {
+			return err
+		}
+		found = true
+		result, err = buildVisiblePlaylistResponse(ctx, repositories, item, 0)
+		result = publicPlaylistResponse(result)
+		return err
+	})
+	return result, found, err
 }
 
 func (s *trackStore) getPublicPlaylistTracks(playlistID, userID, page, pageSize int64) (paginatedTracks, bool, error) {
-	return s.readPlaylistTracks("get public playlist tracks", userID, page, pageSize, func(ctx context.Context, repositories domainRepositories) (playlist, bool, error) {
+	return s.readPlaylistTracks("get public playlist tracks", userID, page, pageSize, false, func(ctx context.Context, repositories domainRepositories) (playlist, bool, error) {
 		item, ok, err := repositories.playlists.FindByID(ctx, playlistID)
 		if err != nil || !ok || item.Visibility != playlistVisibilityPublic {
 			return playlist{}, false, err
@@ -433,18 +523,49 @@ func (s *trackStore) getSharedPlaylist(token string) (playlistResponse, bool, er
 	if !found {
 		return playlistResponse{}, false, nil
 	}
-	return publicPlaylistResponse(buildPlaylistResponse(item)), true, nil
+	var response playlistResponse
+	err = s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
+		var buildErr error
+		response, buildErr = buildVisiblePlaylistResponse(ctx, repositories, item, 0)
+		return buildErr
+	})
+	return publicPlaylistResponse(response), true, err
+}
+
+func buildVisiblePlaylistResponse(ctx context.Context, repositories domainRepositories, item playlist, viewerUserID int64) (playlistResponse, error) {
+	trackIDs := make([]int64, 0, len(item.TrackItems))
+	for _, trackItem := range item.TrackItems {
+		trackIDs = append(trackIDs, trackItem.TrackID)
+	}
+	tracks, err := repositories.reads.ListTracksByIDs(ctx, trackIDs)
+	if err != nil {
+		return playlistResponse{}, err
+	}
+	visible := make(map[int64]struct{}, len(tracks))
+	for _, trackItem := range tracks {
+		if catalogEntityVisible(trackItem.PublicationStatus, trackItem.RequestedByUserID, viewerUserID) {
+			visible[trackItem.ID] = struct{}{}
+		}
+	}
+	response := buildPlaylistResponse(item)
+	response.TrackCount = 0
+	for _, trackItem := range item.TrackItems {
+		if _, ok := visible[trackItem.TrackID]; ok || trackItem.UnavailableTrack != nil {
+			response.TrackCount++
+		}
+	}
+	return response, nil
 }
 
 func (s *trackStore) getSharedPlaylistTracks(token string, userID, page, pageSize int64) (paginatedTracks, bool, error) {
-	return s.readPlaylistTracks("get shared playlist tracks", userID, page, pageSize, func(ctx context.Context, repositories domainRepositories) (playlist, bool, error) {
+	return s.readPlaylistTracks("get shared playlist tracks", userID, page, pageSize, false, func(ctx context.Context, repositories domainRepositories) (playlist, bool, error) {
 		return repositories.reads.FindPlaylistByShareToken(ctx, token)
 	})
 }
 
 type playlistReadTarget func(context.Context, domainRepositories) (playlist, bool, error)
 
-func (s *trackStore) readPlaylistTracks(operation string, userID, page, pageSize int64, find playlistReadTarget) (paginatedTracks, bool, error) {
+func (s *trackStore) readPlaylistTracks(operation string, userID, page, pageSize int64, includeOwnedPending bool, find playlistReadTarget) (paginatedTracks, bool, error) {
 	var result paginatedTracks
 	var found bool
 	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
@@ -453,16 +574,40 @@ func (s *trackStore) readPlaylistTracks(operation string, userID, page, pageSize
 			return err
 		}
 		found = true
-		normalizedPage, normalizedPageSize, totalPages := paginationMetadata(int(page), int(pageSize), len(playlistItem.TrackItems))
+		allTrackIDs := make([]int64, 0, len(playlistItem.TrackItems))
+		for _, item := range playlistItem.TrackItems {
+			allTrackIDs = append(allTrackIDs, item.TrackID)
+		}
+		allTracks, err := repositories.reads.ListTracksByIDs(ctx, allTrackIDs)
+		if err != nil {
+			return err
+		}
+		currentTracks := make(map[int64]track, len(allTracks))
+		for _, item := range allTracks {
+			currentTracks[item.ID] = item
+		}
+		visibilityUserID := int64(0)
+		if includeOwnedPending {
+			visibilityUserID = userID
+		}
+		visibleItems := make([]playlistTrack, 0, len(playlistItem.TrackItems))
+		for _, item := range playlistItem.TrackItems {
+			current, exists := currentTracks[item.TrackID]
+			if exists && !catalogEntityVisible(current.PublicationStatus, current.RequestedByUserID, visibilityUserID) {
+				continue
+			}
+			visibleItems = append(visibleItems, item)
+		}
+		normalizedPage, normalizedPageSize, totalPages := paginationMetadata(int(page), int(pageSize), len(visibleItems))
 		start := (normalizedPage - 1) * normalizedPageSize
-		if start > len(playlistItem.TrackItems) {
-			start = len(playlistItem.TrackItems)
+		if start > len(visibleItems) {
+			start = len(visibleItems)
 		}
 		end := start + normalizedPageSize
-		if end > len(playlistItem.TrackItems) {
-			end = len(playlistItem.TrackItems)
+		if end > len(visibleItems) {
+			end = len(visibleItems)
 		}
-		pageItems := playlistItem.TrackItems[start:end]
+		pageItems := visibleItems[start:end]
 		trackIDs := make([]int64, 0, len(pageItems))
 		for _, item := range pageItems {
 			trackIDs = append(trackIDs, item.TrackID)
@@ -472,7 +617,7 @@ func (s *trackStore) readPlaylistTracks(operation string, userID, page, pageSize
 			return err
 		}
 		albumIDs := make([]int64, 0, len(pageItems))
-		currentTracks := make(map[int64]track, len(tracks))
+		currentTracks = make(map[int64]track, len(tracks))
 		for _, item := range tracks {
 			currentTracks[item.ID] = item
 			albumIDs = append(albumIDs, item.AlbumID)
@@ -502,7 +647,7 @@ func (s *trackStore) readPlaylistTracks(operation string, userID, page, pageSize
 		}
 		result = paginatedTracks{
 			Items: responses, Page: normalizedPage, PageSize: normalizedPageSize,
-			TotalItems: len(playlistItem.TrackItems), TotalPages: totalPages,
+			TotalItems: len(visibleItems), TotalPages: totalPages,
 		}
 		return nil
 	})
@@ -635,7 +780,10 @@ func (s *trackStore) search(userID int64, filter searchListFilter) (paginatedSea
 				}
 			case "album":
 				if item, ok := state.albums[ref.ID]; ok {
-					copy := cloneAlbumForRead(item)
+					copy, err := sanitizeAlbumForViewer(ctx, repositories, item, userID)
+					if err != nil {
+						return err
+					}
 					items = append(items, searchResultItem{Type: ref.Type, Album: &copy})
 				}
 			case "track":
@@ -643,11 +791,25 @@ func (s *trackStore) search(userID int64, filter searchListFilter) (paginatedSea
 					_, favorite := favoriteIDs[item.ID]
 					_, disliked := dislikedIDs[item.ID]
 					copy := state.toSearchTrackResponseLocked(item, favorite, disliked)
+					visibleAuthors := copy.Authors[:0]
+					for _, authorItem := range copy.Authors {
+						if catalogEntityVisible(authorItem.PublicationStatus, authorItem.RequestedByUserID, userID) {
+							visibleAuthors = append(visibleAuthors, authorItem)
+						}
+					}
+					copy.Authors = visibleAuthors
 					items = append(items, searchResultItem{Type: ref.Type, Track: &copy})
 				}
 			case "playlist":
 				if item, ok := state.playlists[ref.ID]; ok {
-					copy := buildPlaylistResponse(item)
+					visibilityUserID := int64(0)
+					if item.UserID == userID {
+						visibilityUserID = userID
+					}
+					copy, err := buildVisiblePlaylistResponse(ctx, repositories, item, visibilityUserID)
+					if err != nil {
+						return err
+					}
 					if item.UserID != userID {
 						copy = publicPlaylistResponse(copy)
 					}
@@ -672,6 +834,62 @@ func (s *trackStore) getAuthor(id int64) (author, bool, error) {
 	return item, ok, nil
 }
 
+func (s *trackStore) getVisibleAuthor(id, viewerUserID int64) (author, bool, error) {
+	item, ok, err := s.authorRepository.FindByID(context.Background(), id)
+	if err != nil {
+		return author{}, false, fmt.Errorf("get author: %w", err)
+	}
+	if !ok || !catalogEntityVisible(item.PublicationStatus, item.RequestedByUserID, viewerUserID) {
+		return author{}, false, nil
+	}
+	return item, true, nil
+}
+
+func visibleTracksForViewer(items []track, viewerUserID int64) []track {
+	result := make([]track, 0, len(items))
+	for _, item := range items {
+		if catalogEntityVisible(item.PublicationStatus, item.RequestedByUserID, viewerUserID) {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func sanitizeAlbumForViewer(ctx context.Context, repositories domainRepositories, item album, viewerUserID int64) (album, error) {
+	tracks, err := repositories.reads.ListTracksByIDs(ctx, item.TrackIDs)
+	if err != nil {
+		return album{}, err
+	}
+	return sanitizeAlbumWithTracks(item, visibleTracksForViewer(tracks, viewerUserID))
+}
+
+func sanitizeAlbumWithTracks(item album, tracks []track) (album, error) {
+	trackSet := make(map[int64]track, len(tracks))
+	for _, trackItem := range tracks {
+		trackSet[trackItem.ID] = trackItem
+	}
+	visibleTrackIDs := make([]int64, 0, len(tracks))
+	authorSet := make(map[int64]struct{})
+	for _, trackID := range item.TrackIDs {
+		trackItem, ok := trackSet[trackID]
+		if !ok {
+			continue
+		}
+		visibleTrackIDs = append(visibleTrackIDs, trackID)
+		for _, authorID := range trackItem.AuthorIDs {
+			authorSet[authorID] = struct{}{}
+		}
+	}
+	item.TrackIDs = visibleTrackIDs
+	if len(visibleTrackIDs) > 0 || normalizePublicationStatus(item.PublicationStatus) == catalogPublicationPublished {
+		item.AuthorIDs = setToSortedIDs(authorSet)
+	} else {
+		item.AuthorIDs = append([]int64(nil), item.AuthorIDs...)
+	}
+	item.AdditionalInfo = normalizeAdditionalInfo(item.AdditionalInfo)
+	return item, nil
+}
+
 func (s *trackStore) createAuthor(req upsertAuthorRequest) (result author, returnErr error) {
 	returnErr = s.withinStateTransaction(stateAuthors, func(state *domainState) error {
 		var err error
@@ -683,6 +901,9 @@ func (s *trackStore) createAuthor(req upsertAuthorRequest) (result author, retur
 
 func (s *trackStore) updateAuthor(id int64, req upsertAuthorRequest) (result author, found bool, returnErr error) {
 	returnErr = s.withinStateTransaction(stateAuthors, func(state *domainState) error {
+		if item, ok := state.authors[id]; ok && normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished {
+			return fmt.Errorf("%w: pending authors must be managed through catalog submissions", errCatalogSubmissionState)
+		}
 		var err error
 		result, found, err = state.updateAuthor(id, req)
 		return err
@@ -692,6 +913,9 @@ func (s *trackStore) updateAuthor(id int64, req upsertAuthorRequest) (result aut
 
 func (s *trackStore) deleteAuthor(id int64) (deleted bool, returnErr error) {
 	returnErr = s.withinStateTransaction(stateAuthors|stateTracks, func(state *domainState) error {
+		if item, ok := state.authors[id]; ok && normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished {
+			return fmt.Errorf("%w: pending authors must be managed through catalog submissions", errCatalogSubmissionState)
+		}
 		var err error
 		deleted, err = state.deleteAuthor(id)
 		return err
@@ -752,6 +976,7 @@ func (s *trackStore) deleteRefreshSession(rawToken string) (deleted bool, return
 }
 
 func (s *trackStore) listTrackResponses(userID int64, filter trackListFilter) (paginatedTracks, error) {
+	filter.ViewerUserID = userID
 	var responses []trackResponse
 	var total int
 	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
@@ -797,7 +1022,7 @@ func (s *trackStore) getTrackResponse(trackID, userID int64) (trackResponse, boo
 	var found bool
 	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
 		item, ok, err := repositories.catalog.FindTrackByID(ctx, trackID)
-		if err != nil || !ok {
+		if err != nil || !ok || !catalogEntityVisible(item.PublicationStatus, item.RequestedByUserID, userID) {
 			return err
 		}
 		found = true

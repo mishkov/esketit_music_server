@@ -1,11 +1,11 @@
 openapi: 3.0.3
 info:
   title: Esketit Music Server API
-  version: 2.0.0
+  version: 3.0.0
   description: |
     REST API for listing and uploading media files, managing albums, tracks, authors,
     user playlists, authenticating users with access and refresh tokens, and
-    managing role-based permissions.
+    managing role-based permissions, and submitting catalog content for human review.
 
 servers:
   - url: http://localhost:8080
@@ -26,6 +26,8 @@ tags:
   - name: Analytics
   - name: Telegram
   - name: YouTube
+  - name: Catalog Submissions
+  - name: Catalog Reviews
   - name: Access Control
 
 paths:
@@ -2204,6 +2206,568 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /api/catalog-submissions:
+    get:
+      tags: [Catalog Submissions]
+      summary: List the authenticated user's catalog submissions
+      description: Requires `catalog_submissions.read_own`. Includes immutable feedback history and the user's current import rating.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Personal submission history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmissionList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/catalog-submissions/audio:
+    post:
+      tags: [Catalog Submissions]
+      summary: Stage audio for a track submission
+      description: Requires `tracks.submit`. The returned token is single-use and can only be claimed by its owner.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/FileUploadRequest'
+      responses:
+        '201':
+          description: Staged audio token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmissionUpload'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+
+  /api/catalog-submissions/authors:
+    post:
+      tags: [Catalog Submissions]
+      summary: Submit a new author
+      description: Requires `authors.submit`. The author is immediately visible only to its requester until approval.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertAuthorRequest'
+      responses:
+        '201':
+          description: Created author submission
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/catalog-submissions/authors/{id}:
+    put:
+      tags: [Catalog Submissions]
+      summary: Edit an author after changes were requested
+      description: Requires `catalog_submissions.update_own`. This does not resubmit the author automatically.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertAuthorRequest'
+      responses:
+        '200':
+          description: Updated submission
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/catalog-submissions/albums:
+    post:
+      tags: [Catalog Submissions]
+      summary: Submit a new album
+      description: Requires `albums.submit`. `trackIds` must be empty; `authorIds` may reference published authors or the requester's pending authors.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertAlbumRequest'
+      responses:
+        '201':
+          description: Created album submission
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/catalog-submissions/albums/{id}:
+    put:
+      tags: [Catalog Submissions]
+      summary: Edit an album after changes were requested
+      description: Requires `catalog_submissions.update_own`. Existing track membership is preserved and the album is not resubmitted automatically.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertAlbumRequest'
+      responses:
+        '200':
+          description: Updated submission
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/catalog-submissions/tracks:
+    post:
+      tags: [Catalog Submissions]
+      summary: Submit a new track
+      description: Requires `tracks.submit`. Referenced authors and album must be published or pending content owned by the requester.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTrackSubmissionRequest'
+      responses:
+        '201':
+          description: Created track submission
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/catalog-submissions/tracks/{id}:
+    put:
+      tags: [Catalog Submissions]
+      summary: Edit a track after changes were requested
+      description: Requires `catalog_submissions.update_own`. Supplying `audioUploadToken` replaces staged audio; this does not resubmit automatically.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTrackSubmissionRequest'
+      responses:
+        '200':
+          description: Updated submission
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/catalog-submissions/tracks/{id}/lyrics:
+    put:
+      tags: [Catalog Submissions]
+      summary: Create or replace lyrics for an owned track submission
+      description: Requires `catalog_submissions.update_own`. Lyrics present when the track is approved award a five-point bonus.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertTrackLyricsRequest'
+      responses:
+        '200':
+          description: Replaced lyrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackLyrics'
+        '201':
+          description: Created lyrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackLyrics'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/catalog-submissions/tracks/{id}/audio:
+    get:
+      tags: [Catalog Submissions]
+      summary: Stream staged audio
+      description: Available to the requester, or to the reviewer holding the requester's current lease. Reviewers must send `X-Review-Lease`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/ReviewLeaseToken'
+      responses:
+        '200':
+          description: Staged audio
+          content:
+            audio/mpeg:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/catalog-submissions/{id}/resubmit:
+    post:
+      tags: [Catalog Submissions]
+      summary: Resubmit corrected content
+      description: Requires `catalog_submissions.update_own`. Only content in `changes_requested` can be resubmitted.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '200':
+          description: Resubmitted content
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/catalog-submissions/{id}:
+    delete:
+      tags: [Catalog Submissions]
+      summary: Cancel an owned submission
+      description: Requires `catalog_submissions.cancel_own`. The catalog entity, staged audio, lyrics, and playlist references are removed; the submission tombstone remains.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '200':
+          description: Cancelled submission tombstone
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/catalog-reviews/requesters:
+    get:
+      tags: [Catalog Reviews]
+      summary: List requesters with content waiting for review
+      description: Requires `catalog_submissions.review`. Results are grouped by requester and include rating, pending count, and lease status but never a lease token.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Review queue grouped by requester
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CatalogReviewRequester'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/catalog-reviews/requesters/{id}/lease:
+    post:
+      tags: [Catalog Reviews]
+      summary: Acquire a requester review lease
+      description: Requires `catalog_submissions.review`. A reviewer may hold only one lease and a requester may be leased by only one reviewer. Leases expire after ten minutes. Reacquiring your own active lease rotates its token and extends its expiry; the previous token becomes invalid.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '201':
+          description: Acquired or recovered lease; retain `leaseToken` for all review operations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogReviewLease'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    put:
+      tags: [Catalog Reviews]
+      summary: Renew a review lease
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/ReviewLeaseTokenRequired'
+      responses:
+        '200':
+          description: Renewed lease
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogReviewLease'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags: [Catalog Reviews]
+      summary: Release a review lease
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/ReviewLeaseTokenRequired'
+      responses:
+        '204':
+          description: Lease released
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/catalog-reviews/requesters/{id}/submissions:
+    get:
+      tags: [Catalog Reviews]
+      summary: List reviewable submissions for the leased requester
+      description: Returns pending items first plus changes-requested items as dependency and feedback context. Only `pending_review` items accept review decisions.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/ReviewLeaseTokenRequired'
+      responses:
+        '200':
+          description: Pending and changes-requested submissions with feedback histories
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CatalogSubmission'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/catalog-reviews/submissions/{id}/approve:
+    post:
+      tags: [Catalog Reviews]
+      summary: Approve and publish a submission
+      description: Requires the requester's active lease. Track approval atomically publishes its pending author and album dependencies, awards ten rating points, and awards five more when lyrics exist.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/ReviewLeaseTokenRequired'
+      responses:
+        '200':
+          description: Approved submission
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/catalog-reviews/submissions/{id}/request-changes:
+    post:
+      tags: [Catalog Reviews]
+      summary: Request changes with feedback
+      description: Keeps the content available to its requester. The feedback message is required and `ratingPenalty` defaults to zero.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/ReviewLeaseTokenRequired'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CatalogReviewDecisionRequest'
+      responses:
+        '200':
+          description: Changes requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/catalog-reviews/submissions/{id}/reject:
+    post:
+      tags: [Catalog Reviews]
+      summary: Permanently reject a submission
+      description: Removes the catalog entity and staged media while retaining an immutable submission and feedback tombstone. Dependencies cannot be rejected while still referenced.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/ReviewLeaseTokenRequired'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CatalogReviewDecisionRequest'
+      responses:
+        '200':
+          description: Rejected submission tombstone
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
   /api/access-control/users:
     get:
       tags: [Access Control]
@@ -2483,6 +3047,20 @@ components:
       required: true
       schema:
         type: string
+    ReviewLeaseToken:
+      name: X-Review-Lease
+      in: header
+      required: false
+      description: Required when a reviewer, rather than the requester, streams staged audio.
+      schema:
+        type: string
+    ReviewLeaseTokenRequired:
+      name: X-Review-Lease
+      in: header
+      required: true
+      description: Token returned when the reviewer acquired the requester lease.
+      schema:
+        type: string
 
   responses:
     BadRequest:
@@ -2581,6 +3159,271 @@ components:
         url:
           type: string
       required: [name, sizeBytes, lastModified, path, url]
+
+    CatalogPublicationStatus:
+      type: string
+      enum: [published, pending_review, changes_requested]
+      description: |
+        Pending and changes-requested entities are returned by ordinary catalog APIs
+        only to the user who submitted them.
+
+    CatalogSubmissionStatus:
+      type: string
+      enum: [pending_review, changes_requested, approved, rejected, cancelled]
+
+    CatalogSubmissionEntityType:
+      type: string
+      enum: [author, album, track]
+
+    CatalogSubmissionFeedback:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        submissionId:
+          type: integer
+          format: int64
+        reviewerUserId:
+          type: integer
+          format: int64
+          nullable: true
+        kind:
+          type: string
+          enum: [changes_requested, rejected]
+        message:
+          type: string
+        ratingPenalty:
+          type: integer
+          minimum: 0
+        createdAt:
+          type: string
+          format: date-time
+      required: [id, submissionId, kind, message, ratingPenalty, createdAt]
+
+    CatalogSubmission:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        entityType:
+          $ref: '#/components/schemas/CatalogSubmissionEntityType'
+        entityId:
+          type: integer
+          format: int64
+        requesterUserId:
+          type: integer
+          format: int64
+        status:
+          $ref: '#/components/schemas/CatalogSubmissionStatus'
+        snapshot:
+          type: object
+          additionalProperties: true
+          description: Immutable latest entity snapshot, retained after rejection or cancellation.
+        entity:
+          type: object
+          additionalProperties: true
+          description: Current author, album, or track; falls back to the snapshot after the entity is removed.
+        feedback:
+          type: array
+          items:
+            $ref: '#/components/schemas/CatalogSubmissionFeedback'
+        createdAt:
+          type: string
+          format: date-time
+        submittedAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        decidedAt:
+          type: string
+          format: date-time
+          nullable: true
+        decidedByUserId:
+          type: integer
+          format: int64
+          nullable: true
+      required: [id, entityType, entityId, requesterUserId, status, snapshot, feedback, createdAt, submittedAt, updatedAt]
+
+    CatalogSubmissionList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CatalogSubmission'
+        importRating:
+          type: integer
+          description: Sum of immutable rating events; may be negative.
+      required: [items, importRating]
+
+    CatalogSubmissionUpload:
+      type: object
+      properties:
+        token:
+          type: string
+        requesterUserId:
+          type: integer
+          format: int64
+        originalName:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        claimedTrackId:
+          type: integer
+          format: int64
+          nullable: true
+        sizeBytes:
+          type: integer
+          format: int64
+          minimum: 0
+      required: [token, requesterUserId, originalName, createdAt]
+
+    CreateTrackSubmissionRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        authorIds:
+          type: array
+          minItems: 1
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        albumId:
+          type: integer
+          format: int64
+          minimum: 1
+        albumOrder:
+          type: integer
+          minimum: 0
+        audioUploadToken:
+          type: string
+          minLength: 1
+        additionalInfo:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdditionalInfo'
+        sourceMetadata:
+          type: array
+          items:
+            $ref: '#/components/schemas/SourceMetadata'
+      required: [name, authorIds, albumId, audioUploadToken, additionalInfo, sourceMetadata]
+
+    UpdateTrackSubmissionRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        authorIds:
+          type: array
+          minItems: 1
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        albumId:
+          type: integer
+          format: int64
+          minimum: 1
+        albumOrder:
+          type: integer
+          minimum: 0
+        audioUploadToken:
+          type: string
+          description: Optional replacement upload token; omit to retain the existing staged audio.
+        additionalInfo:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdditionalInfo'
+        sourceMetadata:
+          type: array
+          items:
+            $ref: '#/components/schemas/SourceMetadata'
+      required: [name, authorIds, albumId, additionalInfo, sourceMetadata]
+
+    CatalogReviewDecisionRequest:
+      type: object
+      properties:
+        message:
+          type: string
+          minLength: 1
+        ratingPenalty:
+          type: integer
+          minimum: 0
+          default: 0
+      required: [message]
+
+    CatalogReviewLease:
+      type: object
+      properties:
+        requesterUserId:
+          type: integer
+          format: int64
+        reviewerUserId:
+          type: integer
+          format: int64
+        leaseToken:
+          type: string
+        acquiredAt:
+          type: string
+          format: date-time
+        heartbeatAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+      required: [requesterUserId, reviewerUserId, leaseToken, acquiredAt, heartbeatAt, expiresAt]
+
+    CatalogReviewLeaseStatus:
+      type: object
+      properties:
+        reviewerUserId:
+          type: integer
+          format: int64
+        acquiredAt:
+          type: string
+          format: date-time
+        heartbeatAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+      required: [reviewerUserId, acquiredAt, heartbeatAt, expiresAt]
+
+    CatalogReviewRequester:
+      type: object
+      properties:
+        user:
+          type: object
+          properties:
+            id:
+              type: integer
+              format: int64
+            email:
+              type: string
+              format: email
+          required: [id, email]
+        pendingCount:
+          type: integer
+          minimum: 1
+        importRating:
+          type: integer
+        activeLease:
+          $ref: '#/components/schemas/CatalogReviewLeaseStatus'
+        oldestPendingAt:
+          type: string
+          format: date-time
+      required: [user, pendingCount, importRating, oldestPendingAt]
 
     AlbumCoverSuggestionsResponse:
       type: object
@@ -2703,7 +3546,14 @@ components:
           type: array
           items:
             type: string
-      required: [id, currentName, photos]
+        publicationStatus:
+          $ref: '#/components/schemas/CatalogPublicationStatus'
+        requestedByUserId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+      required: [id, currentName, photos, publicationStatus]
 
     UpsertAuthorRequest:
       type: object
@@ -2756,7 +3606,14 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AdditionalInfo'
-      required: [id, title, coverImagePath, authorIds, releaseDate, isPublished, trackIds, additionalInfo]
+        publicationStatus:
+          $ref: '#/components/schemas/CatalogPublicationStatus'
+        requestedByUserId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+      required: [id, title, coverImagePath, authorIds, releaseDate, isPublished, trackIds, additionalInfo, publicationStatus]
 
     UpsertAlbumRequest:
       type: object
@@ -2847,7 +3704,14 @@ components:
             responses. Disliked tracks remain visible and may be played manually.
         isAvailable:
           type: boolean
-      required: [id, name, authorIds, albumId, audioFilePath, additionalInfo, sourceMetadata, createdAt, isFavorite, isDisliked, isAvailable]
+        publicationStatus:
+          $ref: '#/components/schemas/CatalogPublicationStatus'
+        requestedByUserId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+      required: [id, name, authorIds, albumId, audioFilePath, additionalInfo, sourceMetadata, createdAt, isFavorite, isDisliked, isAvailable, publicationStatus]
 
     UpsertTrackRequest:
       type: object

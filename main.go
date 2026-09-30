@@ -114,6 +114,7 @@ type songInfo struct {
 
 type albumCoverInfo struct {
 	Name         string    `json:"name"`
+	OriginalName string    `json:"-"`
 	SizeBytes    int64     `json:"sizeBytes"`
 	LastModified time.Time `json:"lastModified"`
 	Path         string    `json:"path"`
@@ -124,14 +125,16 @@ type additionalInfo map[string]any
 type sourceMetadata map[string]any
 
 type album struct {
-	ID             int64            `json:"id"`
-	Title          string           `json:"title"`
-	CoverImagePath string           `json:"coverImagePath"`
-	AuthorIDs      []int64          `json:"authorIds"`
-	ReleaseDate    time.Time        `json:"releaseDate"`
-	IsPublished    bool             `json:"isPublished"`
-	TrackIDs       []int64          `json:"trackIds"`
-	AdditionalInfo []additionalInfo `json:"additionalInfo"`
+	ID                int64            `json:"id"`
+	Title             string           `json:"title"`
+	CoverImagePath    string           `json:"coverImagePath"`
+	AuthorIDs         []int64          `json:"authorIds"`
+	ReleaseDate       time.Time        `json:"releaseDate"`
+	IsPublished       bool             `json:"isPublished"`
+	TrackIDs          []int64          `json:"trackIds"`
+	AdditionalInfo    []additionalInfo `json:"additionalInfo"`
+	PublicationStatus string           `json:"publicationStatus"`
+	RequestedByUserID *int64           `json:"requestedByUserId,omitempty"`
 }
 
 type upsertAlbumRequest struct {
@@ -145,14 +148,16 @@ type upsertAlbumRequest struct {
 }
 
 type track struct {
-	ID             int64            `json:"id"`
-	Name           string           `json:"name"`
-	AuthorIDs      []int64          `json:"authorIds"`
-	AlbumID        int64            `json:"albumId"`
-	AudioFilePath  string           `json:"audioFilePath"`
-	AdditionalInfo []additionalInfo `json:"additionalInfo"`
-	SourceMetadata []sourceMetadata `json:"sourceMetadata"`
-	CreatedAt      time.Time        `json:"createdAt"`
+	ID                int64            `json:"id"`
+	Name              string           `json:"name"`
+	AuthorIDs         []int64          `json:"authorIds"`
+	AlbumID           int64            `json:"albumId"`
+	AudioFilePath     string           `json:"audioFilePath"`
+	AdditionalInfo    []additionalInfo `json:"additionalInfo"`
+	SourceMetadata    []sourceMetadata `json:"sourceMetadata"`
+	CreatedAt         time.Time        `json:"createdAt"`
+	PublicationStatus string           `json:"publicationStatus"`
+	RequestedByUserID *int64           `json:"requestedByUserId,omitempty"`
 }
 
 type lyrics struct {
@@ -283,9 +288,11 @@ type analyticsEventsResponse struct {
 }
 
 type author struct {
-	ID          int64    `json:"id"`
-	CurrentName string   `json:"currentName"`
-	Photos      []string `json:"photos"`
+	ID                int64    `json:"id"`
+	CurrentName       string   `json:"currentName"`
+	Photos            []string `json:"photos"`
+	PublicationStatus string   `json:"publicationStatus"`
+	RequestedByUserID *int64   `json:"requestedByUserId,omitempty"`
 }
 
 type upsertAuthorRequest struct {
@@ -339,19 +346,21 @@ type authResponse struct {
 }
 
 type trackResponse struct {
-	ID             int64            `json:"id"`
-	Name           string           `json:"name"`
-	AuthorIDs      []int64          `json:"authorIds"`
-	Authors        []author         `json:"authors,omitempty"`
-	AlbumID        int64            `json:"albumId"`
-	CoverImagePath string           `json:"coverImagePath,omitempty"`
-	AudioFilePath  string           `json:"audioFilePath"`
-	AdditionalInfo []additionalInfo `json:"additionalInfo"`
-	SourceMetadata []sourceMetadata `json:"sourceMetadata"`
-	CreatedAt      time.Time        `json:"createdAt"`
-	IsFavorite     bool             `json:"isFavorite"`
-	IsDisliked     bool             `json:"isDisliked"`
-	IsAvailable    bool             `json:"isAvailable"`
+	ID                int64            `json:"id"`
+	Name              string           `json:"name"`
+	AuthorIDs         []int64          `json:"authorIds"`
+	Authors           []author         `json:"authors,omitempty"`
+	AlbumID           int64            `json:"albumId"`
+	CoverImagePath    string           `json:"coverImagePath,omitempty"`
+	AudioFilePath     string           `json:"audioFilePath"`
+	AdditionalInfo    []additionalInfo `json:"additionalInfo"`
+	SourceMetadata    []sourceMetadata `json:"sourceMetadata"`
+	CreatedAt         time.Time        `json:"createdAt"`
+	IsFavorite        bool             `json:"isFavorite"`
+	IsDisliked        bool             `json:"isDisliked"`
+	IsAvailable       bool             `json:"isAvailable"`
+	PublicationStatus string           `json:"publicationStatus"`
+	RequestedByUserID *int64           `json:"requestedByUserId,omitempty"`
 }
 
 type playlistResponse struct {
@@ -396,6 +405,7 @@ type albumListFilter struct {
 	Query        string
 	IsPublished  *bool
 	IncludeEmpty bool
+	ViewerUserID int64
 }
 
 type playlistListFilter struct {
@@ -406,13 +416,14 @@ type playlistListFilter struct {
 }
 
 type trackListFilter struct {
-	Page     int
-	PageSize int
-	AuthorID int64
-	AlbumID  int64
-	Query    string
-	Sort     string
-	Order    string
+	Page         int
+	PageSize     int
+	AuthorID     int64
+	AlbumID      int64
+	Query        string
+	Sort         string
+	Order        string
+	ViewerUserID int64
 }
 
 type paginatedTracks struct {
@@ -668,6 +679,9 @@ func run() (runErr error) {
 		}
 	}()
 	store.songsDir = songsDir
+	if err := store.cleanupCatalogSubmissionAudio(); err != nil {
+		return fmt.Errorf("clean catalog submission audio staging: %w", err)
+	}
 	authorPopularityLocation, err := loadAuthorPopularityLocationFromEnv()
 	if err != nil {
 		return err
@@ -738,11 +752,28 @@ func run() (runErr error) {
 	mux.Handle("POST /api/tracks/", postTrackByRouteHandler(store, auth, lyricsSearchService))
 	mux.Handle("PUT /api/tracks/", putTrackByRouteHandler(store, auth))
 	mux.Handle("DELETE /api/tracks/", deleteTrackByRouteHandler(store, auth))
-	mux.HandleFunc("GET /api/authors", listAuthorsHandler(store))
+	mux.HandleFunc("GET /api/authors", listAuthorsHandler(store, auth))
 	mux.Handle("POST /api/authors", requirePermission(auth, store, permissionAuthorsCreate, createAuthorHandler(store)))
-	mux.HandleFunc("GET /api/authors/", getAuthorByIDHandler(store))
+	mux.HandleFunc("GET /api/authors/", getAuthorByIDHandler(store, auth))
 	mux.Handle("PUT /api/authors/", requirePermission(auth, store, permissionAuthorsUpdate, updateAuthorHandler(store)))
 	mux.Handle("DELETE /api/authors/", requirePermission(auth, store, permissionAuthorsDelete, deleteAuthorHandler(store)))
+	mux.Handle("GET /api/catalog-submissions", requirePermission(auth, store, permissionCatalogSubmissionsRead, listOwnCatalogSubmissionsHandler(store)))
+	mux.Handle("POST /api/catalog-submissions/audio", requirePermission(auth, store, permissionTracksSubmit, uploadCatalogSubmissionAudioHandler(store)))
+	mux.Handle("POST /api/catalog-submissions/authors", requirePermission(auth, store, permissionAuthorsSubmit, createAuthorSubmissionHandler(store)))
+	mux.Handle("POST /api/catalog-submissions/albums", requirePermission(auth, store, permissionAlbumsSubmit, createAlbumSubmissionHandler(store)))
+	mux.Handle("POST /api/catalog-submissions/tracks", requirePermission(auth, store, permissionTracksSubmit, createTrackSubmissionHandler(store)))
+	mux.Handle("PUT /api/catalog-submissions/authors/", requirePermission(auth, store, permissionCatalogSubmissionsUpdate, updateAuthorSubmissionHandler(store)))
+	mux.Handle("PUT /api/catalog-submissions/albums/", requirePermission(auth, store, permissionCatalogSubmissionsUpdate, updateAlbumSubmissionHandler(store)))
+	mux.Handle("PUT /api/catalog-submissions/tracks/", requirePermission(auth, store, permissionCatalogSubmissionsUpdate, updateTrackSubmissionByRouteHandler(store)))
+	mux.Handle("GET /api/catalog-submissions/tracks/", requireAuth(auth, store, serveCatalogSubmissionAudioHandler(store)))
+	mux.Handle("POST /api/catalog-submissions/", requirePermission(auth, store, permissionCatalogSubmissionsUpdate, resubmitCatalogSubmissionHandler(store)))
+	mux.Handle("DELETE /api/catalog-submissions/", requirePermission(auth, store, permissionCatalogSubmissionsCancel, cancelCatalogSubmissionHandler(store)))
+	mux.Handle("GET /api/catalog-reviews/requesters", requirePermission(auth, store, permissionCatalogSubmissionsReview, listCatalogReviewRequestersHandler(store)))
+	mux.Handle("GET /api/catalog-reviews/requesters/", requirePermission(auth, store, permissionCatalogSubmissionsReview, catalogReviewRequesterRouteHandler(store)))
+	mux.Handle("POST /api/catalog-reviews/requesters/", requirePermission(auth, store, permissionCatalogSubmissionsReview, catalogReviewRequesterRouteHandler(store)))
+	mux.Handle("PUT /api/catalog-reviews/requesters/", requirePermission(auth, store, permissionCatalogSubmissionsReview, catalogReviewRequesterRouteHandler(store)))
+	mux.Handle("DELETE /api/catalog-reviews/requesters/", requirePermission(auth, store, permissionCatalogSubmissionsReview, catalogReviewRequesterRouteHandler(store)))
+	mux.Handle("POST /api/catalog-reviews/submissions/", requirePermission(auth, store, permissionCatalogSubmissionsReview, catalogReviewDecisionRouteHandler(store)))
 	mux.HandleFunc("GET /api/author-photos/", getAuthorPhotoHandler(authorPhotosDir))
 	mux.Handle("POST /api/author-photos", requirePermission(auth, store, permissionAuthorPhotosUpload, uploadAuthorPhotoHandler(authorPhotosDir)))
 	mux.HandleFunc("POST /api/auth/register", registerHandler(store, auth))
@@ -984,7 +1015,7 @@ func withCORS(next http.Handler) http.Handler {
 			headers.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			headers.Set(
 				"Access-Control-Allow-Headers",
-				"Authorization, Content-Type",
+				"Authorization, Content-Type, X-Review-Lease",
 			)
 		}
 
@@ -1351,13 +1382,14 @@ func (s *domainState) createAlbum(req upsertAlbumRequest) (album, error) {
 		return album{}, err
 	}
 	a := album{
-		ID:             id,
-		Title:          strings.TrimSpace(req.Title),
-		CoverImagePath: strings.TrimSpace(req.CoverImagePath),
-		ReleaseDate:    req.ReleaseDate.UTC(),
-		IsPublished:    req.IsPublished,
-		TrackIDs:       normalizeTrackIDs(req.TrackIDs),
-		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
+		ID:                id,
+		Title:             strings.TrimSpace(req.Title),
+		CoverImagePath:    strings.TrimSpace(req.CoverImagePath),
+		ReleaseDate:       req.ReleaseDate.UTC(),
+		IsPublished:       req.IsPublished,
+		TrackIDs:          normalizeTrackIDs(req.TrackIDs),
+		AdditionalInfo:    normalizeAdditionalInfo(req.AdditionalInfo),
+		PublicationStatus: catalogPublicationPublished,
 	}
 	if err := s.validateAlbumLocked(a); err != nil {
 		return album{}, err
@@ -1403,13 +1435,15 @@ func (s *domainState) updateAlbum(id int64, req upsertAlbumRequest) (album, bool
 		return album{}, false, nil
 	}
 	updated := album{
-		ID:             id,
-		Title:          strings.TrimSpace(req.Title),
-		CoverImagePath: strings.TrimSpace(req.CoverImagePath),
-		ReleaseDate:    req.ReleaseDate.UTC(),
-		IsPublished:    req.IsPublished,
-		TrackIDs:       normalizeTrackIDs(req.TrackIDs),
-		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
+		ID:                id,
+		Title:             strings.TrimSpace(req.Title),
+		CoverImagePath:    strings.TrimSpace(req.CoverImagePath),
+		ReleaseDate:       req.ReleaseDate.UTC(),
+		IsPublished:       req.IsPublished,
+		TrackIDs:          normalizeTrackIDs(req.TrackIDs),
+		AdditionalInfo:    normalizeAdditionalInfo(req.AdditionalInfo),
+		PublicationStatus: current.PublicationStatus,
+		RequestedByUserID: current.RequestedByUserID,
 	}
 	if err := s.validateAlbumLocked(updated); err != nil {
 		return album{}, true, err
@@ -1480,14 +1514,15 @@ func (s *domainState) create(req upsertTrackRequest) (track, error) {
 		return track{}, err
 	}
 	t := track{
-		ID:             id,
-		Name:           strings.TrimSpace(req.Name),
-		AuthorIDs:      normalizeAuthorIDs(req.AuthorIDs),
-		AlbumID:        req.AlbumID,
-		AudioFilePath:  normalizeAudioFilePath(req.AudioFilePath),
-		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
-		SourceMetadata: normalizeSourceMetadata(req.SourceMetadata),
-		CreatedAt:      time.Now().UTC(),
+		ID:                id,
+		Name:              strings.TrimSpace(req.Name),
+		AuthorIDs:         normalizeAuthorIDs(req.AuthorIDs),
+		AlbumID:           req.AlbumID,
+		AudioFilePath:     normalizeAudioFilePath(req.AudioFilePath),
+		AdditionalInfo:    normalizeAdditionalInfo(req.AdditionalInfo),
+		SourceMetadata:    normalizeSourceMetadata(req.SourceMetadata),
+		CreatedAt:         time.Now().UTC(),
+		PublicationStatus: catalogPublicationPublished,
 	}
 	if err := s.validateTrackLocked(t); err != nil {
 		return track{}, err
@@ -1527,14 +1562,16 @@ func (s *domainState) update(id int64, req upsertTrackRequest) (track, bool, err
 	}
 
 	updated := track{
-		ID:             id,
-		Name:           strings.TrimSpace(req.Name),
-		AuthorIDs:      normalizeAuthorIDs(req.AuthorIDs),
-		AlbumID:        req.AlbumID,
-		AudioFilePath:  normalizeAudioFilePath(req.AudioFilePath),
-		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
-		SourceMetadata: normalizeSourceMetadata(req.SourceMetadata),
-		CreatedAt:      current.CreatedAt,
+		ID:                id,
+		Name:              strings.TrimSpace(req.Name),
+		AuthorIDs:         normalizeAuthorIDs(req.AuthorIDs),
+		AlbumID:           req.AlbumID,
+		AudioFilePath:     normalizeAudioFilePath(req.AudioFilePath),
+		AdditionalInfo:    normalizeAdditionalInfo(req.AdditionalInfo),
+		SourceMetadata:    normalizeSourceMetadata(req.SourceMetadata),
+		CreatedAt:         current.CreatedAt,
+		PublicationStatus: current.PublicationStatus,
+		RequestedByUserID: current.RequestedByUserID,
 	}
 	if err := s.validateTrackLocked(updated); err != nil {
 		return track{}, true, err
@@ -1927,7 +1964,8 @@ func (s *domainState) addTrackToPlaylists(userID, trackID int64, playlistIDs []i
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.tracks[trackID]; !ok {
+	trackItem, ok := s.tracks[trackID]
+	if !ok || !catalogEntityVisible(trackItem.PublicationStatus, trackItem.RequestedByUserID, userID) {
 		return errTrackNotFound
 	}
 	if len(playlistIDs) == 0 {
@@ -1995,7 +2033,8 @@ func (s *domainState) setTrackPreference(userID, trackID int64, kind string, ena
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.tracks[trackID]; !ok {
+	trackItem, ok := s.tracks[trackID]
+	if !ok || !catalogEntityVisible(trackItem.PublicationStatus, trackItem.RequestedByUserID, userID) {
 		return errTrackNotFound
 	}
 	if kind != playlistKindFavorites && kind != playlistKindDislikes {
@@ -2057,15 +2096,18 @@ func (s *domainState) nextAutoplayTracks(userID int64, req autoplayNextRequest) 
 			return autoplayNextResponse{}, errPlaylistNotFound
 		}
 	case autoplaySourceAlbum:
-		if _, ok := s.albums[*req.SourceID]; !ok {
+		item, ok := s.albums[*req.SourceID]
+		if !ok || !catalogEntityVisible(item.PublicationStatus, item.RequestedByUserID, userID) {
 			return autoplayNextResponse{}, errAlbumNotFound
 		}
 	case autoplaySourceTrack:
-		if _, ok := s.tracks[*req.SourceID]; !ok {
+		item, ok := s.tracks[*req.SourceID]
+		if !ok || !catalogEntityVisible(item.PublicationStatus, item.RequestedByUserID, userID) {
 			return autoplayNextResponse{}, errTrackNotFound
 		}
 	case autoplaySourceAuthor:
-		if _, ok := s.authors[*req.SourceID]; !ok {
+		item, ok := s.authors[*req.SourceID]
+		if !ok || !catalogEntityVisible(item.PublicationStatus, item.RequestedByUserID, userID) {
 			return autoplayNextResponse{}, errAuthorNotFound
 		}
 	default:
@@ -2079,6 +2121,9 @@ func (s *domainState) nextAutoplayTracks(userID int64, req autoplayNextRequest) 
 
 	candidates := make([]track, 0, len(s.tracks))
 	for _, t := range s.tracks {
+		if !catalogEntityVisible(t.PublicationStatus, t.RequestedByUserID, userID) {
+			continue
+		}
 		if _, skip := excluded[t.ID]; skip {
 			continue
 		}
@@ -2117,7 +2162,7 @@ func (s *domainState) nextAuthorAutoplayTracksLocked(
 	albums := make([]album, 0, len(s.albums))
 	now := time.Now().UTC()
 	for _, albumItem := range s.albums {
-		if !albumItem.IsPublished || albumItem.ReleaseDate.After(now) {
+		if !catalogEntityVisible(albumItem.PublicationStatus, albumItem.RequestedByUserID, userID) || !albumItem.IsPublished || albumItem.ReleaseDate.After(now) {
 			continue
 		}
 		albums = append(albums, albumItem)
@@ -2140,7 +2185,7 @@ func (s *domainState) nextAuthorAutoplayTracksLocked(
 				continue
 			}
 			trackItem, ok := s.tracks[trackID]
-			if !ok || trackItem.AlbumID != albumItem.ID || !containsInt64(trackItem.AuthorIDs, authorID) {
+			if !ok || !catalogEntityVisible(trackItem.PublicationStatus, trackItem.RequestedByUserID, userID) || trackItem.AlbumID != albumItem.ID || !containsInt64(trackItem.AuthorIDs, authorID) {
 				continue
 			}
 			playable, err := s.isTrackAutomaticallyPlayableLocked(trackItem)
@@ -2233,7 +2278,7 @@ func (s *domainState) listAuthors(filter authorListFilter) ([]author, error) {
 	seen := make(map[int64]struct{}, len(rankedAuthorIDs))
 	for _, authorID := range rankedAuthorIDs {
 		authorItem, exists := s.authors[authorID]
-		if !exists {
+		if !exists || !catalogEntityVisible(authorItem.PublicationStatus, authorItem.RequestedByUserID, filter.ViewerUserID) {
 			continue
 		}
 		items = append(items, cloneAuthor(authorItem))
@@ -2243,6 +2288,9 @@ func (s *domainState) listAuthors(filter authorListFilter) ([]author, error) {
 	unranked := make([]author, 0, len(s.authors)-len(items))
 	for authorID, authorItem := range s.authors {
 		if _, exists := seen[authorID]; exists {
+			continue
+		}
+		if !catalogEntityVisible(authorItem.PublicationStatus, authorItem.RequestedByUserID, filter.ViewerUserID) {
 			continue
 		}
 		unranked = append(unranked, cloneAuthor(authorItem))
@@ -2373,9 +2421,10 @@ func (s *domainState) createAuthor(req upsertAuthorRequest) (author, error) {
 		return author{}, err
 	}
 	a := author{
-		ID:          id,
-		CurrentName: strings.TrimSpace(req.CurrentName),
-		Photos:      normalizePhotos(req.Photos),
+		ID:                id,
+		CurrentName:       strings.TrimSpace(req.CurrentName),
+		Photos:            normalizePhotos(req.Photos),
+		PublicationStatus: catalogPublicationPublished,
 	}
 	if err := validateAuthor(a); err != nil {
 		return author{}, err
@@ -2471,15 +2520,17 @@ func (s *domainState) updateAuthor(id int64, req upsertAuthorRequest) (author, b
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, ok := s.authors[id]
+	current, ok := s.authors[id]
 	if !ok {
 		return author{}, false, nil
 	}
 
 	a := author{
-		ID:          id,
-		CurrentName: strings.TrimSpace(req.CurrentName),
-		Photos:      normalizePhotos(req.Photos),
+		ID:                id,
+		CurrentName:       strings.TrimSpace(req.CurrentName),
+		Photos:            normalizePhotos(req.Photos),
+		PublicationStatus: current.PublicationStatus,
+		RequestedByUserID: current.RequestedByUserID,
 	}
 	if err := validateAuthor(a); err != nil {
 		return author{}, true, err
@@ -3132,6 +3183,7 @@ func uploadMediaFile(w http.ResponseWriter, r *http.Request, dir, createFailureM
 	if err != nil {
 		return albumCoverInfo{}, err
 	}
+	originalName := name
 	if urlPrefix == "/api/songs/" {
 		songsMutationMu.Lock()
 		defer songsMutationMu.Unlock()
@@ -3194,6 +3246,7 @@ func uploadMediaFile(w http.ResponseWriter, r *http.Request, dir, createFailureM
 	uploadSucceeded = true
 	return albumCoverInfo{
 		Name:         name,
+		OriginalName: originalName,
 		SizeBytes:    info.Size(),
 		LastModified: info.ModTime(),
 		Path:         path,
@@ -3275,9 +3328,10 @@ func listAlbumsHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 			return
 		}
 		filter.IncludeEmpty = false
+		filter.ViewerUserID = optionalUserIDFromRequest(r, auth)
 		if auth != nil {
-			userID, err := auth.authenticateRequest(r)
-			if err == nil {
+			userID := filter.ViewerUserID
+			if userID > 0 {
 				setSentryUser(r.Context(), userID)
 				allowed, err := store.userHasPermission(userID, permissionCatalogUnpublishedRead)
 				if err != nil {
@@ -3308,6 +3362,10 @@ func createAlbumHandler(store *trackStore) http.HandlerFunc {
 
 		a, err := store.createAlbum(req)
 		if err != nil {
+			if errors.Is(err, errCatalogSubmissionState) {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
 			if errors.Is(err, errInvalidAlbum) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -3325,18 +3383,22 @@ func getAlbumByRouteHandler(store *trackStore, auth *authManager) http.HandlerFu
 			getAlbumTracksHandler(store, auth).ServeHTTP(w, r)
 			return
 		}
-		getAlbumByIDHandler(store).ServeHTTP(w, r)
+		getAlbumByIDHandler(store, auth).ServeHTTP(w, r)
 	}
 }
 
-func getAlbumByIDHandler(store *trackStore) http.HandlerFunc {
+func getAlbumByIDHandler(store *trackStore, authManagers ...*authManager) http.HandlerFunc {
+	var auth *authManager
+	if len(authManagers) > 0 {
+		auth = authManagers[0]
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := parseAlbumID(r.URL.Path)
 		if err != nil {
 			http.Error(w, "invalid album id", http.StatusBadRequest)
 			return
 		}
-		a, ok, err := store.getAlbum(id)
+		a, ok, err := store.getVisibleAlbum(id, optionalUserIDFromRequest(r, auth))
 		if err != nil {
 			writeSentryInternalError(w, r, err, "failed to get album", "database", "albums.get")
 			return
@@ -3383,6 +3445,10 @@ func updateAlbumByRouteHandler(store *trackStore) http.HandlerFunc {
 		}
 		a, exists, err := store.updateAlbum(id, req)
 		if err != nil {
+			if errors.Is(err, errCatalogSubmissionState) {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
 			if errors.Is(err, errInvalidAlbum) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -3407,7 +3473,7 @@ func deleteAlbumByRouteHandler(store *trackStore) http.HandlerFunc {
 		}
 		deleted, err := store.deleteAlbum(id)
 		if err != nil {
-			if errors.Is(err, errAlbumInUse) {
+			if errors.Is(err, errAlbumInUse) || errors.Is(err, errCatalogSubmissionState) {
 				http.Error(w, err.Error(), http.StatusConflict)
 				return
 			}
@@ -3833,6 +3899,10 @@ func createTrackHandler(store *trackStore) http.HandlerFunc {
 
 		t, err := store.create(req)
 		if err != nil {
+			if errors.Is(err, errCatalogSubmissionState) {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
 			if errors.Is(err, errInvalidTrack) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -3852,7 +3922,7 @@ func createTrackHandler(store *trackStore) http.HandlerFunc {
 func getTrackByRouteHandler(store *trackStore, auth *authManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/lyrics") {
-			getTrackLyricsHandler(store).ServeHTTP(w, r)
+			getVisibleTrackLyricsHandler(store, auth).ServeHTTP(w, r)
 			return
 		}
 		getTrackByIDHandler(store, auth).ServeHTTP(w, r)
@@ -3895,6 +3965,10 @@ func updateTrackHandler(store *trackStore) http.HandlerFunc {
 
 		t, exists, err := store.update(id, req)
 		if err != nil {
+			if errors.Is(err, errCatalogSubmissionState) {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
 			if errors.Is(err, errInvalidTrack) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -3925,6 +3999,10 @@ func deleteTrackHandler(store *trackStore) http.HandlerFunc {
 
 		deleted, err := store.delete(id)
 		if err != nil {
+			if errors.Is(err, errCatalogSubmissionState) {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
 			writeSentryInternalError(w, r, err, "failed to delete track", "database", "tracks.delete")
 			return
 		}
@@ -4177,13 +4255,18 @@ func analyticsEventsHandler(store *trackStore, auth *authManager) http.HandlerFu
 	}
 }
 
-func listAuthorsHandler(store *trackStore) http.HandlerFunc {
+func listAuthorsHandler(store *trackStore, authManagers ...*authManager) http.HandlerFunc {
+	var auth *authManager
+	if len(authManagers) > 0 {
+		auth = authManagers[0]
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		filter, err := parseAuthorListFilter(r.URL.Query())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		filter.ViewerUserID = optionalUserIDFromRequest(r, auth)
 		items, err := store.listAuthors(filter)
 		if err != nil {
 			writeSentryInternalError(w, r, err, "failed to list authors", "database", "authors.list")
@@ -4243,14 +4326,18 @@ func createAuthorHandler(store *trackStore) http.HandlerFunc {
 	}
 }
 
-func getAuthorByIDHandler(store *trackStore) http.HandlerFunc {
+func getAuthorByIDHandler(store *trackStore, authManagers ...*authManager) http.HandlerFunc {
+	var auth *authManager
+	if len(authManagers) > 0 {
+		auth = authManagers[0]
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := parseAuthorID(r.URL.Path)
 		if err != nil {
 			http.Error(w, "invalid author id", http.StatusBadRequest)
 			return
 		}
-		a, ok, err := store.getAuthor(id)
+		a, ok, err := store.getVisibleAuthor(id, optionalUserIDFromRequest(r, auth))
 		if err != nil {
 			writeSentryInternalError(w, r, err, "failed to get author", "database", "authors.get")
 			return
@@ -4279,6 +4366,10 @@ func updateAuthorHandler(store *trackStore) http.HandlerFunc {
 
 		a, exists, err := store.updateAuthor(id, req)
 		if err != nil {
+			if errors.Is(err, errCatalogSubmissionState) {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
 			if errors.Is(err, errInvalidAuthor) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -4304,7 +4395,7 @@ func deleteAuthorHandler(store *trackStore) http.HandlerFunc {
 
 		deleted, err := store.deleteAuthor(id)
 		if err != nil {
-			if errors.Is(err, errAuthorInUse) {
+			if errors.Is(err, errAuthorInUse) || errors.Is(err, errCatalogSubmissionState) {
 				http.Error(w, err.Error(), http.StatusConflict)
 				return
 			}
@@ -6198,17 +6289,19 @@ func subtractTrackIDs(left, right []int64) []int64 {
 
 func toTrackResponse(t track, isFavorite, isAvailable bool) trackResponse {
 	return trackResponse{
-		ID:             t.ID,
-		Name:           t.Name,
-		AuthorIDs:      append([]int64(nil), t.AuthorIDs...),
-		AlbumID:        t.AlbumID,
-		AudioFilePath:  normalizeAudioFilePath(t.AudioFilePath),
-		AdditionalInfo: normalizeAdditionalInfo(t.AdditionalInfo),
-		SourceMetadata: normalizeSourceMetadata(t.SourceMetadata),
-		CreatedAt:      t.CreatedAt,
-		IsFavorite:     isFavorite,
-		IsDisliked:     false,
-		IsAvailable:    isAvailable,
+		ID:                t.ID,
+		Name:              t.Name,
+		AuthorIDs:         append([]int64(nil), t.AuthorIDs...),
+		AlbumID:           t.AlbumID,
+		AudioFilePath:     normalizeAudioFilePath(t.AudioFilePath),
+		AdditionalInfo:    normalizeAdditionalInfo(t.AdditionalInfo),
+		SourceMetadata:    normalizeSourceMetadata(t.SourceMetadata),
+		CreatedAt:         t.CreatedAt,
+		IsFavorite:        isFavorite,
+		IsDisliked:        false,
+		IsAvailable:       isAvailable,
+		PublicationStatus: normalizePublicationStatus(t.PublicationStatus),
+		RequestedByUserID: t.RequestedByUserID,
 	}
 }
 
