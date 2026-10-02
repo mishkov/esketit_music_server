@@ -26,44 +26,56 @@ func listOwnCatalogSubmissionsHandler(store *trackStore) http.HandlerFunc {
 	}
 }
 
-func createAuthorSubmissionHandler(store *trackStore) http.HandlerFunc {
+func createAuthorSubmissionHandler(store *trackStore, authorPhotosDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, ok := userIDFromContext(r.Context())
 		if !ok {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
-		request, err := decodeUpsertAuthorRequest(r)
+		var request upsertAuthorRequest
+		paths, cleanup, err := decodeCatalogImageSubmission(w, r, &request, authorPhotosDir, "photos", "/api/author-photos/", maxSubmissionAuthorPhotos)
+		committed := false
+		defer func() { cleanup(committed) }()
 		if err != nil {
-			writeRequestDecodeError(w, err)
+			writeCatalogSubmissionImageError(w, r, err)
 			return
 		}
+		request.Photos = paths
 		result, err := store.createAuthorSubmission(userID, request)
 		if err != nil {
 			writeCatalogSubmissionError(w, r, err, "catalog_submissions.authors.create")
 			return
 		}
+		committed = true
 		writeJSON(w, http.StatusCreated, result)
 	}
 }
 
-func createAlbumSubmissionHandler(store *trackStore) http.HandlerFunc {
+func createAlbumSubmissionHandler(store *trackStore, albumCoversDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, ok := userIDFromContext(r.Context())
 		if !ok {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
-		request, err := decodeUpsertAlbumRequest(r)
+		var request upsertAlbumRequest
+		paths, cleanup, err := decodeCatalogImageSubmission(w, r, &request, albumCoversDir, "cover", "/api/album-covers/", 1)
+		committed := false
+		defer func() { cleanup(committed) }()
 		if err != nil {
-			writeRequestDecodeError(w, err)
+			writeCatalogSubmissionImageError(w, r, err)
 			return
+		}
+		if len(paths) != 0 {
+			request.CoverImagePath = paths[0]
 		}
 		result, err := store.createAlbumSubmission(userID, request)
 		if err != nil {
 			writeCatalogSubmissionError(w, r, err, "catalog_submissions.albums.create")
 			return
 		}
+		committed = true
 		writeJSON(w, http.StatusCreated, result)
 	}
 }
@@ -89,7 +101,7 @@ func createTrackSubmissionHandler(store *trackStore) http.HandlerFunc {
 	}
 }
 
-func updateAuthorSubmissionHandler(store *trackStore) http.HandlerFunc {
+func updateAuthorSubmissionHandler(store *trackStore, authorPhotosDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, ok := userIDFromContext(r.Context())
 		if !ok {
@@ -101,21 +113,26 @@ func updateAuthorSubmissionHandler(store *trackStore) http.HandlerFunc {
 			http.Error(w, "invalid author id", http.StatusBadRequest)
 			return
 		}
-		request, err := decodeUpsertAuthorRequest(r)
+		var request upsertAuthorRequest
+		paths, cleanup, err := decodeCatalogImageSubmission(w, r, &request, authorPhotosDir, "photos", "/api/author-photos/", maxSubmissionAuthorPhotos)
+		committed := false
+		defer func() { cleanup(committed) }()
 		if err != nil {
-			writeRequestDecodeError(w, err)
+			writeCatalogSubmissionImageError(w, r, err)
 			return
 		}
+		request.Photos = paths
 		result, err := store.updateAuthorSubmission(userID, entityID, request)
 		if err != nil {
 			writeCatalogSubmissionError(w, r, err, "catalog_submissions.authors.update")
 			return
 		}
+		committed = true
 		writeJSON(w, http.StatusOK, result)
 	}
 }
 
-func updateAlbumSubmissionHandler(store *trackStore) http.HandlerFunc {
+func updateAlbumSubmissionHandler(store *trackStore, albumCoversDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, ok := userIDFromContext(r.Context())
 		if !ok {
@@ -127,16 +144,23 @@ func updateAlbumSubmissionHandler(store *trackStore) http.HandlerFunc {
 			http.Error(w, "invalid album id", http.StatusBadRequest)
 			return
 		}
-		request, err := decodeUpsertAlbumRequest(r)
+		var request upsertAlbumRequest
+		paths, cleanup, err := decodeCatalogImageSubmission(w, r, &request, albumCoversDir, "cover", "/api/album-covers/", 1)
+		committed := false
+		defer func() { cleanup(committed) }()
 		if err != nil {
-			writeRequestDecodeError(w, err)
+			writeCatalogSubmissionImageError(w, r, err)
 			return
+		}
+		if len(paths) != 0 {
+			request.CoverImagePath = paths[0]
 		}
 		result, err := store.updateAlbumSubmission(userID, entityID, request)
 		if err != nil {
 			writeCatalogSubmissionError(w, r, err, "catalog_submissions.albums.update")
 			return
 		}
+		committed = true
 		writeJSON(w, http.StatusOK, result)
 	}
 }

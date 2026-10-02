@@ -81,7 +81,7 @@ paths:
                 $ref: '#/components/schemas/AuthResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '409'
+        '409':
           description: Email already exists
           content:
             text/plain:
@@ -2264,7 +2264,7 @@ paths:
     post:
       tags: [Catalog Submissions]
       summary: Submit a new author
-      description: Requires `authors.submit`. The author is immediately visible only to its requester until approval.
+      description: Requires `authors.submit`. The author is immediately visible only to its requester until approval. Images are optional and must be uploaded as multipart files (`photos` for authors, `cover` for albums), with a `metadata` JSON form field. Image URLs and paths are rejected. JPEG, PNG, and GIF files are supported, with a 10 MiB limit per file, 32 MiB per request, and maximum dimensions of 4096 by 4096 pixels. Uploaded images are re-encoded; GIFs become static PNGs. JSON requests support metadata only.
       security:
         - bearerAuth: []
       requestBody:
@@ -2272,7 +2272,26 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/UpsertAuthorRequest'
+              $ref: '#/components/schemas/AuthorSubmissionMetadata'
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [metadata]
+              properties:
+                metadata:
+                  $ref: '#/components/schemas/AuthorSubmissionMetadata'
+                photos:
+                  type: array
+                  maxItems: 10
+                  items:
+                    type: string
+                    format: binary
+            encoding:
+              metadata:
+                contentType: application/json
+              photos:
+                contentType: image/jpeg, image/png, image/gif
       responses:
         '201':
           description: Created author submission
@@ -2288,12 +2307,16 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /api/catalog-submissions/authors/{id}:
     put:
       tags: [Catalog Submissions]
       summary: Edit an author after changes were requested
-      description: Requires `catalog_submissions.update_own`. This does not resubmit the author automatically.
+      description: Requires `catalog_submissions.update_own`. This does not resubmit the author automatically. Images are optional and must be uploaded as multipart files (`photos` for authors, `cover` for albums), with a `metadata` JSON form field. Image URLs and paths are rejected. JPEG, PNG, and GIF files are supported, with a 10 MiB limit per file, 32 MiB per request, and maximum dimensions of 4096 by 4096 pixels. Uploaded images are re-encoded; GIFs become static PNGs. JSON requests support metadata only. Omitting image files preserves existing images; supplied files replace them.
       security:
         - bearerAuth: []
       parameters:
@@ -2303,7 +2326,26 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/UpsertAuthorRequest'
+              $ref: '#/components/schemas/AuthorSubmissionMetadata'
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [metadata]
+              properties:
+                metadata:
+                  $ref: '#/components/schemas/AuthorSubmissionMetadata'
+                photos:
+                  type: array
+                  maxItems: 10
+                  items:
+                    type: string
+                    format: binary
+            encoding:
+              metadata:
+                contentType: application/json
+              photos:
+                contentType: image/jpeg, image/png, image/gif
       responses:
         '200':
           description: Updated submission
@@ -2321,12 +2363,16 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /api/catalog-submissions/albums:
     post:
       tags: [Catalog Submissions]
       summary: Submit a new album
-      description: Requires `albums.submit`. `trackIds` must be empty; `authorIds` may reference published authors or the requester's pending authors.
+      description: Requires `albums.submit`. `trackIds` must be empty; `authorIds` may reference published authors or the requester's pending authors. Images are optional and must be uploaded as multipart files (`photos` for authors, `cover` for albums), with a `metadata` JSON form field. Image URLs and paths are rejected. JPEG, PNG, and GIF files are supported, with a 10 MiB limit per file, 32 MiB per request, and maximum dimensions of 4096 by 4096 pixels. Uploaded images are re-encoded; GIFs become static PNGs. JSON requests support metadata only.
       security:
         - bearerAuth: []
       requestBody:
@@ -2334,7 +2380,23 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/UpsertAlbumRequest'
+              $ref: '#/components/schemas/AlbumSubmissionMetadata'
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [metadata]
+              properties:
+                metadata:
+                  $ref: '#/components/schemas/AlbumSubmissionMetadata'
+                cover:
+                  type: string
+                  format: binary
+            encoding:
+              metadata:
+                contentType: application/json
+              cover:
+                contentType: image/jpeg, image/png, image/gif
       responses:
         '201':
           description: Created album submission
@@ -2350,12 +2412,16 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /api/catalog-submissions/albums/{id}:
     put:
       tags: [Catalog Submissions]
       summary: Edit an album after changes were requested
-      description: Requires `catalog_submissions.update_own`. Existing track membership is preserved and the album is not resubmitted automatically.
+      description: Requires `catalog_submissions.update_own`. Existing track membership is preserved and the album is not resubmitted automatically. Images are optional and must be uploaded as multipart files (`photos` for authors, `cover` for albums), with a `metadata` JSON form field. Image URLs and paths are rejected. JPEG, PNG, and GIF files are supported, with a 10 MiB limit per file, 32 MiB per request, and maximum dimensions of 4096 by 4096 pixels. Uploaded images are re-encoded; GIFs become static PNGs. JSON requests support metadata only. Omitting image files preserves existing images; supplied files replace them.
       security:
         - bearerAuth: []
       parameters:
@@ -2365,7 +2431,23 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/UpsertAlbumRequest'
+              $ref: '#/components/schemas/AlbumSubmissionMetadata'
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [metadata]
+              properties:
+                metadata:
+                  $ref: '#/components/schemas/AlbumSubmissionMetadata'
+                cover:
+                  type: string
+                  format: binary
+            encoding:
+              metadata:
+                contentType: application/json
+              cover:
+                contentType: image/jpeg, image/png, image/gif
       responses:
         '200':
           description: Updated submission
@@ -2383,6 +2465,10 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /api/catalog-submissions/tracks:
     post:
@@ -3555,6 +3641,49 @@ components:
           minimum: 1
           nullable: true
       required: [id, currentName, photos, publicationStatus]
+
+    AuthorSubmissionMetadata:
+      type: object
+      additionalProperties: false
+      description: Author submission metadata. Image references are not accepted; upload photos as multipart file parts.
+      required: [currentName]
+      properties:
+        currentName:
+          type: string
+          minLength: 1
+
+    AlbumSubmissionMetadata:
+      type: object
+      additionalProperties: false
+      description: Album submission metadata. Image references are not accepted; upload the cover as a multipart file part.
+      required: [title, releaseDate, isPublished]
+      properties:
+        title:
+          type: string
+          minLength: 1
+        authorIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+          description: Published authors or pending authors owned by the requester.
+        releaseDate:
+          type: string
+          format: date-time
+        isPublished:
+          type: boolean
+        trackIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+          description: Must be empty for new submissions. Existing membership is preserved on edits.
+        additionalInfo:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdditionalInfo'
 
     UpsertAuthorRequest:
       type: object

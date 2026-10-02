@@ -459,6 +459,13 @@ func (s *trackStore) updateAuthorSubmission(requesterUserID, authorID int64, req
 		if err := validateSubmissionEditable(submission); err != nil {
 			return err
 		}
+		if request.Photos == nil {
+			current, exists := state.authors[authorID]
+			if !exists {
+				return errCatalogSubmissionNotFound
+			}
+			request.Photos = append([]string(nil), current.Photos...)
+		}
 		item, found, err := state.updateAuthor(authorID, request)
 		if err != nil {
 			return err
@@ -494,6 +501,9 @@ func (s *trackStore) updateAlbumSubmission(requesterUserID, albumID int64, reque
 		current, exists := state.albums[albumID]
 		if !exists {
 			return errCatalogSubmissionNotFound
+		}
+		if request.CoverImagePath == "" {
+			request.CoverImagePath = current.CoverImagePath
 		}
 		request.TrackIDs = append([]int64(nil), current.TrackIDs...)
 		item, found, err := state.updateAlbum(albumID, request)
