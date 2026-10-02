@@ -68,12 +68,12 @@ operations only mutate published rows. Pending rows are created and changed
 through the submission service, so review state cannot be bypassed accidentally.
 
 `catalog_submissions` is the durable workflow record. It retains the latest
-entity snapshot after rejection or cancellation removes the live catalog row.
-Feedback and import-rating changes are append-only rows. A track approval
-publishes its requester-owned pending author and album dependencies in the same
-database transaction, then records the +10 approval event and optional +5
-lyrics event. Review penalties are explicit negative events and default to
-zero.
+entity snapshot after rejection or cancellation. Rejected authors and albums
+that are still referenced remain as hidden `rejected` rows; dependent tracks
+cannot receive review decisions. Feedback and import-rating changes are
+append-only rows. Authors and albums must be approved before dependent tracks.
+A track approval records the +10 approval event and optional +5 lyrics event.
+Review penalties are explicit negative events and default to zero.
 
 Review ownership is stored in `catalog_review_leases`, not process memory. A
 unique requester and unique reviewer constraint guarantee that two reviewers

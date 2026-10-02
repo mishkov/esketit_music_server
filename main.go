@@ -61,6 +61,7 @@ const (
 	roleListener                    = "listener"
 	logModeVerbose                  = "verbose"
 	logModeErrorOnly                = "error-only"
+	maxLoggedBodySize               = 64 << 10
 	playlistVisibilityPrivate       = "private"
 	playlistVisibilityPublic        = "public"
 	playlistVisibilityShared        = "shared"
@@ -471,6 +472,7 @@ type loggingResponseWriter struct {
 	wroteHeader bool
 	bytes       int
 	request     *http.Request
+	body        *loggedBody
 }
 
 func (w *loggingResponseWriter) Unwrap() http.ResponseWriter {
@@ -492,6 +494,9 @@ func (w *loggingResponseWriter) Write(p []byte) (int, error) {
 	}
 	n, err := w.ResponseWriter.Write(p)
 	w.bytes += n
+	if w.body != nil {
+		_, _ = w.body.Write(p[:n])
+	}
 	if err != nil && w.request != nil {
 		w.reportResponseError(fmt.Errorf("write HTTP response: %w", err), "write_response")
 	}
@@ -699,6 +704,7 @@ func run() (runErr error) {
 
 	auth := newAuthManager([]byte(authSecret), defaultAccessTokenTTL, defaultRefreshTokenTTL)
 	logMode := resolveLogMode(os.Getenv("LOG_MODE"))
+	logBodies := resolveLogBodies(os.Getenv("LOG_BODIES"))
 	albumCoverService := newAlbumCoverServiceFromEnv(albumCoversDir)
 	lyricsSearchService := newLyricsSearchServiceFromEnv()
 	telegramConfig, err := loadTelegramConfig(telegramStateDir, telegramImportTempDir)
@@ -815,10 +821,10 @@ func run() (runErr error) {
 	addr := ":8080"
 	log.Printf("server listening on %s", addr)
 	log.Print("media, database, and integration storage configured")
-	log.Printf("http logging mode %s", logMode)
+	log.Printf("http logging mode %s log_bodies=%t", logMode, logBodies)
 	log.Printf("swagger docs available at http://localhost%s/api/docs", addr)
 	log.Printf("redoc available at http://localhost%s/api/redoc", addr)
-	handler := buildHTTPHandler(mux, logMode, sentryEnabled)
+	handler := buildHTTPHandler(mux, logMode, sentryEnabled, logBodies)
 	shutdownContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 	go runAuthorPopularityScheduler(shutdownContext, store, authorPopularityLocation)
@@ -837,9 +843,9 @@ func run() (runErr error) {
 	return serveHTTP(shutdownContext, server, gracefulShutdownTimeout)
 }
 
-func buildHTTPHandler(next http.Handler, logMode string, sentryEnabled bool) http.Handler {
+func buildHTTPHandler(next http.Handler, logMode string, sentryEnabled, logBodies bool) http.Handler {
 	next = withCORS(next)
-	next = withRequestLogging(next, logMode)
+	next = withRequestLogging(next, logMode, logBodies)
 	next = withRecovery(next)
 	if sentryEnabled {
 		next = withSentry(next)
@@ -1046,7 +1052,7 @@ func withRecovery(next http.Handler) http.Handler {
 	})
 }
 
-func withRequestLogging(next http.Handler, mode string) http.Handler {
+func withRequestLogging(next http.Handler, mode string, logBodies bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r = withSentryRequestCaptureState(r)
 		start := time.Now()
@@ -1056,12 +1062,24 @@ func withRequestLogging(next http.Handler, mode string) http.Handler {
 			status:         http.StatusOK,
 			request:        r,
 		}
+		var requestBody loggedBody
+		if logBodies {
+			if r.Body != nil {
+				r.Body = &loggingRequestBody{ReadCloser: r.Body, body: &requestBody}
+			}
+			lw.body = &loggedBody{}
+		}
 
 		next.ServeHTTP(lw, r)
 		captureUnhandledHTTPStatus(r, lw.status)
 
 		if mode == logModeErrorOnly && lw.status < http.StatusInternalServerError {
 			return
+		}
+		requestBodyText, responseBodyText := "[body omitted for privacy]", "[body omitted for privacy]"
+		if logBodies {
+			requestBodyText = requestBody.String()
+			responseBodyText = lw.body.String()
 		}
 
 		log.Printf(
@@ -1071,11 +1089,47 @@ func withRequestLogging(next http.Handler, mode string) http.Handler {
 			lw.status,
 			time.Since(start).Round(time.Millisecond),
 			r.ContentLength,
-			"[body omitted for privacy]",
+			requestBodyText,
 			lw.bytes,
-			"[body omitted for privacy]",
+			responseBodyText,
 		)
 	})
+}
+
+// loggedBody retains a bounded preview without buffering entire uploads or streams.
+type loggedBody struct {
+	data      []byte
+	truncated bool
+}
+
+func (b *loggedBody) Write(p []byte) (int, error) {
+	n := len(p)
+	remaining := maxLoggedBodySize - len(b.data)
+	if len(p) > remaining {
+		p = p[:remaining]
+		b.truncated = true
+	}
+	b.data = append(b.data, p...)
+	return n, nil
+}
+
+func (b *loggedBody) String() string {
+	value := string(b.data)
+	if b.truncated {
+		value += " [truncated]"
+	}
+	return value
+}
+
+type loggingRequestBody struct {
+	io.ReadCloser
+	body *loggedBody
+}
+
+func (b *loggingRequestBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	_, _ = b.body.Write(p[:n])
+	return n, err
 }
 
 func redactRequestTarget(target string) string {
@@ -1099,6 +1153,19 @@ func resolveLogMode(value string) string {
 		log.Printf("unknown LOG_MODE=%q, defaulting to %s", value, logModeErrorOnly)
 		return logModeErrorOnly
 	}
+}
+
+func resolveLogBodies(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	enabled, err := strconv.ParseBool(value)
+	if err != nil {
+		log.Print("invalid LOG_BODIES value, defaulting to false")
+		return false
+	}
+	return enabled
 }
 
 func loadDotEnv(path string) (returnErr error) {

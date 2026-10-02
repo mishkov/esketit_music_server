@@ -50,7 +50,7 @@ func TestBuildHTTPHandlerCapturesPanicWithSentry(t *testing.T) {
 		sawRequestHub = sentry.GetHubFromContext(r.Context()) != nil
 		panic("boom")
 	})
-	handler := buildHTTPHandler(panicHandler, logModeErrorOnly, true)
+	handler := buildHTTPHandler(panicHandler, logModeErrorOnly, true, false)
 	req := httptest.NewRequest(http.MethodGet, "/panic", nil)
 	req = req.WithContext(sentry.SetHubOnContext(req.Context(), hub))
 	rec := httptest.NewRecorder()
@@ -94,7 +94,7 @@ func TestBuildHTTPHandlerRecordsPanicTransactionAsServerError(t *testing.T) {
 	mux.HandleFunc("GET /panic/{id}", func(http.ResponseWriter, *http.Request) {
 		panic("boom")
 	})
-	handler := buildHTTPHandler(mux, logModeErrorOnly, true)
+	handler := buildHTTPHandler(mux, logModeErrorOnly, true, false)
 	req := httptest.NewRequest(http.MethodGet, "/panic/42", nil)
 	req = req.WithContext(sentry.SetHubOnContext(req.Context(), hub))
 	rec := httptest.NewRecorder()
@@ -128,7 +128,7 @@ func TestBuildHTTPHandlerCapturesUnhandledServerResponse(t *testing.T) {
 	hub, transport := newSentryTestHub(t)
 	handler := buildHTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "generic failure", http.StatusInternalServerError)
-	}), logModeErrorOnly, true)
+	}), logModeErrorOnly, true, false)
 	req := httptest.NewRequest(http.MethodGet, "/generic-failure", nil)
 	req = req.WithContext(sentry.SetHubOnContext(req.Context(), hub))
 	rec := httptest.NewRecorder()
@@ -162,7 +162,7 @@ func TestBuildHTTPHandlerUsesMatchedRouteForSentryTransaction(t *testing.T) {
 	mux.HandleFunc("GET /things/{id}", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	handler := buildHTTPHandler(mux, logModeErrorOnly, true)
+	handler := buildHTTPHandler(mux, logModeErrorOnly, true, false)
 	req := httptest.NewRequest(http.MethodGet, "/things/123", nil)
 	req = req.WithContext(sentry.SetHubOnContext(req.Context(), hub))
 	rec := httptest.NewRecorder()
@@ -191,7 +191,7 @@ func TestExplicitServerErrorIsCapturedOnlyOnce(t *testing.T) {
 			"database",
 			"tracks.list",
 		)
-	}), logModeErrorOnly, true)
+	}), logModeErrorOnly, true, false)
 	req := httptest.NewRequest(http.MethodGet, "/api/tracks", nil)
 	req = req.WithContext(sentry.SetHubOnContext(req.Context(), hub))
 	rec := httptest.NewRecorder()
@@ -221,7 +221,7 @@ func TestUploadDiskFullErrorReturnsInsufficientStorageAndReportsToSentry(t *test
 				Err:  syscall.ENOSPC,
 			}),
 		}, "songs.upload")
-	}), logModeErrorOnly, true)
+	}), logModeErrorOnly, true, false)
 	req := httptest.NewRequest(http.MethodPost, "/api/songs", nil)
 	req = req.WithContext(sentry.SetHubOnContext(req.Context(), hub))
 	rec := httptest.NewRecorder()
@@ -350,7 +350,7 @@ func TestExpectedClientErrorIsNotCaptured(t *testing.T) {
 			"test",
 			"validate",
 		)
-	}), logModeErrorOnly, true)
+	}), logModeErrorOnly, true, false)
 	req := httptest.NewRequest(http.MethodPost, "/invalid", nil)
 	req = req.WithContext(sentry.SetHubOnContext(req.Context(), hub))
 	rec := httptest.NewRecorder()
@@ -382,7 +382,7 @@ func TestSentryUserDoesNotLeakBetweenRequests(t *testing.T) {
 			setSentryUser(r.Context(), 42)
 		}
 		writeSentryInternalError(w, r, errors.New("request failed"), "request failed", "test", "user_isolation")
-	}), logModeErrorOnly, true)
+	}), logModeErrorOnly, true, false)
 
 	for _, path := range []string{"/with-user", "/without-user"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -431,7 +431,7 @@ func TestRequestLoggingDoesNotReadRequestBody(t *testing.T) {
 	hub, transport := newSentryTestHub(t)
 	handler := buildHTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
-	}), logModeErrorOnly, true)
+	}), logModeErrorOnly, true, false)
 	req := httptest.NewRequest(http.MethodPost, "/api/tracks", strings.NewReader("{}"))
 	req.Header.Set("Content-Type", "application/json")
 	req.Body = errorReadCloser{err: io.ErrUnexpectedEOF}
@@ -665,7 +665,7 @@ func TestSensitiveRequestAndResponseBodiesAreNotLogged(t *testing.T) {
 	handler := buildHTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"accessToken":"response-secret"}`)
-	}), logModeVerbose, false)
+	}), logModeVerbose, false, false)
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/api/auth/login",

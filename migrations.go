@@ -25,7 +25,42 @@ func defaultSchemaMigrations() []schemaMigration {
 		{version: 5, name: "normalized system playlist keys", apply: migrateUniqueSystemPlaylists},
 		{version: 6, name: "role based access control", apply: migrateRoleBasedAccessControl},
 		{version: 7, name: "catalog submission approval workflow", apply: migrateCatalogSubmissionWorkflow},
+		{version: 8, name: "retain rejected catalog dependencies", apply: migrateRejectedCatalogDependencies},
 	}
+}
+
+func migrateRejectedCatalogDependencies(ctx context.Context, tx *sql.Tx) error {
+	statements := []string{
+		`CREATE TABLE authors_new (
+			id INTEGER PRIMARY KEY, current_name TEXT NOT NULL, photos_json TEXT NOT NULL,
+			publication_status TEXT NOT NULL DEFAULT 'published'
+				CHECK (publication_status IN ('published', 'pending_review', 'changes_requested', 'rejected')),
+			requested_by_user_id INTEGER REFERENCES users(id) ON DELETE RESTRICT
+		)`,
+		`INSERT INTO authors_new SELECT id, current_name, photos_json, publication_status, requested_by_user_id FROM authors`,
+		`DROP TABLE authors`,
+		`ALTER TABLE authors_new RENAME TO authors`,
+		`CREATE INDEX idx_authors_publication ON authors (publication_status, requested_by_user_id, id)`,
+		`CREATE TABLE albums_new (
+			id INTEGER PRIMARY KEY, title TEXT NOT NULL, cover_image_path TEXT NOT NULL,
+			author_ids_json TEXT NOT NULL, release_date TEXT NOT NULL, is_published INTEGER NOT NULL,
+			track_ids_json TEXT NOT NULL, additional_info_json TEXT NOT NULL,
+			publication_status TEXT NOT NULL DEFAULT 'published'
+				CHECK (publication_status IN ('published', 'pending_review', 'changes_requested', 'rejected')),
+			requested_by_user_id INTEGER REFERENCES users(id) ON DELETE RESTRICT
+		)`,
+		`INSERT INTO albums_new SELECT id, title, cover_image_path, author_ids_json, release_date, is_published,
+			track_ids_json, additional_info_json, publication_status, requested_by_user_id FROM albums`,
+		`DROP TABLE albums`,
+		`ALTER TABLE albums_new RENAME TO albums`,
+		`CREATE INDEX idx_albums_publication ON albums (publication_status, requested_by_user_id, id)`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runSQLiteMigrations(ctx context.Context, db *sql.DB, migrations []schemaMigration) error {
@@ -671,9 +706,15 @@ func validateSQLiteRelationships(ctx context.Context, tx *sql.Tx) error {
 				(entity_type = 'track' AND EXISTS (SELECT 1 FROM tracks WHERE tracks.id = entity_id AND (tracks.publication_status != 'published' OR tracks.requested_by_user_id IS NOT NULL)))
 			) ORDER BY id LIMIT 1`},
 		{"catalog_submissions", `SELECT catalog_submissions.id FROM catalog_submissions
-			WHERE status IN ('rejected', 'cancelled') AND (
+			WHERE status = 'cancelled' AND (
 				(entity_type = 'author' AND EXISTS (SELECT 1 FROM authors WHERE authors.id = entity_id)) OR
 				(entity_type = 'album' AND EXISTS (SELECT 1 FROM albums WHERE albums.id = entity_id)) OR
+				(entity_type = 'track' AND EXISTS (SELECT 1 FROM tracks WHERE tracks.id = entity_id))
+			) ORDER BY id LIMIT 1`},
+		{"catalog_submissions", `SELECT catalog_submissions.id FROM catalog_submissions
+			WHERE status = 'rejected' AND (
+				(entity_type = 'author' AND EXISTS (SELECT 1 FROM authors WHERE authors.id = entity_id AND (authors.publication_status != 'rejected' OR authors.requested_by_user_id != requester_user_id))) OR
+				(entity_type = 'album' AND EXISTS (SELECT 1 FROM albums WHERE albums.id = entity_id AND (albums.publication_status != 'rejected' OR albums.requested_by_user_id != requester_user_id))) OR
 				(entity_type = 'track' AND EXISTS (SELECT 1 FROM tracks WHERE tracks.id = entity_id))
 			) ORDER BY id LIMIT 1`},
 		{"authors", `SELECT authors.id FROM authors WHERE publication_status != 'published' AND NOT EXISTS (SELECT 1 FROM catalog_submissions WHERE entity_type = 'author' AND entity_id = authors.id) ORDER BY authors.id LIMIT 1`},

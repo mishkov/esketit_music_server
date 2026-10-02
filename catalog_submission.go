@@ -16,6 +16,7 @@ const (
 	catalogPublicationPublished        = "published"
 	catalogPublicationPendingReview    = "pending_review"
 	catalogPublicationChangesRequested = "changes_requested"
+	catalogPublicationRejected         = "rejected"
 
 	catalogSubmissionEntityAuthor = "author"
 	catalogSubmissionEntityAlbum  = "album"
@@ -34,16 +35,18 @@ const (
 )
 
 var (
-	errCatalogSubmissionNotFound     = errors.New("catalog submission not found")
-	errCatalogSubmissionForbidden    = errors.New("catalog submission is not owned by this user")
-	errCatalogSubmissionState        = errors.New("catalog submission is not in the required state")
-	errCatalogSubmissionDependency   = errors.New("catalog submission has unresolved dependencies")
-	errCatalogReviewLeaseConflict    = errors.New("requester is already being reviewed")
-	errCatalogReviewerAlreadyLeasing = errors.New("reviewer already has an active review")
-	errCatalogReviewLeaseInvalid     = errors.New("catalog review lease is missing, expired, or belongs to another reviewer")
-	errCatalogSelfReview             = errors.New("users cannot review their own submissions")
-	errCatalogUploadNotFound         = errors.New("staged audio upload not found")
-	errCatalogUploadClaimed          = errors.New("staged audio upload is already assigned to a track")
+	errCatalogSubmissionNotFound      = errors.New("catalog submission not found")
+	errCatalogSubmissionForbidden     = errors.New("catalog submission is not owned by this user")
+	errCatalogSubmissionState         = errors.New("catalog submission is not in the required state")
+	errCatalogSubmissionDependency    = errors.New("catalog submission has unresolved dependencies")
+	errCatalogTrackReviewPrerequisite = fmt.Errorf("%w: review album and authors first", errCatalogSubmissionDependency)
+	errCatalogRejectedDependency      = fmt.Errorf("%w: an author or album was rejected", errCatalogSubmissionDependency)
+	errCatalogReviewLeaseConflict     = errors.New("requester is already being reviewed")
+	errCatalogReviewerAlreadyLeasing  = errors.New("reviewer already has an active review")
+	errCatalogReviewLeaseInvalid      = errors.New("catalog review lease is missing, expired, or belongs to another reviewer")
+	errCatalogSelfReview              = errors.New("users cannot review their own submissions")
+	errCatalogUploadNotFound          = errors.New("staged audio upload not found")
+	errCatalogUploadClaimed           = errors.New("staged audio upload is already assigned to a track")
 )
 
 type catalogSubmission struct {
@@ -162,10 +165,13 @@ func normalizePublicationStatus(value string) string {
 }
 
 func catalogEntityVisible(status string, requestedBy *int64, viewerUserID int64) bool {
-	if normalizePublicationStatus(status) == catalogPublicationPublished {
+	switch normalizePublicationStatus(status) {
+	case catalogPublicationPublished:
 		return true
+	case catalogPublicationPendingReview, catalogPublicationChangesRequested:
+		return viewerUserID > 0 && requestedBy != nil && *requestedBy == viewerUserID
 	}
-	return viewerUserID > 0 && requestedBy != nil && *requestedBy == viewerUserID
+	return false
 }
 
 func requestedByUserID(userID int64) *int64 {
@@ -657,7 +663,8 @@ func ensureSubmissionDependenciesReady(ctx context.Context, repositories domainR
 	if err != nil || !ok {
 		return errCatalogSubmissionDependency
 	}
-	if normalizePublicationStatus(albumItem.PublicationStatus) == catalogPublicationChangesRequested {
+	if normalizePublicationStatus(albumItem.PublicationStatus) == catalogPublicationChangesRequested ||
+		normalizePublicationStatus(albumItem.PublicationStatus) == catalogPublicationRejected {
 		return errCatalogSubmissionDependency
 	}
 	for _, authorID := range item.AuthorIDs {
@@ -665,7 +672,8 @@ func ensureSubmissionDependenciesReady(ctx context.Context, repositories domainR
 		if err != nil || !ok {
 			return errCatalogSubmissionDependency
 		}
-		if normalizePublicationStatus(authorItem.PublicationStatus) == catalogPublicationChangesRequested {
+		if normalizePublicationStatus(authorItem.PublicationStatus) == catalogPublicationChangesRequested ||
+			normalizePublicationStatus(authorItem.PublicationStatus) == catalogPublicationRejected {
 			return errCatalogSubmissionDependency
 		}
 	}
@@ -872,6 +880,11 @@ func (s *trackStore) requestCatalogSubmissionChanges(reviewerUserID, submissionI
 		if item.Status != catalogSubmissionStatusPendingReview {
 			return errCatalogSubmissionState
 		}
+		if item.EntityType == catalogSubmissionEntityTrack {
+			if err := checkCatalogDependencies(ctx, repositories, item.EntityID, false); err != nil {
+				return err
+			}
+		}
 		entity, err := setCatalogEntityPublication(ctx, repositories, item.EntityType, item.EntityID, catalogPublicationChangesRequested, requestedByUserID(item.RequesterUserID))
 		if err != nil {
 			return err
@@ -941,12 +954,7 @@ func (s *trackStore) approveCatalogSubmission(reviewerUserID, submissionID int64
 			if !ok {
 				return errCatalogSubmissionNotFound
 			}
-			for _, authorID := range trackItem.AuthorIDs {
-				if err := approveCatalogDependency(ctx, repositories, catalogSubmissionEntityAuthor, authorID, item.RequesterUserID, reviewerUserID, now); err != nil {
-					return err
-				}
-			}
-			if err := approveCatalogDependency(ctx, repositories, catalogSubmissionEntityAlbum, trackItem.AlbumID, item.RequesterUserID, reviewerUserID, now); err != nil {
+			if err := checkCatalogDependencies(ctx, repositories, item.EntityID, true); err != nil {
 				return err
 			}
 			upload, ok, err := repositories.submissions.FindSubmissionUploadByTrack(ctx, trackItem.ID)
@@ -986,11 +994,14 @@ func (s *trackStore) approveCatalogSubmission(reviewerUserID, submissionID int64
 		} else {
 			if item.EntityType == catalogSubmissionEntityAlbum {
 				albumItem, ok, err := repositories.catalog.FindAlbumByID(ctx, item.EntityID)
-				if err != nil || !ok {
+				if err != nil {
+					return err
+				}
+				if !ok {
 					return errCatalogSubmissionNotFound
 				}
 				for _, authorID := range albumItem.AuthorIDs {
-					if err := approveCatalogDependency(ctx, repositories, catalogSubmissionEntityAuthor, authorID, item.RequesterUserID, reviewerUserID, now); err != nil {
+					if err := checkCatalogDependency(ctx, repositories, catalogSubmissionEntityAuthor, authorID, true); err != nil {
 						return err
 					}
 				}
@@ -1037,38 +1048,45 @@ func (s *trackStore) approveCatalogSubmission(reviewerUserID, submissionID int64
 	return result, err
 }
 
-func approveCatalogDependency(ctx context.Context, repositories domainRepositories, entityType string, entityID, requesterUserID, reviewerUserID int64, now time.Time) error {
+func checkCatalogDependency(ctx context.Context, repositories domainRepositories, entityType string, entityID int64, requirePublished bool) error {
 	entity, err := catalogEntityByType(ctx, repositories, entityType, entityID)
+	if errors.Is(err, errCatalogSubmissionNotFound) {
+		return errCatalogRejectedDependency
+	}
 	if err != nil {
 		return err
 	}
-	status, requestedBy := catalogEntityLifecycle(entity)
-	if status == catalogPublicationPublished {
-		return nil
+	status, _ := catalogEntityLifecycle(entity)
+	if status == catalogPublicationRejected {
+		return errCatalogRejectedDependency
 	}
-	if requestedBy == nil || *requestedBy != requesterUserID || status != catalogPublicationPendingReview {
-		return errCatalogSubmissionDependency
+	if requirePublished && status != catalogPublicationPublished {
+		return errCatalogTrackReviewPrerequisite
 	}
-	submission, ok, err := repositories.submissions.FindByEntity(ctx, entityType, entityID)
+	return nil
+}
+
+func checkCatalogDependencies(ctx context.Context, repositories domainRepositories, trackID int64, requirePublished bool) error {
+	item, ok, err := repositories.catalog.FindTrackByID(ctx, trackID)
 	if err != nil {
 		return err
 	}
-	if !ok || submission.RequesterUserID != requesterUserID || submission.Status != catalogSubmissionStatusPendingReview {
-		return errCatalogSubmissionDependency
+	if !ok {
+		return errCatalogSubmissionNotFound
 	}
-	approved, err := setCatalogEntityPublication(ctx, repositories, entityType, entityID, catalogPublicationPublished, nil)
-	if err != nil {
+	var pendingError error
+	for _, authorID := range item.AuthorIDs {
+		if err := checkCatalogDependency(ctx, repositories, catalogSubmissionEntityAuthor, authorID, requirePublished); err != nil {
+			if !errors.Is(err, errCatalogTrackReviewPrerequisite) {
+				return err
+			}
+			pendingError = err
+		}
+	}
+	if err := checkCatalogDependency(ctx, repositories, catalogSubmissionEntityAlbum, item.AlbumID, requirePublished); err != nil {
 		return err
 	}
-	submission.Status = catalogSubmissionStatusApproved
-	submission.UpdatedAt = now
-	submission.DecidedAt = &now
-	submission.DecidedByUserID = requestedByUserID(reviewerUserID)
-	submission.Snapshot, err = catalogSubmissionSnapshot(approved)
-	if err != nil {
-		return err
-	}
-	return repositories.submissions.UpdateSubmission(ctx, submission)
+	return pendingError
 }
 
 func catalogEntityByType(ctx context.Context, repositories domainRepositories, entityType string, entityID int64) (any, error) {
@@ -1166,6 +1184,11 @@ func (s *trackStore) rejectCatalogSubmission(reviewerUserID, submissionID int64,
 		if item.Status != catalogSubmissionStatusPendingReview {
 			return errCatalogSubmissionState
 		}
+		if item.EntityType == catalogSubmissionEntityTrack {
+			if err := checkCatalogDependencies(ctx, repositories, item.EntityID, false); err != nil {
+				return err
+			}
+		}
 		entity, err := catalogEntityByType(ctx, repositories, item.EntityType, item.EntityID)
 		if err != nil {
 			return err
@@ -1182,6 +1205,10 @@ func (s *trackStore) rejectCatalogSubmission(reviewerUserID, submissionID int64,
 			return err
 		}
 		stagedFile, err = deleteCatalogSubmissionEntity(ctx, repositories, item.EntityType, item.EntityID)
+		if errors.Is(err, errCatalogSubmissionDependency) && item.EntityType != catalogSubmissionEntityTrack {
+			// Keep referenced entities so pending tracks can be corrected or cancelled.
+			_, err = setCatalogEntityPublication(ctx, repositories, item.EntityType, item.EntityID, catalogPublicationRejected, requestedByUserID(item.RequesterUserID))
+		}
 		if err != nil {
 			return err
 		}

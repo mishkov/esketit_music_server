@@ -101,13 +101,13 @@ func (r *sqliteRepositories) ListSubmissionsByRequester(ctx context.Context, req
 
 func (r *sqliteRepositories) ListPendingSubmissionsByRequester(ctx context.Context, requesterUserID int64) ([]catalogSubmission, error) {
 	return r.listCatalogSubmissions(ctx, `WHERE requester_user_id = ? AND status = ?
-		ORDER BY CASE entity_type WHEN 'track' THEN 0 WHEN 'album' THEN 1 ELSE 2 END, submitted_at, id`, requesterUserID, catalogSubmissionStatusPendingReview)
+		ORDER BY CASE entity_type WHEN 'author' THEN 0 WHEN 'album' THEN 1 ELSE 2 END, submitted_at, id`, requesterUserID, catalogSubmissionStatusPendingReview)
 }
 
 func (r *sqliteRepositories) ListReviewSubmissionsByRequester(ctx context.Context, requesterUserID int64) ([]catalogSubmission, error) {
 	return r.listCatalogSubmissions(ctx, `WHERE requester_user_id = ? AND status IN (?, ?)
-		ORDER BY CASE status WHEN 'pending_review' THEN 0 ELSE 1 END,
-			CASE entity_type WHEN 'track' THEN 0 WHEN 'album' THEN 1 ELSE 2 END, submitted_at, id`,
+		ORDER BY CASE entity_type WHEN 'author' THEN 0 WHEN 'album' THEN 1 ELSE 2 END,
+			CASE status WHEN 'pending_review' THEN 0 ELSE 1 END, submitted_at, id`,
 		requesterUserID, catalogSubmissionStatusPendingReview, catalogSubmissionStatusChangesRequested)
 }
 

@@ -81,7 +81,7 @@ paths:
                 $ref: '#/components/schemas/AuthResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '409':
+        '409'
           description: Email already exists
           content:
             text/plain:
@@ -2652,7 +2652,7 @@ paths:
     get:
       tags: [Catalog Reviews]
       summary: List reviewable submissions for the leased requester
-      description: Returns pending items first plus changes-requested items as dependency and feedback context. Only `pending_review` items accept review decisions.
+      description: Returns authors, then albums, then tracks. Pending items come before changes-requested items within each type. Only `pending_review` items accept review decisions.
       security:
         - bearerAuth: []
       parameters:
@@ -2678,7 +2678,7 @@ paths:
     post:
       tags: [Catalog Reviews]
       summary: Approve and publish a submission
-      description: Requires the requester's active lease. Track approval atomically publishes its pending author and album dependencies, awards ten rating points, and awards five more when lyrics exist.
+      description: Requires the requester's active lease. Authors and albums must be approved before a dependent track. Track approval awards ten rating points, and five more when lyrics exist.
       security:
         - bearerAuth: []
       parameters:
@@ -2738,7 +2738,7 @@ paths:
     post:
       tags: [Catalog Reviews]
       summary: Permanently reject a submission
-      description: Removes the catalog entity and staged media while retaining an immutable submission and feedback tombstone. Dependencies cannot be rejected while still referenced.
+      description: Retains an immutable submission and feedback tombstone. Referenced authors and albums are retained with rejected publication status so dependent tracks cannot be reviewed. Other rejected entities and staged media are removed.
       security:
         - bearerAuth: []
       parameters:
@@ -3162,10 +3162,11 @@ components:
 
     CatalogPublicationStatus:
       type: string
-      enum: [published, pending_review, changes_requested]
+      enum: [published, pending_review, changes_requested, rejected]
       description: |
         Pending and changes-requested entities are returned by ordinary catalog APIs
-        only to the user who submitted them.
+        only to the user who submitted them. Rejected authors and albums retained
+        for dependent submissions are hidden from ordinary catalog APIs.
 
     CatalogSubmissionStatus:
       type: string

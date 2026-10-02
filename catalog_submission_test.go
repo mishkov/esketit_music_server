@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -262,6 +264,9 @@ func TestCatalogSubmissionApprovalWorkflow(t *testing.T) {
 	if err != nil || len(reviewContext) != 3 {
 		t.Fatalf("review context after feedback has %d submissions, error = %v, want all 3 dependency records", len(reviewContext), err)
 	}
+	if reviewContext[0].ID != authorSubmission.ID || reviewContext[1].ID != albumSubmission.ID {
+		t.Fatalf("review order = %#v, want author then album before track", reviewContext)
+	}
 	if reviewContext[len(reviewContext)-1].ID != trackSubmission.ID || reviewContext[len(reviewContext)-1].Status != catalogSubmissionStatusChangesRequested {
 		t.Fatalf("changes-requested track missing from review context: %#v", reviewContext)
 	}
@@ -282,11 +287,48 @@ func TestCatalogSubmissionApprovalWorkflow(t *testing.T) {
 	if resubmitted.Status != catalogSubmissionStatusPendingReview {
 		t.Fatalf("resubmitted status = %q", resubmitted.Status)
 	}
+	if _, err := store.requestCatalogSubmissionChanges(reviewer.ID, authorSubmission.ID, lease.LeaseToken, catalogReviewDecisionRequest{Message: "Confirm artist details"}); err != nil {
+		t.Fatalf("request author changes error = %v", err)
+	}
+	reviewContext, err = store.listCatalogReviewSubmissions(reviewer.ID, requester.ID, lease.LeaseToken)
+	if err != nil || len(reviewContext) != 3 || reviewContext[0].ID != authorSubmission.ID || reviewContext[1].ID != albumSubmission.ID || reviewContext[2].ID != trackSubmission.ID {
+		t.Fatalf("review order with changed author = %#v, error = %v", reviewContext, err)
+	}
+	if _, err := store.resubmitCatalogSubmission(requester.ID, authorSubmission.ID); err != nil {
+		t.Fatalf("resubmit author error = %v", err)
+	}
 	plainText := "These are the lyrics"
 	if _, created, err := store.upsertCatalogSubmissionLyrics(requester.ID, trackID, upsertLyricsRequest{Type: lyricsTypePlain, PlainText: &plainText}); err != nil || !created {
 		t.Fatalf("upsertCatalogSubmissionLyrics() created=%v error=%v", created, err)
 	}
 
+	if _, err := store.approveCatalogSubmission(reviewer.ID, trackSubmission.ID, lease.LeaseToken); !errors.Is(err, errCatalogTrackReviewPrerequisite) || !strings.Contains(err.Error(), "review album and authors first") {
+		t.Fatalf("premature track approval error = %v, want review prerequisite", err)
+	}
+	setTestUserRole(t, store, reviewer.ID, roleAdmin)
+	auth := newAuthManager([]byte("review-prerequisite-test-secret"), time.Hour, time.Hour)
+	accessToken, _, err := auth.createAccessToken(reviewer.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := fmt.Sprintf("/api/catalog-reviews/submissions/%d/approve", trackSubmission.ID)
+	request := httptest.NewRequest(http.MethodPost, path, nil)
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	request.Header.Set(catalogReviewLeaseHeader, lease.LeaseToken)
+	response := httptest.NewRecorder()
+	requirePermission(auth, store, permissionCatalogSubmissionsReview, catalogReviewDecisionRouteHandler(store)).ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "review album and authors first") {
+		t.Fatalf("premature track approval HTTP status=%d body=%q", response.Code, response.Body.String())
+	}
+	if _, err := store.approveCatalogSubmission(reviewer.ID, albumSubmission.ID, lease.LeaseToken); !errors.Is(err, errCatalogTrackReviewPrerequisite) {
+		t.Fatalf("premature album approval error = %v, want author prerequisite", err)
+	}
+	if _, err := store.approveCatalogSubmission(reviewer.ID, authorSubmission.ID, lease.LeaseToken); err != nil {
+		t.Fatalf("approve author error = %v", err)
+	}
+	if _, err := store.approveCatalogSubmission(reviewer.ID, albumSubmission.ID, lease.LeaseToken); err != nil {
+		t.Fatalf("approve album error = %v", err)
+	}
 	approved, err := store.approveCatalogSubmission(reviewer.ID, trackSubmission.ID, lease.LeaseToken)
 	if err != nil {
 		t.Fatalf("approveCatalogSubmission() error = %v", err)
@@ -421,6 +463,67 @@ func TestCatalogSubmissionRejectRemovesEntityAndKeepsTombstone(t *testing.T) {
 	items, err := store.listCatalogSubmissions(requester.ID)
 	if err != nil || len(items.Items) != 1 || items.Items[0].Entity == nil {
 		t.Fatalf("submission tombstone = %#v, error = %v", items, err)
+	}
+}
+
+func TestRejectedCatalogDependencyBlocksTrackReview(t *testing.T) {
+	for _, rejectedType := range []string{catalogSubmissionEntityAuthor, catalogSubmissionEntityAlbum} {
+		t.Run(rejectedType, func(t *testing.T) {
+			store := newTestTrackStore(t)
+			store.songsDir = t.TempDir()
+			requester := mustCreateCatalogTestUser(t, store, rejectedType+"-requester@example.com")
+			reviewer := mustCreateCatalogTestUser(t, store, rejectedType+"-reviewer@example.com")
+			authorSubmission, err := store.createAuthorSubmission(requester.ID, upsertAuthorRequest{CurrentName: "Artist"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			authorID := authorSubmission.Entity.(author).ID
+			albumSubmission, err := store.createAlbumSubmission(requester.ID, upsertAlbumRequest{
+				Title: "Album", AuthorIDs: []int64{authorID}, ReleaseDate: time.Now().UTC(), IsPublished: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			albumID := albumSubmission.Entity.(album).ID
+			upload := mustCreateCatalogTestUpload(t, store, requester.ID, rejectedType+"-song.mp3")
+			trackSubmission, err := store.createTrackSubmission(requester.ID, createTrackSubmissionRequest{
+				Name: "Song", AuthorIDs: []int64{authorID}, AlbumID: albumID, AudioUploadToken: upload.Token,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease, err := store.acquireCatalogReviewLease(reviewer.ID, requester.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rejectedID := authorSubmission.ID
+			if rejectedType == catalogSubmissionEntityAlbum {
+				rejectedID = albumSubmission.ID
+			}
+			rejected, err := store.rejectCatalogSubmission(reviewer.ID, rejectedID, lease.LeaseToken, catalogReviewDecisionRequest{Message: "Not acceptable"})
+			if err != nil || rejected.Status != catalogSubmissionStatusRejected {
+				t.Fatalf("reject dependency = %#v, error = %v", rejected, err)
+			}
+			if err := runSQLiteStartupRepairs(context.Background(), store.db); err != nil {
+				t.Fatalf("startup validation with rejected dependency: %v", err)
+			}
+			if _, err := store.approveCatalogSubmission(reviewer.ID, trackSubmission.ID, lease.LeaseToken); !errors.Is(err, errCatalogRejectedDependency) {
+				t.Fatalf("approve dependent track error = %v", err)
+			}
+			if _, err := store.requestCatalogSubmissionChanges(reviewer.ID, trackSubmission.ID, lease.LeaseToken, catalogReviewDecisionRequest{Message: "Fix it"}); !errors.Is(err, errCatalogRejectedDependency) {
+				t.Fatalf("request changes for dependent track error = %v", err)
+			}
+			if _, err := store.rejectCatalogSubmission(reviewer.ID, trackSubmission.ID, lease.LeaseToken, catalogReviewDecisionRequest{Message: "Reject it"}); !errors.Is(err, errCatalogRejectedDependency) {
+				t.Fatalf("reject dependent track error = %v", err)
+			}
+			items, err := store.listCatalogReviewSubmissions(reviewer.ID, requester.ID, lease.LeaseToken)
+			if err != nil || len(items) == 0 {
+				t.Fatalf("list review submissions error = %v", err)
+			}
+			if _, err := store.cancelCatalogSubmission(requester.ID, trackSubmission.ID); err != nil {
+				t.Fatalf("cancel blocked track error = %v", err)
+			}
+		})
 	}
 }
 

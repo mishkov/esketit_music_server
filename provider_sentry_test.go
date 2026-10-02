@@ -406,7 +406,7 @@ func serveProviderSentryRequest(
 	req.Header.Set("Content-Type", "application/json")
 	req = req.WithContext(sentry.SetHubOnContext(req.Context(), hub))
 	rec := httptest.NewRecorder()
-	buildHTTPHandler(handler, logModeErrorOnly, true).ServeHTTP(rec, req)
+	buildHTTPHandler(handler, logModeErrorOnly, true, false).ServeHTTP(rec, req)
 	return rec, transport
 }
 
