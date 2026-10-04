@@ -12,6 +12,7 @@ signatures, while persistence is delegated through these domain boundaries:
 - `LyricsRepository`
 - `ReadRepository` (cross-aggregate filtering, pagination, and projections)
 - `AccessControlRepository` (roles, permissions, assignments, and audit events)
+- `MCPRepository` (agent settings, retry receipts, staged media metadata and scoped agent reads)
 - `CatalogSubmissionRepository` (submissions, feedback, rating events, review
   leases, and staged-upload claims)
 
@@ -137,3 +138,21 @@ connection. Several existing relationships remain embedded in JSON columns and
 therefore cannot use SQLite foreign keys; startup validates those relationships
 with explicit SQL. New normalized relationship tables should declare foreign
 keys in their migrations.
+
+## MCP transaction integration
+
+MCP uses the same submission workflows through a request-local trackStore facade
+whose joined unit of work supplies repositories already bound to the outer
+transaction. It starts no nested SQL transactions and caches no application
+state. Identity/permission checks, current revision validation, upload claims,
+catalog changes, and the successful retry receipt commit together. A failed
+receipt insert rolls back the submission. File deletions from replacement and
+cancellation are collected on the request-local facade and run after commit.
+
+Every submission row has an integer revision incremented by the repository on
+all lifecycle/snapshot updates, including ordinary HTTP review decisions. MCP
+patches compare expectedRevision inside their write transaction. Settings use
+a separate version with compare-and-swap updates and access-control audit rows.
+Retry receipts and media tokens are bound to the selected user through foreign
+keys. They intentionally have no automatic expiry; get_submission/get_upload
+return current state while replayed writes return their original receipt.

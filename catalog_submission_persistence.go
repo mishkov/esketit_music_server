@@ -14,7 +14,7 @@ func scanCatalogSubmission(row rowScanner) (catalogSubmission, error) {
 	var decidedBy sql.NullInt64
 	if err := row.Scan(
 		&item.ID, &item.EntityType, &item.EntityID, &item.RequesterUserID, &item.Status,
-		&snapshotJSON, &createdAt, &submittedAt, &updatedAt, &decidedAt, &decidedBy,
+		&snapshotJSON, &createdAt, &submittedAt, &updatedAt, &decidedAt, &decidedBy, &item.Revision,
 	); err != nil {
 		return catalogSubmission{}, translateSQLiteError(err)
 	}
@@ -42,7 +42,7 @@ func scanCatalogSubmission(row rowScanner) (catalogSubmission, error) {
 	return item, nil
 }
 
-const catalogSubmissionColumns = `id, entity_type, entity_id, requester_user_id, status, snapshot_json, created_at, submitted_at, updated_at, decided_at, decided_by_user_id`
+const catalogSubmissionColumns = `id, entity_type, entity_id, requester_user_id, status, snapshot_json, created_at, submitted_at, updated_at, decided_at, decided_by_user_id, revision`
 
 func (r *sqliteRepositories) InsertSubmission(ctx context.Context, item catalogSubmission) (catalogSubmission, error) {
 	snapshotJSON, err := marshalJSONColumn(item.Snapshot)
@@ -58,6 +58,7 @@ func (r *sqliteRepositories) InsertSubmission(ctx context.Context, item catalogS
 	if err != nil {
 		return catalogSubmission{}, translateSQLiteError(err)
 	}
+	item.Revision = 1
 	item.ID, err = result.LastInsertId()
 	if err != nil {
 		return catalogSubmission{}, translateSQLiteError(err)
@@ -86,7 +87,7 @@ func (r *sqliteRepositories) UpdateSubmission(ctx context.Context, item catalogS
 	if err != nil {
 		return err
 	}
-	result, err := r.q.ExecContext(ctx, `UPDATE catalog_submissions SET status = ?, snapshot_json = ?, submitted_at = ?, updated_at = ?, decided_at = ?, decided_by_user_id = ? WHERE id = ?`,
+	result, err := r.q.ExecContext(ctx, `UPDATE catalog_submissions SET revision = revision + 1, status = ?, snapshot_json = ?, submitted_at = ?, updated_at = ?, decided_at = ?, decided_by_user_id = ? WHERE id = ?`,
 		item.Status, snapshotJSON, formatSQLiteTime(item.SubmittedAt), formatSQLiteTime(item.UpdatedAt),
 		formatOptionalSQLiteTime(item.DecidedAt), item.DecidedByUserID, item.ID)
 	if err != nil {

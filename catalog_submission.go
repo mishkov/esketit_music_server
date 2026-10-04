@@ -51,6 +51,7 @@ var (
 
 type catalogSubmission struct {
 	ID              int64          `json:"id"`
+	Revision        int64          `json:"revision"`
 	EntityType      string         `json:"entityType"`
 	EntityID        int64          `json:"entityId"`
 	RequesterUserID int64          `json:"requesterUserId"`
@@ -222,7 +223,7 @@ func newCatalogSubmission(entityType string, entityID, requesterUserID int64, en
 		return catalogSubmission{}, err
 	}
 	return catalogSubmission{
-		EntityType: entityType, EntityID: entityID, RequesterUserID: requesterUserID,
+		Revision: 1, EntityType: entityType, EntityID: entityID, RequesterUserID: requesterUserID,
 		Status: catalogSubmissionStatusPendingReview, Snapshot: snapshot,
 		CreatedAt: now, SubmittedAt: now, UpdatedAt: now,
 	}, nil
@@ -587,7 +588,7 @@ func (s *trackStore) updateTrackSubmission(requesterUserID, trackID int64, reque
 		return updateSubmissionSnapshot(state.ctx, state.repositories, &submission, item, &result)
 	})
 	if err == nil && oldStagedFile != "" {
-		if cleanupErr := removeFileForCleanup(s.catalogSubmissionAudioPath(oldStagedFile)); cleanupErr != nil {
+		if cleanupErr := s.cleanupSubmissionFile(s.catalogSubmissionAudioPath(oldStagedFile)); cleanupErr != nil {
 			return catalogSubmissionResponse{}, fmt.Errorf("remove replaced staged audio: %w", cleanupErr)
 		}
 	}
@@ -604,6 +605,7 @@ func updateSubmissionSnapshot(ctx context.Context, repositories domainRepositori
 	if err := repositories.submissions.UpdateSubmission(ctx, *submission); err != nil {
 		return err
 	}
+	submission.Revision++
 	feedback, err := repositories.submissions.ListFeedbackBySubmissionIDs(ctx, []int64{submission.ID})
 	if err != nil {
 		return err
@@ -648,6 +650,7 @@ func (s *trackStore) resubmitCatalogSubmission(requesterUserID, submissionID int
 		if err := repositories.submissions.UpdateSubmission(context.Background(), item); err != nil {
 			return err
 		}
+		item.Revision++
 		feedback, err := repositories.submissions.ListFeedbackBySubmissionIDs(context.Background(), []int64{item.ID})
 		if err != nil {
 			return err
@@ -919,6 +922,7 @@ func (s *trackStore) requestCatalogSubmissionChanges(reviewerUserID, submissionI
 		if err := repositories.submissions.UpdateSubmission(ctx, item); err != nil {
 			return err
 		}
+		item.Revision++
 		lease.HeartbeatAt, lease.ExpiresAt = now, now.Add(catalogReviewLeaseTTL)
 		if err := repositories.submissions.UpdateReviewLease(ctx, lease, now); err != nil {
 			return err
@@ -1033,6 +1037,7 @@ func (s *trackStore) approveCatalogSubmission(reviewerUserID, submissionID int64
 		if err := repositories.submissions.UpdateSubmission(ctx, item); err != nil {
 			return err
 		}
+		item.Revision++
 		lease.HeartbeatAt, lease.ExpiresAt = now, now.Add(catalogReviewLeaseTTL)
 		if err := repositories.submissions.UpdateReviewLease(ctx, lease, now); err != nil {
 			return err
@@ -1233,6 +1238,7 @@ func (s *trackStore) rejectCatalogSubmission(reviewerUserID, submissionID int64,
 		if err := repositories.submissions.UpdateSubmission(ctx, item); err != nil {
 			return err
 		}
+		item.Revision++
 		lease.HeartbeatAt, lease.ExpiresAt = now, now.Add(catalogReviewLeaseTTL)
 		if err := repositories.submissions.UpdateReviewLease(ctx, lease, now); err != nil {
 			return err
@@ -1245,7 +1251,7 @@ func (s *trackStore) rejectCatalogSubmission(reviewerUserID, submissionID int64,
 		return nil
 	})
 	if err == nil && stagedFile != "" {
-		if cleanupErr := removeFileForCleanup(s.catalogSubmissionAudioPath(stagedFile)); cleanupErr != nil {
+		if cleanupErr := s.cleanupSubmissionFile(s.catalogSubmissionAudioPath(stagedFile)); cleanupErr != nil {
 			return catalogSubmissionResponse{}, fmt.Errorf("remove rejected staged audio: %w", cleanupErr)
 		}
 	}
@@ -1289,6 +1295,7 @@ func (s *trackStore) cancelCatalogSubmission(requesterUserID, submissionID int64
 		if err := repositories.submissions.UpdateSubmission(ctx, item); err != nil {
 			return err
 		}
+		item.Revision++
 		feedback, err := repositories.submissions.ListFeedbackBySubmissionIDs(ctx, []int64{item.ID})
 		if err != nil {
 			return err
@@ -1297,7 +1304,7 @@ func (s *trackStore) cancelCatalogSubmission(requesterUserID, submissionID int64
 		return nil
 	})
 	if err == nil && stagedFile != "" {
-		if cleanupErr := removeFileForCleanup(s.catalogSubmissionAudioPath(stagedFile)); cleanupErr != nil {
+		if cleanupErr := s.cleanupSubmissionFile(s.catalogSubmissionAudioPath(stagedFile)); cleanupErr != nil {
 			return catalogSubmissionResponse{}, fmt.Errorf("remove cancelled staged audio: %w", cleanupErr)
 		}
 	}
@@ -1541,4 +1548,11 @@ func (s *trackStore) catalogSubmissionAudioAccess(userID, trackID int64, leaseTo
 
 func (s *trackStore) upsertCatalogSubmissionLyrics(requesterUserID, trackID int64, request upsertLyricsRequest) (lyrics, bool, error) {
 	return s.upsertSubmissionLyricsContext(context.Background(), requesterUserID, trackID, request)
+}
+
+func (s *trackStore) cleanupSubmissionFile(path string) error {
+	if s.deferSubmissionCleanup != nil {
+		return s.deferSubmissionCleanup(path)
+	}
+	return removeFileForCleanup(path)
 }

@@ -379,16 +379,17 @@ type playlistResponse struct {
 }
 
 type trackStore struct {
-	songsDir           string
-	db                 *sql.DB
-	unitOfWork         unitOfWork
-	userRepository     UserRepository
-	sessionRepository  RefreshSessionRepository
-	authorRepository   AuthorRepository
-	catalogRepository  CatalogRepository
-	playlistRepository PlaylistRepository
-	lyricsRepository   LyricsRepository
-	accessRepository   AccessControlRepository
+	deferSubmissionCleanup func(string) error // Set only on transaction-local MCP facades.
+	songsDir               string
+	db                     *sql.DB
+	unitOfWork             unitOfWork
+	userRepository         UserRepository
+	sessionRepository      RefreshSessionRepository
+	authorRepository       AuthorRepository
+	catalogRepository      CatalogRepository
+	playlistRepository     PlaylistRepository
+	lyricsRepository       LyricsRepository
+	accessRepository       AccessControlRepository
 }
 
 type paginatedAlbums struct {
@@ -726,6 +727,14 @@ func run() (runErr error) {
 	}()
 
 	mux := http.NewServeMux()
+	mcpReview := &mcpService{store: store, authorPhotosDir: authorPhotosDir, albumCoversDir: albumCoversDir, accessToken: strings.TrimSpace(os.Getenv("MCP_ACCESS_TOKEN"))}
+	if err := mcpReview.configurePublicURL(os.Getenv("MCP_PUBLIC_URL")); err != nil {
+		return err
+	}
+	mux.Handle("/mcp", mcpReview.handler())
+	mux.Handle("POST /api/mcp/uploads", mcpReview.authenticate(mcpReview.uploadHandler()))
+	mux.Handle("GET /api/mcp/settings", requirePermission(auth, store, permissionAccessControlManage, mcpReview.settingsHandler()))
+	mux.Handle("PATCH /api/mcp/settings", requirePermission(auth, store, permissionAccessControlManage, mcpReview.settingsHandler()))
 	mux.HandleFunc("GET /healthz", healthzHandler())
 	mux.HandleFunc("GET /api/songs", listSongsHandler(songsDir))
 	mux.Handle("POST /api/songs", requirePermission(auth, store, permissionSongsUpload, uploadSongHandler(songsDir)))
@@ -1018,10 +1027,10 @@ func withCORS(next http.Handler) http.Handler {
 			headers := w.Header()
 			headers.Set("Access-Control-Allow-Origin", origin)
 			headers.Set("Vary", "Origin")
-			headers.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			headers.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			headers.Set(
 				"Access-Control-Allow-Headers",
-				"Authorization, Content-Type, X-Review-Lease",
+				"Authorization, Content-Type, X-Review-Lease, Idempotency-Key, MCP-Protocol-Version, Mcp-Session-Id",
 			)
 		}
 

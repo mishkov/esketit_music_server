@@ -149,6 +149,7 @@ type domainRepositories struct {
 	reads       ReadRepository
 	access      AccessControlRepository
 	submissions CatalogSubmissionRepository
+	mcp         MCPRepository
 }
 
 // unitOfWork keeps *sql.Tx inside the SQLite adapter. Callers receive only
@@ -936,5 +937,6 @@ func newDomainRepositories(q sqlExecutor) domainRepositories {
 		reads:       base,
 		access:      base,
 		submissions: base,
+		mcp:         base,
 	}
 }

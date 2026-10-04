@@ -26,6 +26,7 @@ func defaultSchemaMigrations() []schemaMigration {
 		{version: 6, name: "role based access control", apply: migrateRoleBasedAccessControl},
 		{version: 7, name: "catalog submission approval workflow", apply: migrateCatalogSubmissionWorkflow},
 		{version: 8, name: "retain rejected catalog dependencies", apply: migrateRejectedCatalogDependencies},
+		{version: 9, name: "MCP submission integration", apply: migrateMCP},
 	}
 }
 
