@@ -100,6 +100,49 @@ func TestSQLiteMigrationsFreshAndRepeatable(t *testing.T) {
 	}
 }
 
+func TestRejectedDependencyMigrationPreservesCatalogRows(t *testing.T) {
+	db, err := openSQLiteDB(filepath.Join(t.TempDir(), "catalog-upgrade.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	migrations := defaultSchemaMigrations()
+	if err := runSQLiteMigrations(context.Background(), db, migrations[:7]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO users (id, email, password_hash, created_at) VALUES (1, 'owner@example.com', 'hash', ?)`, formatSQLiteTime(time.Now().UTC())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO authors (id, current_name, photos_json, publication_status, requested_by_user_id)
+		VALUES (10, 'Artist', '[]', 'pending_review', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO albums (id, title, cover_image_path, author_ids_json, release_date,
+		is_published, track_ids_json, additional_info_json, publication_status, requested_by_user_id)
+		VALUES (20, 'Album', '', '[10]', ?, 1, '[]', '[]', 'pending_review', 1)`, formatSQLiteTime(time.Now().UTC())); err != nil {
+		t.Fatal(err)
+	}
+	if err := runSQLiteMigrations(context.Background(), db, migrations); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE authors SET publication_status = 'rejected' WHERE id = 10`); err != nil {
+		t.Fatalf("update migrated author: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE albums SET publication_status = 'rejected' WHERE id = 20`); err != nil {
+		t.Fatalf("update migrated album: %v", err)
+	}
+	var authorName, albumTitle string
+	if err := db.QueryRow(`SELECT current_name FROM authors WHERE id = 10`).Scan(&authorName); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT title FROM albums WHERE id = 20`).Scan(&albumTitle); err != nil {
+		t.Fatal(err)
+	}
+	if authorName != "Artist" || albumTitle != "Album" {
+		t.Fatalf("migrated author=%q album=%q", authorName, albumTitle)
+	}
+}
+
 func TestSystemPlaylistNormalizationMigrationUpgradesAlreadyVersionedDatabase(t *testing.T) {
 	db, err := openSQLiteDB(filepath.Join(t.TempDir(), "system-playlist-upgrade.sqlite"))
 	if err != nil {

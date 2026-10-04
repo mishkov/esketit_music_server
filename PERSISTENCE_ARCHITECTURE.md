@@ -12,6 +12,9 @@ signatures, while persistence is delegated through these domain boundaries:
 - `LyricsRepository`
 - `ReadRepository` (cross-aggregate filtering, pagination, and projections)
 - `AccessControlRepository` (roles, permissions, assignments, and audit events)
+- `MCPRepository` (agent settings, retry receipts, staged media metadata and scoped agent reads)
+- `CatalogSubmissionRepository` (submissions, feedback, rating events, review
+  leases, and staged-upload claims)
 
 The SQLite implementations accept `context.Context` and contain SQL encoding,
 row scanning, constraint translation, and driver-specific behavior. The unit of
@@ -56,6 +59,39 @@ Every access-control mutation is recorded in
 `access_control_audit_events`. Transactions reject any change that would leave
 the system without a user who has `access_control.manage`.
 
+## Catalog submission workflow
+
+Authors, albums, and tracks have an explicit publication lifecycle. Published
+rows are visible to everyone; `pending_review` and `changes_requested` rows are
+visible through normal catalog, search, playlist, and autoplay reads only to
+the user identified by `requested_by_user_id`. Direct catalog-management
+operations only mutate published rows. Pending rows are created and changed
+through the submission service, so review state cannot be bypassed accidentally.
+
+`catalog_submissions` is the durable workflow record. It retains the latest
+entity snapshot after rejection or cancellation. Rejected authors and albums
+that are still referenced remain as hidden `rejected` rows; dependent tracks
+cannot receive review decisions. Feedback and import-rating changes are
+append-only rows. Authors and albums must be approved before dependent tracks.
+A track approval records the +10 approval event and optional +5 lyrics event.
+Review penalties are explicit negative events and default to zero.
+
+Review ownership is stored in `catalog_review_leases`, not process memory. A
+unique requester and unique reviewer constraint guarantee that two reviewers
+cannot review the same requester and that one reviewer cannot hold two queues.
+Lease tokens are bound to both users, expire after ten minutes, and are renewed
+by heartbeat or successful review decisions.
+
+Uploaded submission audio is stored below the configured songs directory in
+`.catalog-submissions` and is not exposed by the public song endpoint. The
+requester can stream it immediately; the active reviewer can stream it with the
+lease token. Approval publishes it into the public songs directory, while
+rejection or cancellation removes it. Publication uses a same-filesystem hard
+link so the staged copy survives until the database commit succeeds. On
+rollback the public link is removed; after commit the staged link is removed.
+Startup deletes unreferenced staging files and any public hard link still tied
+to an active staged upload after a crash between those steps.
+
 ## Transaction boundaries
 
 - User creation advances the user and playlist counters, inserts the user, and
@@ -71,6 +107,12 @@ the system without a user who has `access_control.manage`.
 - Lyrics and their embedded synchronized lines are written atomically.
 - Role assignments, permission assignments, their lockout check, and audit
   event insertion commit atomically.
+- Submission creation writes the pending catalog row, workflow snapshot, and
+  staged-upload claim atomically.
+- Approval validates the review lease, publishes the entity and its pending
+  dependencies, and records rating events atomically.
+- Feedback, its optional rating penalty, the entity lifecycle, and the
+  submission lifecycle change atomically.
 
 ## ID allocation
 
@@ -96,3 +138,21 @@ connection. Several existing relationships remain embedded in JSON columns and
 therefore cannot use SQLite foreign keys; startup validates those relationships
 with explicit SQL. New normalized relationship tables should declare foreign
 keys in their migrations.
+
+## MCP transaction integration
+
+MCP uses the same submission workflows through a request-local trackStore facade
+whose joined unit of work supplies repositories already bound to the outer
+transaction. It starts no nested SQL transactions and caches no application
+state. Identity/permission checks, current revision validation, upload claims,
+catalog changes, and the successful retry receipt commit together. A failed
+receipt insert rolls back the submission. File deletions from replacement and
+cancellation are collected on the request-local facade and run after commit.
+
+Every submission row has an integer revision incremented by the repository on
+all lifecycle/snapshot updates, including ordinary HTTP review decisions. MCP
+patches compare expectedRevision inside their write transaction. Settings use
+a separate version with compare-and-swap updates and access-control audit rows.
+Retry receipts and media tokens are bound to the selected user through foreign
+keys. They intentionally have no automatic expiry; get_submission/get_upload
+return current state while replayed writes return their original receipt.

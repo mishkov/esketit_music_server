@@ -23,7 +23,8 @@ const (
 )
 
 type authorListFilter struct {
-	Sort string
+	Sort         string
+	ViewerUserID int64
 }
 
 type authorPopularityEvent struct {
@@ -108,10 +109,16 @@ func (s *trackStore) authorPopularityCatalogSnapshot(ctx context.Context) ([]int
 	}
 	authorIDs := make([]int64, 0, len(authors))
 	for _, item := range authors {
+		if normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished {
+			continue
+		}
 		authorIDs = append(authorIDs, item.ID)
 	}
 	trackAuthorIDs := make(map[int64][]int64, len(tracks))
 	for _, item := range tracks {
+		if normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished {
+			continue
+		}
 		trackAuthorIDs[item.ID] = append([]int64(nil), item.AuthorIDs...)
 	}
 	return authorIDs, trackAuthorIDs, nil

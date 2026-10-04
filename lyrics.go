@@ -68,6 +68,24 @@ func getTrackLyricsHandler(store *trackStore) http.HandlerFunc {
 	}
 }
 
+func getVisibleTrackLyricsHandler(store *trackStore, auth *authManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		trackID, err := parseTrackLyricsID(r.URL.Path)
+		if err != nil {
+			http.Error(w, "invalid track id", http.StatusBadRequest)
+			return
+		}
+		if _, visible, err := store.getTrackResponse(trackID, optionalUserIDFromRequest(r, auth)); err != nil {
+			writeSentryHTTPError(w, r, err, "failed to authorize lyrics", http.StatusInternalServerError, "lyrics", "visibility")
+			return
+		} else if !visible {
+			http.NotFound(w, r)
+			return
+		}
+		getTrackLyricsHandler(store).ServeHTTP(w, r)
+	}
+}
+
 func putTrackLyricsHandler(store *trackStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		trackID, err := parseTrackLyricsID(r.URL.Path)
@@ -87,6 +105,8 @@ func putTrackLyricsHandler(store *trackStore) http.HandlerFunc {
 			switch {
 			case errors.Is(err, errTrackNotFound), strings.Contains(err.Error(), "trackId"):
 				http.NotFound(w, r)
+			case errors.Is(err, errCatalogSubmissionState):
+				http.Error(w, err.Error(), http.StatusConflict)
 			case errors.Is(err, errInvalidLyricsPayload):
 				http.Error(w, err.Error(), http.StatusBadRequest)
 			default:
@@ -115,6 +135,8 @@ func deleteTrackLyricsHandler(store *trackStore) http.HandlerFunc {
 			switch {
 			case errors.Is(err, errTrackNotFound), errors.Is(err, errLyricsNotFound):
 				http.NotFound(w, r)
+			case errors.Is(err, errCatalogSubmissionState):
+				http.Error(w, err.Error(), http.StatusConflict)
 			default:
 				writeSentryHTTPError(w, r, err, "failed to delete lyrics", http.StatusInternalServerError, "lyrics", "delete")
 			}
@@ -162,13 +184,41 @@ func (s *trackStore) upsertLyrics(trackID int64, req upsertLyricsRequest) (lyric
 }
 
 func (s *trackStore) upsertLyricsContext(ctx context.Context, trackID int64, req upsertLyricsRequest) (lyrics, bool, error) {
+	return s.upsertLyricsContextMode(ctx, trackID, req)
+}
+
+func (s *trackStore) upsertSubmissionLyricsContext(ctx context.Context, requesterUserID, trackID int64, req upsertLyricsRequest) (lyrics, bool, error) {
+	return s.upsertLyricsContextMode(ctx, trackID, req, requesterUserID)
+}
+
+func (s *trackStore) upsertLyricsContextMode(ctx context.Context, trackID int64, req upsertLyricsRequest, submissionRequesterUserID ...int64) (lyrics, bool, error) {
 	var saved lyrics
 	var created bool
 	err := s.unitOfWork.WithinTransaction(ctx, func(repositories domainRepositories) error {
-		if _, ok, err := repositories.catalog.FindTrackByID(ctx, trackID); err != nil {
+		trackItem, ok, err := repositories.catalog.FindTrackByID(ctx, trackID)
+		if err != nil {
 			return err
 		} else if !ok {
 			return errTrackNotFound
+		}
+		if len(submissionRequesterUserID) == 0 {
+			if normalizePublicationStatus(trackItem.PublicationStatus) != catalogPublicationPublished {
+				return fmt.Errorf("%w: pending track lyrics must be managed through catalog submissions", errCatalogSubmissionState)
+			}
+		} else {
+			submission, ok, err := repositories.submissions.FindByEntity(ctx, catalogSubmissionEntityTrack, trackID)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return errCatalogSubmissionNotFound
+			}
+			if err := validateSubmissionOwner(submission, submissionRequesterUserID[0]); err != nil {
+				return err
+			}
+			if submission.Status != catalogSubmissionStatusPendingReview && submission.Status != catalogSubmissionStatusChangesRequested {
+				return errCatalogSubmissionState
+			}
 		}
 		previous, exists, err := repositories.lyrics.FindByTrackID(ctx, trackID)
 		if err != nil {
@@ -226,10 +276,14 @@ func (s *trackStore) deleteLyrics(trackID int64) error {
 
 func (s *trackStore) deleteLyricsContext(ctx context.Context, trackID int64) error {
 	return s.unitOfWork.WithinTransaction(ctx, func(repositories domainRepositories) error {
-		if _, ok, err := repositories.catalog.FindTrackByID(ctx, trackID); err != nil {
+		trackItem, ok, err := repositories.catalog.FindTrackByID(ctx, trackID)
+		if err != nil {
 			return err
 		} else if !ok {
 			return errTrackNotFound
+		}
+		if normalizePublicationStatus(trackItem.PublicationStatus) != catalogPublicationPublished {
+			return fmt.Errorf("%w: pending track lyrics must be managed through catalog submissions", errCatalogSubmissionState)
 		}
 		if _, ok, err := repositories.lyrics.FindByTrackID(ctx, trackID); err != nil {
 			return err
