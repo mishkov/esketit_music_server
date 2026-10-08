@@ -129,6 +129,13 @@ func TestMCPProtocolAndAuthorization(t *testing.T) {
 		if _, ok := tool.InputSchema["required"].([]any); !ok {
 			t.Fatalf("invalid required schema for %s", tool.Name)
 		}
+		if tool.Name == "submit_album" || tool.Name == "update_album_submission" {
+			properties := tool.InputSchema["properties"].(map[string]any)
+			field, ok := properties["isPublished"].(map[string]any)
+			if !ok || field["type"] != "boolean" {
+				t.Fatalf("album release setting missing from %s: %v", tool.Name, properties)
+			}
+		}
 	}
 	rec = invoke("tools/call", map[string]any{"name": "get_context", "arguments": map[string]any{}}, s.accessToken)
 	if !strings.Contains(rec.Body.String(), "configurationVersion") || !strings.Contains(rec.Body.String(), "workflowGuidance") {
@@ -265,6 +272,11 @@ func TestMCPAudioAlbumAndApproval(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	approvedAlbum := callMCP(t, s, "get_submission", map[string]any{"submissionId": mcpID(album, "submissionId")})
+	albumEntity := approvedAlbum["entity"].(map[string]any)
+	if approvedAlbum["status"] != "approved" || albumEntity["publicationStatus"] != "published" || albumEntity["isPublished"] != true {
+		t.Fatalf("MCP album was not released after album and track approval: %v", approvedAlbum)
+	}
 	final := callMCP(t, s, "get_submission", map[string]any{"submissionId": mcpID(track, "submissionId")})
 	if final["status"] != "approved" {
 		t.Fatalf("final=%v", final)
@@ -272,6 +284,67 @@ func TestMCPAudioAlbumAndApproval(t *testing.T) {
 	path := final["entity"].(map[string]any)["audioFilePath"].(string)
 	if _, err := os.Stat(filepath.Join(s.store.songsDir, filepath.Base(path))); err != nil {
 		t.Fatal("approved audio missing", err)
+	}
+}
+
+func TestMCPAlbumReleaseSetting(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		setting  any
+		expected bool
+	}{
+		{name: "omitted defaults to released", expected: true},
+		{name: "explicit released", setting: true, expected: true},
+		{name: "explicit draft", setting: false, expected: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, requester := newMCPTestService(t)
+			author := callMCP(t, s, "submit_author", map[string]any{"requestId": "author", "currentName": "Artist"})
+			args := map[string]any{"requestId": "album", "title": "Album", "releaseDate": "2024-01-01T00:00:00Z", "authorIds": []int64{mcpID(author, "entityId")}}
+			if tc.setting != nil {
+				args["isPublished"] = tc.setting
+			}
+			created := callMCP(t, s, "submit_album", args)
+			assertSetting := func(result map[string]any, expected bool) {
+				t.Helper()
+				if entity := result["entity"].(map[string]any); entity["isPublished"] != expected {
+					t.Fatalf("isPublished=%v, want %v", entity["isPublished"], expected)
+				}
+			}
+			assertSetting(created, tc.expected)
+			if entity := created["entity"].(map[string]any); entity["publicationStatus"] != "pending_review" {
+				t.Fatalf("new album bypassed review: %v", created)
+			}
+			if !reflect.DeepEqual(created, callMCP(t, s, "submit_album", args)) {
+				t.Fatal("retry changed album release setting")
+			}
+			reviewer := mustCreateCatalogTestUser(t, s.store, "reviewer@example.com")
+			lease, err := s.store.acquireCatalogReviewLease(reviewer.ID, requester.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed, err := s.store.requestCatalogSubmissionChanges(reviewer.ID, mcpID(created, "submissionId"), lease.LeaseToken, catalogReviewDecisionRequest{Message: "Correct album metadata"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			patched := callMCP(t, s, "update_album_submission", map[string]any{"requestId": "title", "submissionId": changed.ID, "expectedRevision": changed.Revision, "title": "Corrected Album"})
+			assertSetting(patched, tc.expected)
+			patched = callMCP(t, s, "update_album_submission", map[string]any{"requestId": "toggle", "submissionId": changed.ID, "expectedRevision": mcpID(patched, "revision"), "isPublished": !tc.expected})
+			assertSetting(patched, !tc.expected)
+			patched = callMCP(t, s, "update_album_submission", map[string]any{"requestId": "restore", "submissionId": changed.ID, "expectedRevision": mcpID(patched, "revision"), "isPublished": tc.expected})
+			assertSetting(patched, tc.expected)
+			callMCP(t, s, "resubmit_submission", map[string]any{"requestId": "resubmit", "submissionId": changed.ID, "expectedRevision": mcpID(patched, "revision")})
+			for _, id := range []int64{mcpID(author, "submissionId"), changed.ID} {
+				if _, err := s.store.approveCatalogSubmission(reviewer.ID, id, lease.LeaseToken); err != nil {
+					t.Fatal(err)
+				}
+			}
+			approved := callMCP(t, s, "get_submission", map[string]any{"submissionId": changed.ID})
+			assertSetting(approved, tc.expected)
+			if entity := approved["entity"].(map[string]any); approved["status"] != "approved" || entity["publicationStatus"] != "published" {
+				t.Fatalf("album approval failed: %v", approved)
+			}
+		})
 	}
 }
 

@@ -44,7 +44,7 @@ limits. Every result supplies `structuredContent` and the equivalent text:
 | `get_submission` | submissionId. Current entity, full feedback history, revision, dependencies and allowedActions. |
 | `get_upload` | uploadToken. Owned media type, size, SHA-256 of input bytes and claimedSubmissionId (null until used). |
 | `submit_author` | requestId + currentName; optional photoUploadTokens. |
-| `submit_album` | requestId + title + authorIds + releaseDate (RFC3339); optional coverUploadToken/additionalInfo. Release date is required by the existing backend. |
+| `submit_album` | requestId + title + authorIds + releaseDate (RFC3339); optional isPublished (defaults to true)/coverUploadToken/additionalInfo. Release date is required by the existing backend. |
 | `submit_track` | requestId + name + authorIds + albumId + audioUploadToken; optional albumOrder/additionalInfo/sourceMetadata. |
 | `update_author_submission` | requestId + submissionId + expectedRevision + at least one changed author field. |
 | `update_album_submission` | requestId + submissionId + expectedRevision + at least one changed album field. |
@@ -61,6 +61,15 @@ omitting it appends new/moved tracks and preserves existing track positions.
 Albums with tracks derive their author list from those tracks. Photo tokens replace
 the entire photo list. Audio tokens replace the recording. Upload tokens are
 owned by the selected user and may be claimed only once.
+
+Album `isPublished` controls whether an approved album is released content.
+New MCP albums default to `true`; supply `false` to intentionally keep a draft.
+Updates preserve this setting when omitted. Review approval independently sets
+`publicationStatus` to `published` and never overrides an explicit draft setting.
+Before approval, even an album with `isPublished: true` remains private under the
+normal review visibility rules. Existing albums created with the old MCP default
+retain their stored setting; an administrator can enable Published in the console
+for affected approved albums.
 
 `additionalInfo` accepts the existing metadata objects; text records require
 `type: "text"`, `title`, and `text`. External links require
