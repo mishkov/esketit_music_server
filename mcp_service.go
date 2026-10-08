@@ -696,7 +696,9 @@ func (s *mcpService) mutate(ctx context.Context, repos domainRepositories, store
 			}
 		}
 	case "album":
-		var request upsertAlbumRequest
+		// New MCP albums are intended for release unless explicitly submitted
+		// as drafts. Updates decode the current entity, preserving omitted fields.
+		request := upsertAlbumRequest{IsPublished: isCreate}
 		err = decodeMCPArguments(encodeFields("title", "authorIds", "releaseDate", "coverImagePath", "additionalInfo", "isPublished"), &request)
 		if err == nil {
 			if isCreate {
