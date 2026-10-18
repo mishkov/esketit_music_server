@@ -57,7 +57,7 @@ func init() {
 }
 
 const (
-	albumColumns    = `id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json, publication_status, requested_by_user_id`
+	albumColumns    = `id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json, publication_status, requested_by_user_id, order_revision`
 	trackColumns    = `id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at, publication_status, requested_by_user_id`
 	authorColumns   = `id, current_name, photos_json, publication_status, requested_by_user_id`
 	playlistColumns = `id, user_id, name, description, cover_image_path, visibility, share_token, track_items_json, system, kind`

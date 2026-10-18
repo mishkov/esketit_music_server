@@ -98,6 +98,12 @@ to an active staged upload after a crash between those steps.
   creates both system playlists in one transaction.
 - Track creation advances its counter and updates the track and album order in
   one transaction.
+- Album reordering checks the dedicated permission, approval, full visible
+  membership, and expected order revision before updating in one transaction.
+  Album orderRevision starts at 1; the catalog repository advances it only when
+  the persisted ordered track IDs change, covering legacy and submission writes.
+  Reads return it with trackIds from the same snapshot. It is separate from
+  submission revisions; MCP includes its persisted retry receipt in the transaction.
 - Track movement updates the track plus its old and new album rows atomically.
 - Track deletion updates album membership and playlist unavailable-track data,
   and deletes lyrics with the track in one transaction.

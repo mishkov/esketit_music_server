@@ -274,7 +274,7 @@ func (s *trackStore) createAlbumSubmission(requesterUserID int64, request upsert
 		item.PublicationStatus = catalogPublicationPendingReview
 		item.RequestedByUserID = requestedByUserID(requesterUserID)
 		state.albums[item.ID] = item
-		if err := state.repositories.catalog.UpdateAlbum(state.ctx, item); err != nil {
+		if err := state.repositories.catalog.UpdateAlbum(state.ctx, &item); err != nil {
 			return err
 		}
 		submission, err := newCatalogSubmission(catalogSubmissionEntityAlbum, item.ID, requesterUserID, item, time.Now().UTC())
@@ -517,7 +517,7 @@ func (s *trackStore) updateAlbumSubmission(requesterUserID, albumID int64, reque
 		if len(item.TrackIDs) == 0 {
 			item.AuthorIDs = append([]int64(nil), request.AuthorIDs...)
 			state.albums[item.ID] = item
-			if err := state.repositories.catalog.UpdateAlbum(state.ctx, item); err != nil {
+			if err := state.repositories.catalog.UpdateAlbum(state.ctx, &item); err != nil {
 				return err
 			}
 		}
@@ -714,7 +714,7 @@ func setCatalogEntityPublication(ctx context.Context, repositories domainReposit
 			return nil, errCatalogSubmissionNotFound
 		}
 		item.PublicationStatus, item.RequestedByUserID = status, requesterUserID
-		return item, repositories.catalog.UpdateAlbum(ctx, item)
+		return item, repositories.catalog.UpdateAlbum(ctx, &item)
 	case catalogSubmissionEntityTrack:
 		item, ok, err := repositories.catalog.FindTrackByID(ctx, entityID)
 		if err != nil {
@@ -1342,7 +1342,7 @@ func deleteCatalogSubmissionEntity(ctx context.Context, repositories domainRepos
 				}
 			}
 			albumItem.AuthorIDs = setToSortedIDs(authorSet)
-			if err := repositories.catalog.UpdateAlbum(ctx, albumItem); err != nil {
+			if err := repositories.catalog.UpdateAlbum(ctx, &albumItem); err != nil {
 				return "", err
 			}
 		}

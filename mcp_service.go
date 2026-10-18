@@ -52,9 +52,16 @@ func mcpError(err error) *mcpProblem {
 	case errors.Is(err, errMCPDisabled):
 		p.Code = "not_configured"
 		p.Recovery = "Ask an administrator to select an MCP acting user in console settings."
-	case errors.Is(err, errMCPForbidden), errors.Is(err, errCatalogSubmissionForbidden):
+	case errors.Is(err, errMCPForbidden), errors.Is(err, errCatalogSubmissionForbidden), errors.Is(err, errAlbumOrderForbidden):
 		p.Code = "forbidden"
-		p.Recovery = "Check get_context permissions; use only the acting user's submissions."
+		p.Recovery = "Check get_context permissions for this operation."
+	case errors.Is(err, errAlbumOrderStale):
+		p.Code = "stale_revision"
+		p.Fields = []string{"expectedOrderRevision"}
+		p.Recovery = "Call get_catalog_item for the album, reassess the complete trackIds and orderRevision, and use a new requestId."
+	case errors.Is(err, errAlbumOrderState), errors.Is(err, errAlbumOrderHidden):
+		p.Code = "invalid_state"
+		p.Recovery = "Only approved albums whose complete membership is visible can be reordered; this tool cannot repair pending albums."
 	case errors.Is(err, errMCPStaleRevision):
 		p.Code = "stale_revision"
 		p.Fields = []string{"expectedRevision"}
@@ -63,7 +70,7 @@ func mcpError(err error) *mcpProblem {
 		p.Code = "request_conflict"
 		p.Fields = []string{"requestId"}
 		p.Recovery = "Retry the original operation with its original payload, or use a new requestId for new work."
-	case errors.Is(err, errCatalogSubmissionNotFound), errors.Is(err, errCatalogUploadNotFound):
+	case errors.Is(err, errCatalogSubmissionNotFound), errors.Is(err, errCatalogUploadNotFound), errors.Is(err, errRepositoryNotFound):
 		p.Code = "not_found"
 		p.Recovery = "Use list_submissions or get_upload to locate an item owned by the acting user."
 	case errors.Is(err, errCatalogUploadClaimed):
@@ -150,6 +157,8 @@ func mcpPermission(name string) string {
 		return permissionAuthorsSubmit
 	case "submit_album":
 		return permissionAlbumsSubmit
+	case "reorder_album_tracks":
+		return permissionAlbumsReorderTracks
 	case "submit_track":
 		return permissionTracksSubmit
 	case "update_author_submission", "update_album_submission", "update_track_submission", "resubmit_submission":
@@ -228,11 +237,27 @@ func (s *mcpService) call(ctx context.Context, name string, raw json.RawMessage,
 		joined := *s.store
 		joined.unitOfWork = joinedUnitOfWork{repos}
 		joined.deferSubmissionCleanup = func(path string) error { cleanup = append(cleanup, path); return nil }
-		response, err := s.mutate(ctx, repos, &joined, userID, name, args)
-		if err != nil {
-			return err
+		if name == "reorder_album_tracks" {
+			var input struct {
+				RequestID string `json:"requestId"`
+				AlbumID   int64  `json:"albumId"`
+				reorderAlbumTracksRequest
+			}
+			encoded, _ := json.Marshal(args)
+			if err := decodeMCPArguments(encoded, &input); err != nil {
+				return mcpInvalid("arguments", err.Error())
+			}
+			if input.AlbumID < 1 {
+				return mcpInvalid("albumId", "albumId must be positive")
+			}
+			result, err = reorderAlbumTracks(ctx, repos, userID, input.AlbumID, input.reorderAlbumTracksRequest)
+		} else {
+			var response catalogSubmissionResponse
+			response, err = s.mutate(ctx, repos, &joined, userID, name, args)
+			if err == nil {
+				result, err = s.submission(ctx, repos, userID, response.ID)
+			}
 		}
-		result, err = s.submission(ctx, repos, userID, response.ID)
 		if err != nil {
 			return err
 		}
@@ -275,7 +300,7 @@ func (s *mcpService) read(ctx context.Context, repos domainRepositories, userID 
 		}
 		return map[string]any{"actingUserId": userID, "permissions": codes, "configurationVersion": settings.Version, "workflowGuidance": settings.WorkflowGuidance, "uploadGuidance": settings.UploadGuidance,
 			"uploads": map[string]any{"endpoint": s.publicBaseURL + "/api/mcp/uploads", "method": "POST", "authentication": "Authorization: Bearer <MCP credential>; reuse your configured MCP connection credential", "contentType": "multipart/form-data", "fileField": "file", "kindField": "kind", "idempotencyHeader": "Idempotency-Key", "kinds": []string{"audio", "author_photo", "album_cover"}, "maxAudioBytes": maxSongUploadSize, "maxImageBytes": maxSubmissionImageSize, "maxImageDimension": maxSubmissionImageDimension, "maxAuthorPhotos": maxSubmissionAuthorPhotos, "audioFormats": []string{"mp3"}, "imageFormats": []string{"jpeg", "png", "gif"}, "example": "curl --fail-with-body -H \"Authorization: Bearer $MCP_ACCESS_TOKEN\" -H \"Idempotency-Key: <stable-upload-request-id>\" -F kind=audio -F file=@./track.mp3 <server-base-url>/api/mcp/uploads"},
-			"rules":   []string{"Only owned submissions may be read or changed.", "Only changes_requested submissions can be edited or resubmitted.", "Use submissionId for workflow tools and entityId for authorIds/albumId.", "Authors and albums must be approved before track approval; correct dependency feedback before resubmitting tracks.", "Updates are patches: omitted fields are preserved. Use [] to clear photoUploadTokens/additionalInfo/sourceMetadata; use null to clear coverUploadToken. Required names and references cannot be cleared.", "Use the same requestId and exact payload after a timeout. Use a new requestId for changed work. Receipts persist without automatic expiry.", "expectedRevision must match current submission details. Refresh context at session start and after permission/configuration errors.", "Review approval, rejection, and settings changes are not MCP tools."}}, nil
+			"rules":   []string{"Only owned submissions may be read or changed.", "Only changes_requested submissions can be edited or resubmitted.", "Use submissionId for workflow tools and entityId for authorIds/albumId.", "Authors and albums must be approved before track approval; correct dependency feedback before resubmitting tracks.", "Updates are patches: omitted fields are preserved. Use [] to clear photoUploadTokens/additionalInfo/sourceMetadata; use null to clear coverUploadToken. Required names and references cannot be cleared.", "Use the same requestId and exact payload after a timeout. Use a new requestId for changed work. Receipts persist without automatic expiry.", "expectedRevision must match current submission details. Refresh context at session start and after permission/configuration errors.", "reorder_album_tracks requires albums.reorder_tracks, publicationStatus published, complete visible membership, and the current orderRevision. It cannot repair pending albums.", "Review approval, rejection, and settings changes are not MCP tools."}}, nil
 	case "get_submission":
 		return s.submission(ctx, repos, userID, argID(args, "submissionId"))
 	case "list_submissions":
@@ -367,6 +392,9 @@ func mcpCatalogItem(ctx context.Context, repos domainRepositories, userID int64,
 	}
 	if !catalogEntityVisible(status, owner, userID) {
 		return nil, errCatalogSubmissionNotFound
+	}
+	if albumItem, ok := item.(album); ok {
+		return sanitizeAlbumForViewer(ctx, repos, albumItem, userID)
 	}
 	if trackItem, ok := item.(track); ok {
 		return mcpTrackWithOrder(ctx, repos, trackItem)
@@ -738,7 +766,7 @@ func (s *mcpService) mutate(ctx context.Context, repos domainRepositories, store
 			return result, errCatalogSubmissionNotFound
 		}
 		item.CoverImagePath = ""
-		if e := repos.catalog.UpdateAlbum(ctx, item); e != nil {
+		if e := repos.catalog.UpdateAlbum(ctx, &item); e != nil {
 			return result, e
 		}
 		sub, _, e := repos.submissions.FindSubmissionByID(ctx, result.ID)

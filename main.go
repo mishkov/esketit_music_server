@@ -133,6 +133,7 @@ type album struct {
 	ReleaseDate       time.Time        `json:"releaseDate"`
 	IsPublished       bool             `json:"isPublished"`
 	TrackIDs          []int64          `json:"trackIds"`
+	OrderRevision     int64            `json:"orderRevision"`
 	AdditionalInfo    []additionalInfo `json:"additionalInfo"`
 	PublicationStatus string           `json:"publicationStatus"`
 	RequestedByUserID *int64           `json:"requestedByUserId,omitempty"`
@@ -746,6 +747,7 @@ func run() (runErr error) {
 	mux.HandleFunc("GET /api/search", searchHandler(store, auth))
 	mux.Handle("POST /api/albums", requirePermission(auth, store, permissionAlbumsCreate, createAlbumHandler(store)))
 	mux.HandleFunc("GET /api/albums/", getAlbumByRouteHandler(store, auth))
+	mux.Handle("PUT /api/albums/{albumId}/track-order", requirePermission(auth, store, permissionAlbumsReorderTracks, reorderAlbumTracksHandler(store)))
 	mux.Handle("PUT /api/albums/", requirePermission(auth, store, permissionAlbumsUpdate, updateAlbumByRouteHandler(store)))
 	mux.Handle("DELETE /api/albums/", requirePermission(auth, store, permissionAlbumsDelete, deleteAlbumByRouteHandler(store)))
 	mux.Handle("POST /api/album-covers", requirePermission(auth, store, permissionAlbumCoversManage, uploadAlbumCoverHandler(albumCoversDir)))
@@ -1466,6 +1468,7 @@ func (s *domainState) createAlbum(req upsertAlbumRequest) (album, error) {
 		TrackIDs:          normalizeTrackIDs(req.TrackIDs),
 		AdditionalInfo:    normalizeAdditionalInfo(req.AdditionalInfo),
 		PublicationStatus: catalogPublicationPublished,
+		OrderRevision:     1,
 	}
 	if err := s.validateAlbumLocked(a); err != nil {
 		return album{}, err
@@ -1494,7 +1497,7 @@ func (s *domainState) createAlbum(req upsertAlbumRequest) (album, error) {
 	delete(previousAlbumIDs, a.ID)
 	for previousID := range previousAlbumIDs {
 		if previous, ok := s.albums[previousID]; ok {
-			if err := s.repositories.catalog.UpdateAlbum(s.ctx, previous); err != nil {
+			if err := s.repositories.catalog.UpdateAlbum(s.ctx, &previous); err != nil {
 				return album{}, err
 			}
 		}
@@ -1520,6 +1523,7 @@ func (s *domainState) updateAlbum(id int64, req upsertAlbumRequest) (album, bool
 		AdditionalInfo:    normalizeAdditionalInfo(req.AdditionalInfo),
 		PublicationStatus: current.PublicationStatus,
 		RequestedByUserID: current.RequestedByUserID,
+		OrderRevision:     current.OrderRevision,
 	}
 	if err := s.validateAlbumLocked(updated); err != nil {
 		return album{}, true, err
@@ -1551,7 +1555,7 @@ func (s *domainState) updateAlbum(id int64, req upsertAlbumRequest) (album, bool
 		}
 	}
 	for albumID := range affectedAlbumIDs {
-		if err := s.repositories.catalog.UpdateAlbum(s.ctx, s.albums[albumID]); err != nil {
+		if err := s.persistAlbumLocked(albumID); err != nil {
 			return album{}, true, err
 		}
 	}
@@ -1619,7 +1623,7 @@ func (s *domainState) create(req upsertTrackRequest) (track, error) {
 	if err := s.repositories.catalog.InsertTrack(s.ctx, t); err != nil {
 		return track{}, err
 	}
-	if err := s.repositories.catalog.UpdateAlbum(s.ctx, s.albums[req.AlbumID]); err != nil {
+	if err := s.persistAlbumLocked(req.AlbumID); err != nil {
 		return track{}, err
 	}
 	return s.tracks[t.ID], nil
@@ -1676,11 +1680,11 @@ func (s *domainState) update(id int64, req upsertTrackRequest) (track, bool, err
 	if err := s.repositories.catalog.UpdateTrack(s.ctx, s.tracks[id]); err != nil {
 		return track{}, true, err
 	}
-	if err := s.repositories.catalog.UpdateAlbum(s.ctx, s.albums[current.AlbumID]); err != nil {
+	if err := s.persistAlbumLocked(current.AlbumID); err != nil {
 		return track{}, true, err
 	}
 	if updated.AlbumID != current.AlbumID {
-		if err := s.repositories.catalog.UpdateAlbum(s.ctx, s.albums[updated.AlbumID]); err != nil {
+		if err := s.persistAlbumLocked(updated.AlbumID); err != nil {
 			return track{}, true, err
 		}
 	}
@@ -1706,7 +1710,7 @@ func (s *domainState) delete(id int64) (bool, error) {
 	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
 		return false, err
 	}
-	if err := s.repositories.catalog.UpdateAlbum(s.ctx, s.albums[t.AlbumID]); err != nil {
+	if err := s.persistAlbumLocked(t.AlbumID); err != nil {
 		return false, err
 	}
 	for _, p := range s.playlists {
@@ -5737,20 +5741,43 @@ func validatePlaylist(p playlist) error {
 }
 
 func validatePlaylistTrackOrder(trackIDs []int64, existing []playlistTrack) error {
-	if len(trackIDs) != len(existing) {
-		return fmt.Errorf("%w: trackIds must contain exactly %d items", errInvalidPlaylistPayload, len(existing))
+	existingIDs := make([]int64, 0, len(existing))
+	for _, item := range existing {
+		existingIDs = append(existingIDs, item.TrackID)
 	}
-	if len(trackIDs) != len(normalizeTrackIDs(trackIDs)) {
-		return fmt.Errorf("%w: duplicate trackId is not allowed", errInvalidPlaylistPayload)
+	if err := validateExactTrackOrder(trackIDs, existingIDs); err != nil {
+		return fmt.Errorf("%w: %v", errInvalidPlaylistPayload, err)
+	}
+	return nil
+}
+
+// validateExactTrackOrder accepts only a permutation; it never drops or deduplicates IDs.
+func validateExactTrackOrder(trackIDs, existing []int64) error {
+	if len(trackIDs) != len(existing) {
+		return fmt.Errorf("trackIds must contain exactly %d items", len(existing))
 	}
 	existingSet := make(map[int64]struct{}, len(existing))
-	for _, item := range existing {
-		existingSet[item.TrackID] = struct{}{}
-	}
-	for _, trackID := range trackIDs {
-		if _, ok := existingSet[trackID]; !ok {
-			return fmt.Errorf("%w: trackId %d is not part of the playlist", errInvalidPlaylistPayload, trackID)
+	for _, id := range existing {
+		if id <= 0 {
+			return errors.New("current track membership is invalid")
 		}
+		if _, exists := existingSet[id]; exists {
+			return errors.New("current track membership contains duplicates")
+		}
+		existingSet[id] = struct{}{}
+	}
+	seen := make(map[int64]struct{}, len(trackIDs))
+	for _, id := range trackIDs {
+		if id <= 0 {
+			return errors.New("trackIds must be positive")
+		}
+		if _, exists := seen[id]; exists {
+			return errors.New("duplicate trackId is not allowed")
+		}
+		if _, exists := existingSet[id]; !exists {
+			return fmt.Errorf("trackId %d is not part of the current membership", id)
+		}
+		seen[id] = struct{}{}
 	}
 	return nil
 }

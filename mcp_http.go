@@ -44,11 +44,11 @@ func writeMCPHTTPError(w http.ResponseWriter, err error, status int) {
 }
 func mcpHTTPStatus(err error) int {
 	switch {
-	case errors.Is(err, errMCPForbidden):
+	case errors.Is(err, errMCPForbidden), errors.Is(err, errAlbumOrderForbidden):
 		return http.StatusForbidden
 	case errors.Is(err, errMCPDisabled):
 		return http.StatusServiceUnavailable
-	case errors.Is(err, errMCPStaleRevision), errors.Is(err, errMCPRequestConflict), errors.Is(err, errCatalogUploadClaimed):
+	case errors.Is(err, errMCPStaleRevision), errors.Is(err, errMCPRequestConflict), errors.Is(err, errCatalogUploadClaimed), errors.Is(err, errAlbumOrderStale), errors.Is(err, errAlbumOrderState), errors.Is(err, errAlbumOrderHidden):
 		return http.StatusConflict
 	case errors.Is(err, errRepositoryPersistence), errors.Is(err, errRepositoryConflict):
 		return http.StatusServiceUnavailable
@@ -236,7 +236,7 @@ func mcpToolSpecs() []mcpToolSpec {
 	specs := []mcpToolSpec{
 		{"get_context", "Read acting identity, permissions, editable workflow/upload guidance, upload limits and server-enforced rules. Call at session start.", schema(map[string]any{}), false},
 		{"search_catalog", "Find candidate matches among published entities and the acting user's pending entities. Search before creating; inspect IDs and relationships to confirm matches.", schema(map[string]any{"query": text("Case-insensitive substring search."), "entityType": kind, "page": page, "pageSize": pageSize}, "query"), false},
-		{"get_catalog_item", "Read a visible author, album or track and its relationship IDs. Use to confirm search matches.", schema(map[string]any{"entityType": kind, "entityId": id}, "entityType", "entityId"), false},
+		{"get_catalog_item", "Read a visible author, album or track and its relationship IDs. Albums include trackIds and orderRevision from one snapshot; trackIds exclude invisible pending tracks. Reordering requires the complete album membership.", schema(map[string]any{"entityType": kind, "entityId": id}, "entityType", "entityId"), false},
 		{"list_submissions", "List owned submissions, feedback, revisions, dependencies and allowedActions, including terminal records. Poll this tool to discover reviewer feedback.", schema(map[string]any{"status": map[string]any{"type": "string", "enum": []string{"pending_review", "changes_requested", "approved", "rejected", "cancelled"}}, "entityType": kind, "updatedSince": map[string]any{"type": "string", "format": "date-time"}, "page": page, "pageSize": pageSize}), false},
 		{"get_submission", "Read full current entity data, feedback history, revision, dependencies and permitted next actions. Call before correcting or resubmitting.", schema(map[string]any{"submissionId": id}, "submissionId"), false},
 		{"get_upload", "Read an owned upload's kind, byte size, checksum and claimed submission ID. Claimed tokens cannot be reused for new submissions.", schema(map[string]any{"uploadToken": token}, "uploadToken"), false},
@@ -248,6 +248,7 @@ func mcpToolSpecs() []mcpToolSpec {
 	}
 	required := map[string][]string{"author": {"currentName"}, "album": {"title", "authorIds", "releaseDate"}, "track": {"name", "authorIds", "albumId", "audioUploadToken"}}
 	requestID := map[string]any{"type": "string", "minLength": 1, "maxLength": 128, "pattern": `\S`, "description": "Stable unique operation ID. Repeat the same ID and exact payload after timeout; use a new ID for changed work."}
+	specs = append(specs, mcpToolSpec{"reorder_album_tracks", "Reorder approved albums (publicationStatus published, independent of isPublished). Cannot repair pending albums. Supply every current track exactly once and expectedOrderRevision from get_catalog_item; invisible pending tracks prevent reordering. An identical order preserves the revision. Reuse requestId only for the exact same payload.", schema(map[string]any{"requestId": requestID, "albumId": id, "trackIds": map[string]any{"type": "array", "items": id, "uniqueItems": true}, "expectedOrderRevision": id}, "requestId", "albumId", "trackIds", "expectedOrderRevision"), true})
 	for _, entityType := range []string{"author", "album", "track"} {
 		for _, create := range []bool{true, false} {
 			props := map[string]any{"requestId": requestID}

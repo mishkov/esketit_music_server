@@ -801,6 +801,72 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /api/albums/{albumId}/track-order:
+    put:
+      tags: [Albums]
+      summary: Reorder every track in an approved album
+      description: |
+        Requires authentication and `albums.reorder_tracks` (granted to administrators
+        by default). Only albums with `publicationStatus: published` are eligible;
+        the separate `isPublished` flag does not control approval.
+        Supply every current track exactly once. Duplicate, missing, additional,
+        unknown, or foreign-album IDs are rejected without normalization. This
+        operation changes order only and cannot add, remove, move, or repair tracks.
+        Validation, permission and revision checks, and persistence are transactional.
+        Read `trackIds` and `orderRevision` together from the album first. Normal
+        visibility rules still apply: reads exclude other users' pending tracks,
+        and reordering an album containing invisible tracks returns 409 rather than
+        reordering a filtered subset. Pending albums cannot be repaired here.
+        An identical order with the current revision succeeds without advancing it.
+        Ordering revisions are independent of submission revisions and advance on
+        all membership or order changes, including legacy mutations and cancellations.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: albumId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReorderAlbumTracksRequest'
+            example:
+              trackIds: [103, 101, 102]
+              expectedOrderRevision: 4
+      responses:
+        '200':
+          description: Persisted order and its revision (unchanged for an identical order)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlbumTrackOrder'
+              example:
+                albumId: 42
+                trackIds: [103, 101, 102]
+                orderRevision: 5
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Unapproved album, stale order revision, or invisible album tracks
+          content:
+            text/plain:
+              schema:
+                $ref: '#/components/schemas/PlainError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /api/albums/{id}/tracks:
     get:
       tags: [Albums]
@@ -3946,8 +4012,18 @@ components:
             format: int64
             minimum: 1
           description: |
-            May be empty. Album list responses without `catalog.unpublished.read`
+            May be empty. Excludes pending tracks invisible to the viewer; if any exist,
+            reordering is blocked rather than applying to this filtered subset.
+            Album list responses without `catalog.unpublished.read`
             omit albums whose `trackIds` array is empty.
+        orderRevision:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            Persisted order/membership revision, initially 1 for new and existing albums.
+            Returned with trackIds from the same snapshot. Metadata-only edits and
+            identical-order requests do not advance it. Independent of submission revisions.
         additionalInfo:
           type: array
           items:
@@ -3959,7 +4035,43 @@ components:
           format: int64
           minimum: 1
           nullable: true
-      required: [id, title, coverImagePath, authorIds, releaseDate, isPublished, trackIds, additionalInfo, publicationStatus]
+      required: [id, title, coverImagePath, authorIds, releaseDate, isPublished, trackIds, orderRevision, additionalInfo, publicationStatus]
+
+    ReorderAlbumTracksRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        trackIds:
+          type: array
+          uniqueItems: true
+          description: Every current album track ID exactly once, including owned pending tracks.
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        expectedOrderRevision:
+          type: integer
+          format: int64
+          minimum: 1
+      required: [trackIds, expectedOrderRevision]
+
+    AlbumTrackOrder:
+      type: object
+      properties:
+        albumId:
+          type: integer
+          format: int64
+        trackIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        orderRevision:
+          type: integer
+          format: int64
+          minimum: 1
+      required: [albumId, trackIds, orderRevision]
 
     UpsertAlbumRequest:
       type: object

@@ -46,7 +46,7 @@ func newMCPTestService(t *testing.T) (*mcpService, user) {
 func callMCP(t *testing.T, s *mcpService, name string, args map[string]any) map[string]any {
 	t.Helper()
 	raw, _ := json.Marshal(args)
-	write := strings.HasPrefix(name, "submit_") || strings.HasPrefix(name, "update_") || name == "resubmit_submission" || name == "cancel_submission"
+	write := strings.HasPrefix(name, "submit_") || strings.HasPrefix(name, "update_") || name == "resubmit_submission" || name == "cancel_submission" || name == "reorder_album_tracks"
 	result, err := s.call(context.Background(), name, raw, write)
 	if err != nil {
 		t.Fatalf("%s: %v", name, err)
@@ -122,7 +122,7 @@ func TestMCPProtocolAndAuthorization(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &listing); err != nil {
 		t.Fatalf("list: %s", rec.Body.String())
 	}
-	if len(listing.Result.Tools) != 14 {
+	if len(listing.Result.Tools) != 15 {
 		t.Fatalf("tools=%d %s", len(listing.Result.Tools), rec.Body.String())
 	}
 	for _, tool := range listing.Result.Tools {
@@ -612,7 +612,7 @@ func TestMCPOfficialClientInteroperability(t *testing.T) {
 	}
 	defer session.Close()
 	tools, err := session.ListTools(ctx, nil)
-	if err != nil || len(tools.Tools) != 14 {
+	if err != nil || len(tools.Tools) != 15 {
 		t.Fatalf("tools=%v err=%v", tools, err)
 	}
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "submit_author", Arguments: map[string]any{"requestId": "sdk-author", "currentName": "SDK Artist"}})

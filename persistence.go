@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -39,10 +40,11 @@ type AuthorRepository interface {
 type CatalogRepository interface {
 	ListAlbums(context.Context) ([]album, error)
 	ListTracks(context.Context) ([]track, error)
+	ListAlbumTracks(context.Context, int64) ([]track, error)
 	FindAlbumByID(context.Context, int64) (album, bool, error)
 	FindTrackByID(context.Context, int64) (track, bool, error)
 	InsertAlbum(context.Context, album) error
-	UpdateAlbum(context.Context, album) error
+	UpdateAlbum(context.Context, *album) error
 	DeleteAlbum(context.Context, int64) error
 	InsertTrack(context.Context, track) error
 	UpdateTrack(context.Context, track) error
@@ -488,7 +490,7 @@ func scanAlbum(row rowScanner) (album, error) {
 	var authorIDsJSON, releaseDate, trackIDsJSON, additionalInfoJSON string
 	var isPublished int
 	var requestedBy sql.NullInt64
-	if err := row.Scan(&item.ID, &item.Title, &item.CoverImagePath, &authorIDsJSON, &releaseDate, &isPublished, &trackIDsJSON, &additionalInfoJSON, &item.PublicationStatus, &requestedBy); err != nil {
+	if err := row.Scan(&item.ID, &item.Title, &item.CoverImagePath, &authorIDsJSON, &releaseDate, &isPublished, &trackIDsJSON, &additionalInfoJSON, &item.PublicationStatus, &requestedBy, &item.OrderRevision); err != nil {
 		return album{}, translateSQLiteError(err)
 	}
 	if err := unmarshalJSONColumn(authorIDsJSON, &item.AuthorIDs); err != nil {
@@ -525,6 +527,24 @@ func (r *sqliteRepositories) ListTracks(ctx context.Context) (items []track, ret
 		return nil, translateSQLiteError(err)
 	}
 	defer joinRowsCloseError(&returnErr, rows, "list tracks")
+	for rows.Next() {
+		item, err := scanTrack(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, translateSQLiteError(rows.Err())
+}
+
+// ListAlbumTracks returns unfiltered membership for domain validation, including
+// pending tracks. Public read projections must still apply catalog visibility.
+func (r *sqliteRepositories) ListAlbumTracks(ctx context.Context, albumID int64) (items []track, returnErr error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT `+trackColumns+` FROM tracks WHERE album_id = ? ORDER BY id`, albumID)
+	if err != nil {
+		return nil, translateSQLiteError(err)
+	}
+	defer joinRowsCloseError(&returnErr, rows, "list album membership")
 	for rows.Next() {
 		item, err := scanTrack(rows)
 		if err != nil {
@@ -595,18 +615,30 @@ func (r *sqliteRepositories) InsertAlbum(ctx context.Context, item album) error 
 	return translateSQLiteError(err)
 }
 
-func (r *sqliteRepositories) UpdateAlbum(ctx context.Context, item album) error {
-	authorIDsJSON, trackIDsJSON, additionalInfoJSON, err := encodeAlbum(item)
+// UpdateAlbum owns ordering revisions for every catalog mutation, including
+// legacy writes and submission removal. Callers use transaction-bound repositories.
+// Returning the stored revision through item keeps responses and snapshots current.
+func (r *sqliteRepositories) UpdateAlbum(ctx context.Context, item *album) error {
+	current, found, err := r.FindAlbumByID(ctx, item.ID)
 	if err != nil {
 		return err
 	}
-	result, err := r.q.ExecContext(ctx, `UPDATE albums SET title = ?, cover_image_path = ?, author_ids_json = ?, release_date = ?,
-		is_published = ?, track_ids_json = ?, additional_info_json = ?, publication_status = ?, requested_by_user_id = ? WHERE id = ?`,
-		item.Title, item.CoverImagePath, authorIDsJSON, formatSQLiteTime(item.ReleaseDate), boolToSQLiteInt(item.IsPublished), trackIDsJSON, additionalInfoJSON, normalizePublicationStatus(item.PublicationStatus), item.RequestedByUserID, item.ID)
-	if err != nil {
-		return translateSQLiteError(err)
+	if !found {
+		return errRepositoryNotFound
 	}
-	return requireAffected(result)
+	increment := 0
+	if !slices.Equal(current.TrackIDs, item.TrackIDs) {
+		increment = 1
+	}
+	authorIDsJSON, trackIDsJSON, additionalInfoJSON, err := encodeAlbum(*item)
+	if err != nil {
+		return err
+	}
+	err = r.q.QueryRowContext(ctx, `UPDATE albums SET title = ?, cover_image_path = ?, author_ids_json = ?, release_date = ?,
+ is_published = ?, track_ids_json = ?, additional_info_json = ?, publication_status = ?, requested_by_user_id = ?,
+ order_revision = order_revision + ? WHERE id = ? RETURNING order_revision`,
+		item.Title, item.CoverImagePath, authorIDsJSON, formatSQLiteTime(item.ReleaseDate), boolToSQLiteInt(item.IsPublished), trackIDsJSON, additionalInfoJSON, normalizePublicationStatus(item.PublicationStatus), item.RequestedByUserID, increment, item.ID).Scan(&item.OrderRevision)
+	return translateSQLiteError(err)
 }
 
 func (r *sqliteRepositories) DeleteAlbum(ctx context.Context, id int64) error {

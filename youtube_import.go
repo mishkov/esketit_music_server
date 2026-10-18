@@ -3139,7 +3139,7 @@ func (s *domainState) insertTrackIfSourceAbsent(req upsertTrackRequest, target s
 	if err := s.repositories.catalog.InsertTrack(s.ctx, created); err != nil {
 		return track{}, err
 	}
-	if err := s.repositories.catalog.UpdateAlbum(s.ctx, s.albums[req.AlbumID]); err != nil {
+	if err := s.persistAlbumLocked(req.AlbumID); err != nil {
 		return track{}, err
 	}
 	return cloneTrack(s.tracks[created.ID]), nil
