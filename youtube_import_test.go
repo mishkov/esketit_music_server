@@ -231,6 +231,7 @@ func TestYouTubeImportAddCurrentCreateDownloadsAndCreatesTrack(t *testing.T) {
 	if dto.Status != youtubeImportStatusCompleted || dto.Progress.Saved != 1 {
 		t.Fatalf("AddCurrent() dto = %#v", dto)
 	}
+	assertAlbumOrder(t, store, album.ID, []int64{createdTrack.ID}, album.OrderRevision+1)
 	if !strings.HasPrefix(createdTrack.AudioFilePath, "/api/songs/") {
 		t.Fatalf("created track audio path = %q", createdTrack.AudioFilePath)
 	}

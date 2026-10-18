@@ -27,6 +27,7 @@ func defaultSchemaMigrations() []schemaMigration {
 		{version: 7, name: "catalog submission approval workflow", apply: migrateCatalogSubmissionWorkflow},
 		{version: 8, name: "retain rejected catalog dependencies", apply: migrateRejectedCatalogDependencies},
 		{version: 9, name: "MCP submission integration", apply: migrateMCP},
+		{version: 10, name: "album ordering revisions and permission", apply: migrateAlbumOrder},
 	}
 }
 

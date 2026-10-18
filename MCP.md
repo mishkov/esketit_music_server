@@ -39,7 +39,7 @@ limits. Every result supplies `structuredContent` and the equivalent text:
 | --- | --- |
 | `get_context` | No arguments. Identity, permission codes, configurationVersion, editable guidance, generated upload contract, and enforced workflow rules. |
 | `search_catalog` | query; optional entityType/page/pageSize. Published and owned pending authors/albums/tracks, case-insensitive substring matching. No automatic fuzzy identity decisions. |
-| `get_catalog_item` | entityType + entityId. Full visible entity metadata and relationship IDs. |
+| `get_catalog_item` | entityType + entityId. Visible metadata and relationship IDs. Albums include trackIds and orderRevision from one snapshot; invisible pending tracks are excluded. |
 | `list_submissions` | Optional status/entityType/updatedSince/page/pageSize. Full owned records, feedback, revision, dependencies and allowedActions, including terminal submissions. |
 | `get_submission` | submissionId. Current entity, full feedback history, revision, dependencies and allowedActions. |
 | `get_upload` | uploadToken. Owned media type, size, SHA-256 of input bytes and claimedSubmissionId (null until used). |
@@ -50,6 +50,7 @@ limits. Every result supplies `structuredContent` and the equivalent text:
 | `update_album_submission` | requestId + submissionId + expectedRevision + at least one changed album field. |
 | `update_track_submission` | requestId + submissionId + expectedRevision + at least one changed track field. |
 | `resubmit_submission` | requestId + submissionId + expectedRevision. changes_requested → pending_review, subject to dependency validation. |
+| `reorder_album_tracks` | requestId + albumId + trackIds + expectedOrderRevision. Reorder every track in an approved album; requires albums.reorder_tracks. Cannot repair pending albums. |
 | `cancel_submission` | requestId + submissionId + expectedRevision. Eligible owned pending submissions; dependent items block cancellation. |
 
 Submission responses include both `submissionId` and `entityId`. Use entity IDs
@@ -70,6 +71,44 @@ Before approval, even an album with `isPublished: true` remains private under th
 normal review visibility rules. Existing albums created with the old MCP default
 retain their stored setting; an administrator can enable Published in the console
 for affected approved albums.
+
+`reorder_album_tracks` works only when `publicationStatus` is `published`
+(approved), independently of `isPublished`. It requires the dedicated
+`albums.reorder_tracks` permission, granted to the admin role by default.
+Read the album with `get_catalog_item`, then send:
+
+```json
+{
+  "requestId": "album-42-order-1",
+  "albumId": 42,
+  "trackIds": [103, 101, 102],
+  "expectedOrderRevision": 4
+}
+```
+
+The success envelope contains `data: {"albumId":42,"trackIds":[103,101,102],
+"orderRevision":5}`. Supply every current track exactly once. Duplicates, missing,
+additional, unknown, nonpositive, and foreign-album IDs fail without normalization.
+The operation changes only order: it cannot add/remove/move tracks or repair a
+pending album. It does not change pending-submission editing rules or support
+skipped positions.
+
+Visibility rules still apply. An approved album may contain pending tracks;
+album reads exclude tracks invisible to the acting user, and reordering is
+blocked with `invalid_state` if the full membership is not visible. Never submit
+a filtered subset. Owned pending tracks may be included in a complete order.
+A stale revision returns `stale_revision` with field `expectedOrderRevision`;
+read the album again and reassess before using a new requestId. Unapproved albums
+also return `invalid_state`.
+
+Album `orderRevision` starts at 1 for existing and new albums. Every membership
+or order change advances it, including legacy track/album writes, movement,
+deletion, cancellation, and rejection. Metadata-only changes and an identical
+order with the current revision leave it unchanged. Submission `revision` is
+separate. Permission checks, validation, revision comparison, update and persisted
+receipt insertion share one transaction. Identical retries return the original
+receipt even after later order changes or a restart; changed payloads require a
+new requestId. This tool does not automatically repair existing album data.
 
 `additionalInfo` accepts the existing metadata objects; text records require
 `type: "text"`, `title`, and `text`. External links require

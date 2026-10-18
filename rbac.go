@@ -22,6 +22,7 @@ const (
 	permissionSongsCleanup             = "songs.cleanup"
 	permissionAlbumsCreate             = "albums.create"
 	permissionAlbumsUpdate             = "albums.update"
+	permissionAlbumsReorderTracks      = "albums.reorder_tracks"
 	permissionAlbumsDelete             = "albums.delete"
 	permissionAlbumCoversManage        = "album_covers.manage"
 	permissionTracksCreate             = "tracks.create"
@@ -148,6 +149,7 @@ func definedPermissions() []permissionDefinition {
 		{permissionSongsCleanup, "Inspect and delete unused song files"},
 		{permissionAlbumsCreate, "Create albums"},
 		{permissionAlbumsUpdate, "Update albums"},
+		{permissionAlbumsReorderTracks, "Reorder approved album tracks"},
 		{permissionAlbumsDelete, "Delete albums"},
 		{permissionAlbumCoversManage, "Upload, search, and import album covers"},
 		{permissionTracksCreate, "Create tracks"},
