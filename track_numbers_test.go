@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -203,6 +204,9 @@ func TestReviewedTrackNumbersPreserveGaps(t *testing.T) {
 }
 
 func TestMCPRequiredGappedNumbers(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg required for real MP3 validation")
+	}
 	s, _ := newMCPTestService(t)
 	_, _, artist := trackNumberFixture(t, s.store)
 	album, err := s.store.createAlbum(upsertAlbumRequest{Title: "MCP gaps", ReleaseDate: time.Now().UTC()})
