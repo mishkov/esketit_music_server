@@ -414,6 +414,8 @@ func buildCatalogSubmissionResponses(ctx context.Context, repositories domainRep
 
 func catalogSubmissionEntity(ctx context.Context, repositories domainRepositories, submission catalogSubmission) (any, error) {
 	switch submission.EntityType {
+	case catalogSubmissionEntityAlbumTrackOrder:
+		return albumTrackOrderProposalView(ctx, repositories, submission)
 	case catalogSubmissionEntityAuthor:
 		item, ok, err := repositories.authors.FindByID(ctx, submission.EntityID)
 		if err != nil {
@@ -633,7 +635,10 @@ func (s *trackStore) resubmitCatalogSubmission(requesterUserID, submissionID int
 		if err := ensureSubmissionDependenciesReady(context.Background(), repositories, item); err != nil {
 			return err
 		}
-		entity, err := setCatalogEntityPublication(context.Background(), repositories, item.EntityType, item.EntityID, catalogPublicationPendingReview, requestedByUserID(requesterUserID))
+		var entity any = item.Snapshot
+		if item.EntityType != catalogSubmissionEntityAlbumTrackOrder {
+			entity, err = setCatalogEntityPublication(context.Background(), repositories, item.EntityType, item.EntityID, catalogPublicationPendingReview, requestedByUserID(requesterUserID))
+		}
 		if err != nil {
 			return err
 		}
@@ -662,6 +667,9 @@ func (s *trackStore) resubmitCatalogSubmission(requesterUserID, submissionID int
 }
 
 func ensureSubmissionDependenciesReady(ctx context.Context, repositories domainRepositories, submission catalogSubmission) error {
+	if submission.EntityType == catalogSubmissionEntityAlbumTrackOrder {
+		return albumTrackOrderDependenciesReady(ctx, repositories, submission)
+	}
 	if submission.EntityType != catalogSubmissionEntityTrack {
 		return nil
 	}
@@ -898,7 +906,10 @@ func (s *trackStore) requestCatalogSubmissionChanges(reviewerUserID, submissionI
 				return err
 			}
 		}
-		entity, err := setCatalogEntityPublication(ctx, repositories, item.EntityType, item.EntityID, catalogPublicationChangesRequested, requestedByUserID(item.RequesterUserID))
+		var entity any = item.Snapshot
+		if item.EntityType != catalogSubmissionEntityAlbumTrackOrder {
+			entity, err = setCatalogEntityPublication(ctx, repositories, item.EntityType, item.EntityID, catalogPublicationChangesRequested, requestedByUserID(item.RequesterUserID))
+		}
 		if err != nil {
 			return err
 		}
@@ -960,7 +971,12 @@ func (s *trackStore) approveCatalogSubmission(reviewerUserID, submissionID int64
 			return errCatalogSubmissionState
 		}
 
-		if item.EntityType == catalogSubmissionEntityTrack {
+		if item.EntityType == catalogSubmissionEntityAlbumTrackOrder {
+			result.Entity, err = applyAlbumTrackOrderProposal(ctx, repositories, item)
+			if err != nil {
+				return err
+			}
+		} else if item.EntityType == catalogSubmissionEntityTrack {
 			trackItem, ok, err := repositories.catalog.FindTrackByID(ctx, item.EntityID)
 			if err != nil {
 				return err
@@ -1204,7 +1220,10 @@ func (s *trackStore) rejectCatalogSubmission(reviewerUserID, submissionID int64,
 				return err
 			}
 		}
-		entity, err := catalogEntityByType(ctx, repositories, item.EntityType, item.EntityID)
+		var entity any = item.Snapshot
+		if item.EntityType != catalogSubmissionEntityAlbumTrackOrder {
+			entity, err = catalogEntityByType(ctx, repositories, item.EntityType, item.EntityID)
+		}
 		if err != nil {
 			return err
 		}
@@ -1219,7 +1238,9 @@ func (s *trackStore) rejectCatalogSubmission(reviewerUserID, submissionID int64,
 			fmt.Sprintf("feedback:%d:penalty", feedback.ID), "review_penalty", -request.RatingPenalty, request.Message, now); err != nil {
 			return err
 		}
-		stagedFile, err = deleteCatalogSubmissionEntity(ctx, repositories, item.EntityType, item.EntityID)
+		if item.EntityType != catalogSubmissionEntityAlbumTrackOrder {
+			stagedFile, err = deleteCatalogSubmissionEntity(ctx, repositories, item.EntityType, item.EntityID)
+		}
 		if errors.Is(err, errCatalogSubmissionDependency) && item.EntityType != catalogSubmissionEntityTrack {
 			// Keep referenced entities so pending tracks can be corrected or cancelled.
 			_, err = setCatalogEntityPublication(ctx, repositories, item.EntityType, item.EntityID, catalogPublicationRejected, requestedByUserID(item.RequesterUserID))
@@ -1276,11 +1297,16 @@ func (s *trackStore) cancelCatalogSubmission(requesterUserID, submissionID int64
 		if item.Status != catalogSubmissionStatusPendingReview && item.Status != catalogSubmissionStatusChangesRequested {
 			return errCatalogSubmissionState
 		}
-		entity, err := catalogEntityByType(ctx, repositories, item.EntityType, item.EntityID)
+		var entity any = item.Snapshot
+		if item.EntityType != catalogSubmissionEntityAlbumTrackOrder {
+			entity, err = catalogEntityByType(ctx, repositories, item.EntityType, item.EntityID)
+		}
 		if err != nil {
 			return err
 		}
-		stagedFile, err = deleteCatalogSubmissionEntity(ctx, repositories, item.EntityType, item.EntityID)
+		if item.EntityType != catalogSubmissionEntityAlbumTrackOrder {
+			stagedFile, err = deleteCatalogSubmissionEntity(ctx, repositories, item.EntityType, item.EntityID)
+		}
 		if err != nil {
 			return err
 		}

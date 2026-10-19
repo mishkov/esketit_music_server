@@ -456,6 +456,8 @@ func parseCatalogReviewSubmissionID(path, action string) (int64, error) {
 
 func writeCatalogSubmissionError(w http.ResponseWriter, r *http.Request, err error, operation string) {
 	switch {
+	case errors.Is(err, errAlbumOrderStale), errors.Is(err, errAlbumOrderState), errors.Is(err, errAlbumOrderHidden), errors.Is(err, errMCPStaleRevision), errors.Is(err, errCatalogSubmissionState):
+		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.Is(err, errInvalidAuthor), errors.Is(err, errInvalidAlbum), errors.Is(err, errInvalidTrack),
 		errors.Is(err, errInvalidLyricsPayload), strings.Contains(err.Error(), "required"), strings.Contains(err.Error(), "must be"):
 		http.Error(w, err.Error(), http.StatusBadRequest)
