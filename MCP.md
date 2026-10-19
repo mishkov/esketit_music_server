@@ -51,6 +51,8 @@ limits. Every result supplies `structuredContent` and the equivalent text:
 | `update_track_submission` | requestId + submissionId + expectedRevision + at least one changed track field. |
 | `resubmit_submission` | requestId + submissionId + expectedRevision. changes_requested → pending_review, subject to dependency validation. |
 | `reorder_album_tracks` | requestId + albumId + trackIds + expectedOrderRevision. Reorder every track in an approved album; requires albums.reorder_tracks. Cannot repair pending albums. |
+| `submit_album_track_order` | requestId + albumId + trackIds + expectedOrderRevision; optional reason. Creates a pending order proposal without changing the album; requires albums.submit_track_order. |
+| `update_album_track_order_submission` | requestId + submissionId + expectedRevision; patch trackIds/expectedOrderRevision/reason on an owned changes_requested proposal. |
 | `cancel_submission` | requestId + submissionId + expectedRevision. Eligible owned pending submissions; dependent items block cancellation. |
 
 Submission responses include both `submissionId` and `entityId`. Use entity IDs
@@ -191,3 +193,46 @@ empty text and are limited to 32,000 UTF-8 bytes each. Stale versions return
 409 without changes. Settings changes are audited. CredentialConfigured is
 read-only; no credential is returned. Editable text guides the agent while
 permissions, upload limits and lifecycle constraints remain server-enforced.
+
+## Reviewed album track order proposals
+
+Use `submit_album_track_order` for changes that need human approval. The deployed
+`reorder_album_tracks` tool and direct HTTP API keep their existing behavior.
+The proposal permission `albums.submit_track_order` is granted to admin and
+listener roles by default; it does not grant immediate reorder access.
+
+Read the album's complete visible `trackIds` and `orderRevision` using
+`get_catalog_item`, then submit every current member exactly once in the intended
+order. Only approved albums (`publicationStatus: published`, independent of
+`isPublished`) are eligible. Hidden pending membership prevents submission.
+Do not omit requested ordering to bypass an error.
+
+Each proposal has its own `submissionId`, `entityType: album_track_order`, and
+`entityId` pointing to the target album. One pending_review or changes_requested
+proposal is allowed per requester/album; proposals from other requesters can
+coexist. Filter `list_submissions` by `entityType: album_track_order` and use
+`get_submission` for feedback and allowedActions. Proposal entities include:
+
+- `baseTrackIds`, proposed `trackIds`, `expectedOrderRevision`, and `reason`;
+- `currentTrackIds`, `currentOrderRevision`, `targetAvailable`, and visible
+  track summaries (`id`/`name`) for comparison;
+- `appliedOrderRevision` once approved. The saved snapshot remains historical.
+
+Review uses existing reviewer endpoints, permissions, and requester leases;
+there are no new MCP review tools. Approval rechecks current membership and the
+base ordering revision in the same transaction as the order change and decision.
+If a direct reorder, track insertion/removal, or competing approval made the
+proposal stale, approval returns conflict and leaves it pending and the album
+unchanged. Request changes, fetch the latest album, patch the proposal with fresh
+`expectedOrderRevision` and intended `trackIds`, then resubmit with the latest
+submission revision. Never silently merge a stale proposal.
+
+Edits preserve omitted fields; an empty reason clears it. Rejecting, cancelling,
+or requesting changes affects only the proposal and feedback, never the album's
+publication, ownership, tracks, or media. Repeat the same requestId and payload
+after timeouts; use a new requestId for changed work. Idempotency receipts persist.
+
+HTTP equivalents: `POST /api/catalog-submissions/album-track-orders` and
+`PUT /api/catalog-submissions/album-track-orders/{submissionId}`. Updates require
+`expectedRevision`; creation does not. Existing list, resubmit, cancel, and
+review endpoints also handle this submission type.

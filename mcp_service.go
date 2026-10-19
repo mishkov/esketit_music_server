@@ -155,13 +155,15 @@ func mcpPermission(name string) string {
 		return ""
 	case "submit_author":
 		return permissionAuthorsSubmit
+	case "submit_album_track_order":
+		return permissionAlbumsSubmitTrackOrder
 	case "submit_album":
 		return permissionAlbumsSubmit
 	case "reorder_album_tracks":
 		return permissionAlbumsReorderTracks
 	case "submit_track":
 		return permissionTracksSubmit
-	case "update_author_submission", "update_album_submission", "update_track_submission", "resubmit_submission":
+	case "update_author_submission", "update_album_submission", "update_track_submission", "update_album_track_order_submission", "resubmit_submission":
 		return permissionCatalogSubmissionsUpdate
 	case "cancel_submission":
 		return permissionCatalogSubmissionsCancel
@@ -300,7 +302,7 @@ func (s *mcpService) read(ctx context.Context, repos domainRepositories, userID 
 		}
 		return map[string]any{"actingUserId": userID, "permissions": codes, "configurationVersion": settings.Version, "workflowGuidance": settings.WorkflowGuidance, "uploadGuidance": settings.UploadGuidance,
 			"uploads": map[string]any{"endpoint": s.publicBaseURL + "/api/mcp/uploads", "method": "POST", "authentication": "Authorization: Bearer <MCP credential>; reuse your configured MCP connection credential", "contentType": "multipart/form-data", "fileField": "file", "kindField": "kind", "idempotencyHeader": "Idempotency-Key", "kinds": []string{"audio", "author_photo", "album_cover"}, "maxAudioBytes": maxSongUploadSize, "maxImageBytes": maxSubmissionImageSize, "maxImageDimension": maxSubmissionImageDimension, "maxAuthorPhotos": maxSubmissionAuthorPhotos, "audioFormats": []string{"mp3"}, "imageFormats": []string{"jpeg", "png", "gif"}, "example": "curl --fail-with-body -H \"Authorization: Bearer $MCP_ACCESS_TOKEN\" -H \"Idempotency-Key: <stable-upload-request-id>\" -F kind=audio -F file=@./track.mp3 <server-base-url>/api/mcp/uploads"},
-			"rules":   []string{"Only owned submissions may be read or changed.", "Only changes_requested submissions can be edited or resubmitted.", "Use submissionId for workflow tools and entityId for authorIds/albumId.", "Authors and albums must be approved before track approval; correct dependency feedback before resubmitting tracks.", "Updates are patches: omitted fields are preserved. Use [] to clear photoUploadTokens/additionalInfo/sourceMetadata; use null to clear coverUploadToken. Required names and references cannot be cleared.", "Use the same requestId and exact payload after a timeout. Use a new requestId for changed work. Receipts persist without automatic expiry.", "expectedRevision must match current submission details. Refresh context at session start and after permission/configuration errors.", "reorder_album_tracks requires albums.reorder_tracks, publicationStatus published, complete visible membership, and the current orderRevision. It cannot repair pending albums.", "Review approval, rejection, and settings changes are not MCP tools."}}, nil
+			"rules":   []string{"Only owned submissions may be read or changed.", "Only changes_requested submissions can be edited or resubmitted.", "Use submissionId for workflow tools and entityId for authorIds/albumId.", "Authors and albums must be approved before track approval; correct dependency feedback before resubmitting tracks.", "Updates are patches: omitted fields are preserved. Use [] to clear photoUploadTokens/additionalInfo/sourceMetadata; use null to clear coverUploadToken. Required names and references cannot be cleared.", "Use the same requestId and exact payload after a timeout. Use a new requestId for changed work. Receipts persist without automatic expiry.", "expectedRevision must match current submission details. Refresh context at session start and after permission/configuration errors.", "reorder_album_tracks requires albums.reorder_tracks, publicationStatus published, complete visible membership, and the current orderRevision. It cannot repair pending albums.", "submit_album_track_order proposes a complete order for an approved album without changing it until review approval. Use albums.submit_track_order permission; direct reorder permission is not needed. Refresh stale proposals through changes_requested updates before resubmitting.", "Review approval, rejection, and settings changes are not MCP tools."}}, nil
 	case "get_submission":
 		return s.submission(ctx, repos, userID, argID(args, "submissionId"))
 	case "list_submissions":
@@ -471,6 +473,8 @@ func (s *mcpService) submission(ctx context.Context, repos domainRepositories, u
 		var albumID int64
 		var authorIDs []int64
 		switch v := responses[0].Entity.(type) {
+		case albumTrackOrderSubmissionView:
+			albumID = v.AlbumID
 		case album:
 			authorIDs = v.AuthorIDs
 		case track:
@@ -546,6 +550,31 @@ func (s *mcpService) imageToken(ctx context.Context, repos domainRepositories, u
 	return v.MediaPath, nil
 }
 func (s *mcpService) mutate(ctx context.Context, repos domainRepositories, store *trackStore, userID int64, name string, args map[string]json.RawMessage) (catalogSubmissionResponse, error) {
+	if name == "submit_album_track_order" {
+		var input struct {
+			RequestID string `json:"requestId"`
+			createAlbumTrackOrderSubmissionRequest
+		}
+		raw, _ := json.Marshal(args)
+		if err := decodeMCPArguments(raw, &input); err != nil {
+			return catalogSubmissionResponse{}, err
+		}
+		return store.createAlbumTrackOrderSubmission(userID, input.createAlbumTrackOrderSubmissionRequest)
+	}
+	if name == "update_album_track_order_submission" {
+		fields := make(map[string]json.RawMessage, len(args))
+		for key, value := range args {
+			if key != "requestId" && key != "submissionId" {
+				fields[key] = value
+			}
+		}
+		var input updateAlbumTrackOrderSubmissionRequest
+		raw, _ := json.Marshal(fields)
+		if err := decodeMCPArguments(raw, &input); err != nil {
+			return catalogSubmissionResponse{}, err
+		}
+		return store.updateAlbumTrackOrderSubmission(userID, argID(args, "submissionId"), input)
+	}
 	argsCopy := make(map[string]json.RawMessage, len(args))
 	for key, value := range args {
 		argsCopy[key] = value

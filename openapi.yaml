@@ -2435,6 +2435,89 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /api/catalog-submissions/album-track-orders:
+    post:
+      tags: [Catalog Submissions]
+      summary: Propose an approved album's track order for review
+      description: |
+        Requires `albums.submit_track_order` (granted to listeners and admins by default),
+        not `albums.reorder_tracks`. The album must have publicationStatus published,
+        independently of isPublished. Supply every current track exactly once and the
+        current orderRevision. Invisible pending membership prevents submission.
+        Saves a pending_review proposal without changing the album. One active proposal
+        per requester and album; completed proposals remain in history. Approval checks
+        the base ordering revision again and applies the complete order atomically.
+        Rejecting, cancelling, or requesting changes never modifies album publication,
+        ownership, membership, or media. Existing reviewer endpoints and leases apply.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAlbumTrackOrderSubmissionRequest'
+      responses:
+        '201':
+          description: Pending proposal; the album is unchanged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/catalog-submissions/album-track-orders/{id}:
+    put:
+      tags: [Catalog Submissions]
+      summary: Patch an owned order proposal after changes were requested
+      description: |
+        Requires catalog_submissions.update_own. The path id is a submission ID.
+        expectedRevision must match the submission revision. Omitted proposal fields
+        are preserved; an empty reason clears it. Refresh expectedOrderRevision and
+        trackIds against the album when the proposal is stale. At least one proposal
+        field must be supplied. Editing leaves changes_requested status unchanged;
+        use the existing resubmit endpoint to return it to review. No catalog change occurs.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAlbumTrackOrderSubmissionRequest'
+      responses:
+        '200':
+          description: Updated proposal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /api/catalog-submissions/albums:
     post:
       tags: [Catalog Submissions]
@@ -3537,7 +3620,58 @@ components:
 
     CatalogSubmissionEntityType:
       type: string
-      enum: [author, album, track]
+      enum: [author, album, track, album_track_order]
+
+    CreateAlbumTrackOrderSubmissionRequest:
+      type: object
+      additionalProperties: false
+      required: [albumId, trackIds, expectedOrderRevision]
+      properties:
+        albumId:
+          type: integer
+          format: int64
+          minimum: 1
+        trackIds:
+          type: array
+          uniqueItems: true
+          description: Every current album track exactly once, in proposed order.
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        expectedOrderRevision:
+          type: integer
+          format: int64
+          minimum: 1
+        reason:
+          type: string
+          description: Optional explanation; limited to 1000 characters after trimming.
+          maxLength: 1000
+
+    UpdateAlbumTrackOrderSubmissionRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedRevision]
+      minProperties: 2
+      properties:
+        expectedRevision:
+          type: integer
+          format: int64
+          minimum: 1
+        trackIds:
+          type: array
+          uniqueItems: true
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        expectedOrderRevision:
+          type: integer
+          format: int64
+          minimum: 1
+        reason:
+          type: string
+          maxLength: 1000
 
     CatalogSubmissionFeedback:
       type: object
@@ -3593,7 +3727,13 @@ components:
         entity:
           type: object
           additionalProperties: true
-          description: Current author, album, or track; falls back to the snapshot after the entity is removed.
+          description: |
+            Current author, album, or track; falls back to the snapshot after removal.
+            For album_track_order, returns albumId, baseTrackIds, proposed trackIds,
+            expectedOrderRevision, reason, optional appliedOrderRevision, targetAvailable,
+            currentTrackIds, currentOrderRevision, and visible track summaries (id/name).
+            The snapshot retains proposal data independently of current album data;
+            entityId is the target album ID and submission id identifies each proposal.
         feedback:
           type: array
           items:

@@ -23,6 +23,7 @@ const (
 	permissionAlbumsCreate             = "albums.create"
 	permissionAlbumsUpdate             = "albums.update"
 	permissionAlbumsReorderTracks      = "albums.reorder_tracks"
+	permissionAlbumsSubmitTrackOrder   = "albums.submit_track_order"
 	permissionAlbumsDelete             = "albums.delete"
 	permissionAlbumCoversManage        = "album_covers.manage"
 	permissionTracksCreate             = "tracks.create"
@@ -150,6 +151,7 @@ func definedPermissions() []permissionDefinition {
 		{permissionAlbumsCreate, "Create albums"},
 		{permissionAlbumsUpdate, "Update albums"},
 		{permissionAlbumsReorderTracks, "Reorder approved album tracks"},
+		{permissionAlbumsSubmitTrackOrder, "Propose album track order changes for review"},
 		{permissionAlbumsDelete, "Delete albums"},
 		{permissionAlbumCoversManage, "Upload, search, and import album covers"},
 		{permissionTracksCreate, "Create tracks"},
@@ -184,6 +186,7 @@ func defaultListenerPermissionCodes() []string {
 		permissionAutoplayUse,
 		permissionAuthorsSubmit,
 		permissionAlbumsSubmit,
+		permissionAlbumsSubmitTrackOrder,
 		permissionTracksSubmit,
 		permissionCatalogSubmissionsRead,
 		permissionCatalogSubmissionsUpdate,

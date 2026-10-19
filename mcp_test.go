@@ -122,7 +122,7 @@ func TestMCPProtocolAndAuthorization(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &listing); err != nil {
 		t.Fatalf("list: %s", rec.Body.String())
 	}
-	if len(listing.Result.Tools) != 15 {
+	if len(listing.Result.Tools) != 17 {
 		t.Fatalf("tools=%d %s", len(listing.Result.Tools), rec.Body.String())
 	}
 	for _, tool := range listing.Result.Tools {
@@ -612,7 +612,7 @@ func TestMCPOfficialClientInteroperability(t *testing.T) {
 	}
 	defer session.Close()
 	tools, err := session.ListTools(ctx, nil)
-	if err != nil || len(tools.Tools) != 15 {
+	if err != nil || len(tools.Tools) != 17 {
 		t.Fatalf("tools=%v err=%v", tools, err)
 	}
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "submit_author", Arguments: map[string]any{"requestId": "sdk-author", "currentName": "SDK Artist"}})
