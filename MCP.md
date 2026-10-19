@@ -45,22 +45,23 @@ limits. Every result supplies `structuredContent` and the equivalent text:
 | `get_upload` | uploadToken. Owned media type, size, SHA-256 of input bytes and claimedSubmissionId (null until used). |
 | `submit_author` | requestId + currentName; optional photoUploadTokens. |
 | `submit_album` | requestId + title + authorIds + releaseDate (RFC3339); optional isPublished (defaults to true)/coverUploadToken/additionalInfo. Release date is required by the existing backend. |
-| `submit_track` | requestId + name + authorIds + albumId + audioUploadToken; optional albumOrder/additionalInfo/sourceMetadata. |
+| `submit_track` | requestId + name + authorIds + albumId + audioUploadToken; required trackNumber; optional additionalInfo/sourceMetadata. |
 | `update_author_submission` | requestId + submissionId + expectedRevision + at least one changed author field. |
 | `update_album_submission` | requestId + submissionId + expectedRevision + at least one changed album field. |
 | `update_track_submission` | requestId + submissionId + expectedRevision + at least one changed track field. |
 | `resubmit_submission` | requestId + submissionId + expectedRevision. changes_requested → pending_review, subject to dependency validation. |
-| `reorder_album_tracks` | requestId + albumId + trackIds + expectedOrderRevision. Reorder every track in an approved album; requires albums.reorder_tracks. Cannot repair pending albums. |
-| `submit_album_track_order` | requestId + albumId + trackIds + expectedOrderRevision; optional reason. Creates a pending order proposal without changing the album; requires albums.submit_track_order. |
-| `update_album_track_order_submission` | requestId + submissionId + expectedRevision; patch trackIds/expectedOrderRevision/reason on an owned changes_requested proposal. |
+| `reorder_album_tracks` | requestId + albumId + tracks + expectedOrderRevision. Reorder every track in an approved album; requires albums.reorder_tracks. Cannot repair pending albums. |
+| `submit_album_track_order` | requestId + albumId + tracks + expectedOrderRevision; optional reason. Creates a pending order proposal without changing the album; requires albums.submit_track_order. |
+| `update_album_track_order_submission` | requestId + submissionId + expectedRevision; patch tracks/expectedOrderRevision/reason on an owned changes_requested proposal. |
 | `cancel_submission` | requestId + submissionId + expectedRevision. Eligible owned pending submissions; dependent items block cancellation. |
 
 Submission responses include both `submissionId` and `entityId`. Use entity IDs
 in authorIds/albumId; use submission IDs for workflow tools. Edits require
 `changes_requested`; omitted fields are preserved. Clear optional metadata or
 photos with an empty array. Clear a cover with `coverUploadToken: null`.
-Required names, references and dates cannot be cleared. Album order is zero-based;
-omitting it appends new/moved tracks and preserves existing track positions.
+Required names, references and dates cannot be cleared. Track numbers are positive and one-based. New tracks and album moves require an explicit
+`trackNumber`; metadata patches preserve it when omitted. Gaps remain unchanged.
+Occupied numbers return `track_number_conflict`; never retry without the number.
 Albums with tracks derive their author list from those tracks. Photo tokens replace
 the entire photo list. Audio tokens replace the recording. Upload tokens are
 owned by the selected user and may be claimed only once.
@@ -77,23 +78,23 @@ for affected approved albums.
 `reorder_album_tracks` works only when `publicationStatus` is `published`
 (approved), independently of `isPublished`. It requires the dedicated
 `albums.reorder_tracks` permission, granted to the admin role by default.
-Read the album with `get_catalog_item`, then send:
+Read the album with `get_catalog_item` and fetch its tracks to see their persisted
+`trackNumber` values, then send:
 
 ```json
 {
   "requestId": "album-42-order-1",
   "albumId": 42,
-  "trackIds": [103, 101, 102],
+  "tracks": [{"trackId": 103, "trackNumber": 1}, {"trackId": 101, "trackNumber": 4}, {"trackId": 102, "trackNumber": 10}],
   "expectedOrderRevision": 4
 }
 ```
 
-The success envelope contains `data: {"albumId":42,"trackIds":[103,101,102],
-"orderRevision":5}`. Supply every current track exactly once. Duplicates, missing,
+The success envelope contains `data: {"albumId":42,"tracks":[{"trackId":103,"trackNumber":1},{"trackId":101,"trackNumber":4},{"trackId":102,"trackNumber":10}],
+"orderRevision":5}`. Supply every current track exactly once with a distinct positive trackNumber. Duplicates, missing,
 additional, unknown, nonpositive, and foreign-album IDs fail without normalization.
 The operation changes only order: it cannot add/remove/move tracks or repair a
-pending album. It does not change pending-submission editing rules or support
-skipped positions.
+pending album. It does not change pending-submission editing rules. Distinct positive numbers may contain gaps.
 
 Visibility rules still apply. An approved album may contain pending tracks;
 album reads exclude tracks invisible to the acting user, and reordering is
@@ -197,13 +198,13 @@ permissions, upload limits and lifecycle constraints remain server-enforced.
 ## Reviewed album track order proposals
 
 Use `submit_album_track_order` for changes that need human approval. The deployed
-`reorder_album_tracks` tool and direct HTTP API keep their existing behavior.
+`reorder_album_tracks` tool and direct HTTP API apply the same explicit number assignments immediately.
 The proposal permission `albums.submit_track_order` is granted to admin and
 listener roles by default; it does not grant immediate reorder access.
 
 Read the album's complete visible `trackIds` and `orderRevision` using
 `get_catalog_item`, then submit every current member exactly once in the intended
-order. Only approved albums (`publicationStatus: published`, independent of
+order as `{trackId, trackNumber}` assignments. Only approved albums (`publicationStatus: published`, independent of
 `isPublished`) are eligible. Hidden pending membership prevents submission.
 Do not omit requested ordering to bypass an error.
 
@@ -213,9 +214,9 @@ proposal is allowed per requester/album; proposals from other requesters can
 coexist. Filter `list_submissions` by `entityType: album_track_order` and use
 `get_submission` for feedback and allowedActions. Proposal entities include:
 
-- `baseTrackIds`, proposed `trackIds`, `expectedOrderRevision`, and `reason`;
-- `currentTrackIds`, `currentOrderRevision`, `targetAvailable`, and visible
-  track summaries (`id`/`name`) for comparison;
+- `baseTracks`, proposed `tracks`, `expectedOrderRevision`, and `reason`;
+- `currentTracks`, `currentOrderRevision`, `targetAvailable`, and visible
+  `trackDetails` summaries (`id`/`name`) for comparison;
 - `appliedOrderRevision` once approved. The saved snapshot remains historical.
 
 Review uses existing reviewer endpoints, permissions, and requester leases;
@@ -224,7 +225,7 @@ base ordering revision in the same transaction as the order change and decision.
 If a direct reorder, track insertion/removal, or competing approval made the
 proposal stale, approval returns conflict and leaves it pending and the album
 unchanged. Request changes, fetch the latest album, patch the proposal with fresh
-`expectedOrderRevision` and intended `trackIds`, then resubmit with the latest
+`expectedOrderRevision` and intended `tracks`, then resubmit with the latest
 submission revision. Never silently merge a stale proposal.
 
 Edits preserve omitted fields; an empty reason clears it. Rejecting, cancelling,
@@ -236,3 +237,9 @@ HTTP equivalents: `POST /api/catalog-submissions/album-track-orders` and
 `PUT /api/catalog-submissions/album-track-orders/{submissionId}`. Updates require
 `expectedRevision`; creation does not. Existing list, resubmit, cancel, and
 review endpoints also handle this submission type.
+
+Persistent numbering replaces the previous insertion index contract. `albumOrder`
+and album write `trackIds` are rejected; direct reorder and proposals require
+`tracks: [{trackId, trackNumber}]`. Album read `trackIds` remains a derived list.
+The automatic database migration preserves existing relative order as 1..N;
+repair previously incorrect ordering with explicit assignments.

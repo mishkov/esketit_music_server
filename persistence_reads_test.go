@@ -14,18 +14,21 @@ func TestScopedTrackReadFiltersAndPaginatesBeforeDecoding(t *testing.T) {
 	for index, name := range []string{"Привет", "Приветствие"} {
 		if _, err := store.create(upsertTrackRequest{
 			Name: name, AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID,
-			AlbumOrder: index, AudioFilePath: name + ".mp3",
+			TrackNumber: index + 1, AudioFilePath: name + ".mp3",
 		}); err != nil {
 			t.Fatalf("create track %q: %v", name, err)
 		}
 	}
 
+	if _, err := store.db.Exec(`INSERT INTO albums(id,title,cover_image_path,author_ids_json,release_date,is_published,additional_info_json) VALUES(999,'Unrelated','','[]',?,1,'[]')`, formatSQLiteTime(time.Now().UTC())); err != nil {
+		t.Fatal(err)
+	}
 	// This row contains valid JSON with the wrong shape. A whole-table decode
 	// would fail, while a scoped query for the real album must never scan it.
 	if _, err := store.db.Exec(`INSERT INTO tracks (
 		id, name, author_ids_json, album_id, audio_file_path,
-		additional_info_json, source_metadata_json, created_at
-	) VALUES (999, 'unrelated', '[]', 999, '/api/songs/unrelated.mp3', '"wrong-shape"', '[]', ?)`, formatSQLiteTime(time.Now().UTC())); err != nil {
+		additional_info_json, source_metadata_json, created_at, track_number
+	) VALUES (999, 'unrelated', '[]', 999, '/api/songs/unrelated.mp3', '"wrong-shape"', '[]', ?, 1)`, formatSQLiteTime(time.Now().UTC())); err != nil {
 		t.Fatalf("insert unrelated malformed domain row: %v", err)
 	}
 
@@ -51,6 +54,7 @@ func TestScopedSearchPreservesUnicodeCaseFolding(t *testing.T) {
 	created, err := store.create(upsertTrackRequest{
 		Name: "Северный Ветер", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID,
 		AudioFilePath: "north-wind.mp3",
+		TrackNumber:   1,
 	})
 	if err != nil {
 		t.Fatalf("create track: %v", err)
@@ -74,8 +78,8 @@ func TestScopedTrackReadSortsRFC3339NanoChronologically(t *testing.T) {
 	artist, albumItem := seedPlaylistTrackDependencies(t, store)
 	exactSecond := time.Date(2026, time.September, 23, 10, 0, 0, 0, time.UTC)
 	items := []track{
-		{ID: 50, Name: "fraction", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AudioFilePath: "/api/songs/fraction.mp3", CreatedAt: exactSecond.Add(100 * time.Millisecond)},
-		{ID: 51, Name: "exact", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AudioFilePath: "/api/songs/exact.mp3", CreatedAt: exactSecond},
+		{ID: 50, Name: "fraction", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AudioFilePath: "/api/songs/fraction.mp3", CreatedAt: exactSecond.Add(100 * time.Millisecond), TrackNumber: 50},
+		{ID: 51, Name: "exact", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AudioFilePath: "/api/songs/exact.mp3", CreatedAt: exactSecond, TrackNumber: 51},
 	}
 	for _, item := range items {
 		if err := store.catalogRepository.InsertTrack(context.Background(), item); err != nil {

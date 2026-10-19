@@ -343,6 +343,7 @@ func TestTargetedWritesDoNotTouchUnrelatedTables(t *testing.T) {
 		AuthorIDs:     []int64{authorItem.ID},
 		AlbumID:       albumItem.ID,
 		AudioFilePath: "track.mp3",
+		TrackNumber:   1,
 	})
 	if err != nil {
 		t.Fatalf("create track error = %v", err)
@@ -361,7 +362,7 @@ func TestTargetedWritesDoNotTouchUnrelatedTables(t *testing.T) {
 		Name:          "Second Track",
 		AuthorIDs:     []int64{authorItem.ID},
 		AlbumID:       albumItem.ID,
-		AlbumOrder:    1,
+		TrackNumber:   2,
 		AudioFilePath: "second-track.mp3",
 	}); err != nil {
 		t.Fatalf("create track with user/session write guards: %v", err)
@@ -386,6 +387,7 @@ func TestTargetedWritesDoNotTouchUnrelatedTables(t *testing.T) {
 		AuthorIDs:     trackItem.AuthorIDs,
 		AlbumID:       trackItem.AlbumID,
 		AudioFilePath: trackItem.AudioFilePath,
+		TrackNumber:   1,
 	}); err != nil || !found {
 		t.Fatalf("update track found=%v error=%v", found, err)
 	}
@@ -449,7 +451,7 @@ func TestTrackAndLyricsFailuresRollBackEntireTransaction(t *testing.T) {
 	if _, err := store.db.Exec(`CREATE TRIGGER reject_album_membership_update BEFORE UPDATE ON albums BEGIN SELECT RAISE(FAIL, 'injected album failure'); END`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.create(upsertTrackRequest{Name: "Rollback", AuthorIDs: []int64{authorItem.ID}, AlbumID: albumItem.ID, AudioFilePath: "rollback.mp3"}); err == nil {
+	if _, err := store.create(upsertTrackRequest{Name: "Rollback", AuthorIDs: []int64{authorItem.ID}, AlbumID: albumItem.ID, AudioFilePath: "rollback.mp3", TrackNumber: 1}); err == nil {
 		t.Fatal("create track error = nil, want injected failure")
 	}
 	if _, err := store.db.Exec(`DROP TRIGGER reject_album_membership_update`); err != nil {
@@ -467,7 +469,7 @@ func TestTrackAndLyricsFailuresRollBackEntireTransaction(t *testing.T) {
 		t.Fatalf("after rollback trackCount=%d counter=%d, want 0 and %d", trackCount, counterAfter, counterBefore)
 	}
 
-	trackItem, err := store.create(upsertTrackRequest{Name: "Lyrics", AuthorIDs: []int64{authorItem.ID}, AlbumID: albumItem.ID, AudioFilePath: "lyrics.mp3"})
+	trackItem, err := store.create(upsertTrackRequest{Name: "Lyrics", AuthorIDs: []int64{authorItem.ID}, AlbumID: albumItem.ID, AudioFilePath: "lyrics.mp3", TrackNumber: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,7 +554,7 @@ func TestTrackMovementAndDeletionFailuresRollBackAllRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	trackItem, err := store.create(upsertTrackRequest{Name: "Movable", AuthorIDs: []int64{authorItem.ID}, AlbumID: sourceAlbum.ID, AudioFilePath: "movable.mp3"})
+	trackItem, err := store.create(upsertTrackRequest{Name: "Movable", AuthorIDs: []int64{authorItem.ID}, AlbumID: sourceAlbum.ID, AudioFilePath: "movable.mp3", TrackNumber: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -563,6 +565,7 @@ func TestTrackMovementAndDeletionFailuresRollBackAllRows(t *testing.T) {
 	}
 	if _, found, err := store.update(trackItem.ID, upsertTrackRequest{
 		Name: trackItem.Name, AuthorIDs: trackItem.AuthorIDs, AlbumID: targetAlbum.ID, AudioFilePath: trackItem.AudioFilePath,
+		TrackNumber: 1,
 	}); err == nil || !found {
 		t.Fatalf("move track found=%v error=%v, want found with injected failure", found, err)
 	}
@@ -646,7 +649,7 @@ func TestMultiPlaylistAndPreferenceFailuresRollBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	authorItem, albumItem := seedPlaylistTrackDependencies(t, store)
-	trackItem, err := store.create(upsertTrackRequest{Name: "Track", AuthorIDs: []int64{authorItem.ID}, AlbumID: albumItem.ID, AudioFilePath: "track.mp3"})
+	trackItem, err := store.create(upsertTrackRequest{Name: "Track", AuthorIDs: []int64{authorItem.ID}, AlbumID: albumItem.ID, AudioFilePath: "track.mp3", TrackNumber: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -880,7 +883,7 @@ func TestConcurrentTrackAndPlaylistMutationsDoNotLoseUpdates(t *testing.T) {
 			defer wait.Done()
 			item, err := store.create(upsertTrackRequest{
 				Name: "Track " + string(rune('A'+index)), AuthorIDs: []int64{authorItem.ID},
-				AlbumID: albumItem.ID, AlbumOrder: 0, AudioFilePath: "track.mp3",
+				AlbumID: albumItem.ID, TrackNumber: index + 1, AudioFilePath: "track.mp3",
 			})
 			if err != nil {
 				errorsCh <- err
@@ -949,7 +952,7 @@ func TestConcurrentFavoriteAndDislikeChangesRemainMutuallyExclusive(t *testing.T
 		t.Fatal(err)
 	}
 	authorItem, albumItem := seedPlaylistTrackDependencies(t, store)
-	trackItem, err := store.create(upsertTrackRequest{Name: "Track", AuthorIDs: []int64{authorItem.ID}, AlbumID: albumItem.ID, AudioFilePath: "track.mp3"})
+	trackItem, err := store.create(upsertTrackRequest{Name: "Track", AuthorIDs: []int64{authorItem.ID}, AlbumID: albumItem.ID, AudioFilePath: "track.mp3", TrackNumber: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -691,12 +691,12 @@ type youtubeStartImportRequest struct {
 }
 
 type youtubeAddCurrentRequest struct {
-	Mode       string  `json:"mode"`
-	TrackID    int64   `json:"trackId,omitempty"`
-	Name       string  `json:"name,omitempty"`
-	AuthorIDs  []int64 `json:"authorIds,omitempty"`
-	AlbumID    int64   `json:"albumId,omitempty"`
-	AlbumOrder int     `json:"albumOrder,omitempty"`
+	Mode        string  `json:"mode"`
+	TrackID     int64   `json:"trackId,omitempty"`
+	Name        string  `json:"name,omitempty"`
+	AuthorIDs   []int64 `json:"authorIds,omitempty"`
+	AlbumID     int64   `json:"albumId,omitempty"`
+	TrackNumber int     `json:"trackNumber,omitempty"`
 }
 
 type youtubeSkippedItem struct {
@@ -1434,7 +1434,7 @@ func (s *youtubeImportService) AddCurrent(ctx context.Context, userID int64, req
 			Name:           strings.TrimSpace(req.Name),
 			AuthorIDs:      req.AuthorIDs,
 			AlbumID:        req.AlbumID,
-			AlbumOrder:     req.AlbumOrder,
+			TrackNumber:    req.TrackNumber,
 			AudioFilePath:  "/api/songs/" + url.PathEscape(finalName),
 			AdditionalInfo: generatedAdditionalInfo,
 			SourceMetadata: generatedSourceMetadata,
@@ -3033,26 +3033,6 @@ func (s *domainState) getTrack(trackID int64) (track, bool) {
 	return cloneTrack(t), true
 }
 
-func (s *domainState) getTrackAlbumOrder(trackID int64) (int, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	t, ok := s.tracks[trackID]
-	if !ok {
-		return 0, false
-	}
-	albumItem, ok := s.albums[t.AlbumID]
-	if !ok {
-		return 0, false
-	}
-	for index, existingTrackID := range albumItem.TrackIDs {
-		if existingTrackID == trackID {
-			return index, true
-		}
-	}
-	return 0, false
-}
-
 func (s *domainState) findTrackBySourceMetadata(target sourceMetadata) (track, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -3116,6 +3096,7 @@ func (s *domainState) insertTrackIfSourceAbsent(req upsertTrackRequest, target s
 		Name:           strings.TrimSpace(req.Name),
 		AuthorIDs:      normalizeAuthorIDs(req.AuthorIDs),
 		AlbumID:        req.AlbumID,
+		TrackNumber:    req.TrackNumber,
 		AudioFilePath:  normalizeAudioFilePath(req.AudioFilePath),
 		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo),
 		SourceMetadata: normalizeSourceMetadata(req.SourceMetadata),
@@ -3124,15 +3105,7 @@ func (s *domainState) insertTrackIfSourceAbsent(req upsertTrackRequest, target s
 	if err := s.validateTrackLocked(created); err != nil {
 		return track{}, err
 	}
-	albumOrder, err := normalizeAlbumOrder(req.AlbumOrder, len(s.albums[req.AlbumID].TrackIDs), true)
-	if err != nil {
-		return track{}, fmt.Errorf("%w: %v", errInvalidTrack, err)
-	}
-
 	s.tracks[created.ID] = created
-	targetAlbum := s.albums[req.AlbumID]
-	insertTrackIntoAlbumLocked(&targetAlbum, created.ID, albumOrder)
-	s.albums[req.AlbumID] = targetAlbum
 	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
 		return track{}, err
 	}
@@ -3555,6 +3528,8 @@ func writeYouTubeImportError(w http.ResponseWriter, r *http.Request, err error, 
 		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.Is(err, errYouTubeSessionNotFound), errors.Is(err, errTrackNotFound), errors.Is(err, errYouTubeCurrentNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, errTrackNumberConflict):
+		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.Is(err, errInvalidTrack):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	default:

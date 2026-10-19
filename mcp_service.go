@@ -52,14 +52,18 @@ func mcpError(err error) *mcpProblem {
 	case errors.Is(err, errMCPDisabled):
 		p.Code = "not_configured"
 		p.Recovery = "Ask an administrator to select an MCP acting user in console settings."
-	case errors.Is(err, errMCPForbidden), errors.Is(err, errCatalogSubmissionForbidden), errors.Is(err, errAlbumOrderForbidden):
+	case errors.Is(err, errMCPForbidden), errors.Is(err, errCatalogSubmissionForbidden), errors.Is(err, errTrackNumberForbidden):
 		p.Code = "forbidden"
 		p.Recovery = "Check get_context permissions for this operation."
-	case errors.Is(err, errAlbumOrderStale):
+	case errors.Is(err, errTrackNumberConflict):
+		p.Code = "track_number_conflict"
+		p.Fields = []string{"trackNumber"}
+		p.Recovery = "Read existing album tracks and their trackNumber values. Choose an unoccupied positive number or submit a complete number assignment proposal. Never omit the number or shift other tracks to recover."
+	case errors.Is(err, errTrackNumberStale):
 		p.Code = "stale_revision"
 		p.Fields = []string{"expectedOrderRevision"}
 		p.Recovery = "Call get_catalog_item for the album, reassess the complete trackIds and orderRevision, and use a new requestId."
-	case errors.Is(err, errAlbumOrderState), errors.Is(err, errAlbumOrderHidden):
+	case errors.Is(err, errTrackNumberState), errors.Is(err, errTrackNumberHidden):
 		p.Code = "invalid_state"
 		p.Recovery = "Only approved albums whose complete membership is visible can be reordered; this tool cannot repair pending albums."
 	case errors.Is(err, errMCPStaleRevision):
@@ -413,20 +417,7 @@ func mcpTrackWithOrder(ctx context.Context, repos domainRepositories, item track
 	if err := json.Unmarshal(raw, &entity); err != nil {
 		return nil, err
 	}
-	albumItem, found, err := repos.catalog.FindAlbumByID(ctx, item.AlbumID)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, errCatalogSubmissionDependency
-	}
-	for index, id := range albumItem.TrackIDs {
-		if id == item.ID {
-			entity["albumOrder"] = index
-			return entity, nil
-		}
-	}
-	return nil, errCatalogSubmissionDependency
+	return entity, nil
 }
 
 func (s *mcpService) submission(ctx context.Context, repos domainRepositories, userID, id int64) (any, error) {
@@ -680,25 +671,23 @@ func (s *mcpService) mutate(ctx context.Context, repos domainRepositories, store
 		payload[key] = value
 	}
 	if kind == "track" {
-		if _, supplied := argsCopy["albumOrder"]; !supplied {
-			targetID := argID(payload, "albumId")
-			target, found, err := repos.catalog.FindAlbumByID(ctx, targetID)
-			if err != nil {
-				return catalogSubmissionResponse{}, err
-			}
-			if !found {
-				return catalogSubmissionResponse{}, mcpInvalid("albumId", "album is not available")
-			}
-			order := len(target.TrackIDs) // New or moved tracks append by default.
-			if !isCreate {
-				for index, id := range target.TrackIDs {
-					if id == existing.EntityID {
-						order = index
-						break
+		if _, supplied := argsCopy["trackNumber"]; !supplied && isCreate {
+			return catalogSubmissionResponse{}, mcpInvalid("trackNumber", "A positive track number is required; numbers may contain gaps.")
+		}
+		if !isCreate {
+			if raw, supplied := argsCopy["albumId"]; supplied {
+				var target int64
+				_ = json.Unmarshal(raw, &target)
+				current, ok, err := repos.catalog.FindTrackByID(ctx, existing.EntityID)
+				if err != nil {
+					return catalogSubmissionResponse{}, err
+				}
+				if ok && target != current.AlbumID {
+					if _, given := argsCopy["trackNumber"]; !given {
+						return catalogSubmissionResponse{}, mcpInvalid("trackNumber", "Specify the destination track number when changing albums.")
 					}
 				}
 			}
-			payload["albumOrder"], _ = json.Marshal(order)
 		}
 	}
 	if kind == "album" && !isCreate {
@@ -767,13 +756,13 @@ func (s *mcpService) mutate(ctx context.Context, repos domainRepositories, store
 	case "track":
 		if isCreate {
 			var request createTrackSubmissionRequest
-			err = decodeMCPArguments(encodeFields("name", "authorIds", "albumId", "albumOrder", "audioUploadToken", "additionalInfo", "sourceMetadata"), &request)
+			err = decodeMCPArguments(encodeFields("name", "authorIds", "albumId", "trackNumber", "audioUploadToken", "additionalInfo", "sourceMetadata"), &request)
 			if err == nil {
 				result, err = store.createTrackSubmission(userID, request)
 			}
 		} else {
 			var request updateTrackSubmissionRequest
-			err = decodeMCPArguments(encodeFields("name", "authorIds", "albumId", "albumOrder", "audioUploadToken", "additionalInfo", "sourceMetadata"), &request)
+			err = decodeMCPArguments(encodeFields("name", "authorIds", "albumId", "trackNumber", "audioUploadToken", "additionalInfo", "sourceMetadata"), &request)
 			if err == nil {
 				result, err = store.updateTrackSubmission(userID, existing.EntityID, request)
 			}

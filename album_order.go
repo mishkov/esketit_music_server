@@ -6,30 +6,29 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 )
 
 var (
-	errAlbumOrderForbidden = errors.New("albums.reorder_tracks permission is required")
-	errAlbumOrderStale     = errors.New("album order revision has changed; fetch the current album before retrying")
-	errAlbumOrderState     = errors.New("only approved albums (publicationStatus published) can be reordered")
-	errAlbumOrderHidden    = errors.New("album contains tracks not visible to this user; the complete order cannot be changed")
+	errTrackNumberForbidden = errors.New("albums.reorder_tracks permission is required")
+	errTrackNumberStale     = errors.New("album order revision has changed; fetch the current album before retrying")
+	errTrackNumberState     = errors.New("only approved albums (publicationStatus published) can be reordered")
+	errTrackNumberHidden    = errors.New("album contains tracks not visible to this user; the complete order cannot be changed")
 )
 
 type reorderAlbumTracksRequest struct {
-	TrackIDs              []int64 `json:"trackIds"`
-	ExpectedOrderRevision int64   `json:"expectedOrderRevision"`
+	Tracks                []trackNumberAssignment `json:"tracks"`
+	ExpectedOrderRevision int64                   `json:"expectedOrderRevision"`
 }
 
 type albumTrackOrder struct {
-	AlbumID       int64   `json:"albumId"`
-	TrackIDs      []int64 `json:"trackIds"`
-	OrderRevision int64   `json:"orderRevision"`
+	AlbumID       int64                   `json:"albumId"`
+	Tracks        []trackNumberAssignment `json:"tracks"`
+	OrderRevision int64                   `json:"orderRevision"`
 }
 
-func migrateAlbumOrder(ctx context.Context, tx *sql.Tx) error {
+func migrateTrackNumber(ctx context.Context, tx *sql.Tx) error {
 	if _, err := tx.ExecContext(ctx, `ALTER TABLE albums ADD COLUMN order_revision INTEGER NOT NULL DEFAULT 1 CHECK(order_revision > 0)`); err != nil {
 		return err
 	}
@@ -68,7 +67,7 @@ func reorderAlbumTracks(ctx context.Context, repos domainRepositories, userID, a
 		return albumTrackOrder{}, err
 	}
 	if !allowed {
-		return albumTrackOrder{}, errAlbumOrderForbidden
+		return albumTrackOrder{}, errTrackNumberForbidden
 	}
 	item, found, err := repos.catalog.FindAlbumByID(ctx, albumID)
 	if err != nil {
@@ -78,13 +77,13 @@ func reorderAlbumTracks(ctx context.Context, repos domainRepositories, userID, a
 		return albumTrackOrder{}, errRepositoryNotFound
 	}
 	if normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished {
-		return albumTrackOrder{}, errAlbumOrderState
+		return albumTrackOrder{}, errTrackNumberState
 	}
-	if req.TrackIDs == nil || req.ExpectedOrderRevision < 1 {
-		return albumTrackOrder{}, fmt.Errorf("%w: trackIds array and positive expectedOrderRevision are required", errInvalidAlbum)
+	if req.Tracks == nil || req.ExpectedOrderRevision < 1 {
+		return albumTrackOrder{}, fmt.Errorf("%w: tracks assignments and positive expectedOrderRevision are required", errInvalidAlbum)
 	}
 	if req.ExpectedOrderRevision != item.OrderRevision {
-		return albumTrackOrder{}, errAlbumOrderStale
+		return albumTrackOrder{}, errTrackNumberStale
 	}
 	tracks, err := repos.catalog.ListAlbumTracks(ctx, albumID)
 	if err != nil {
@@ -93,25 +92,28 @@ func reorderAlbumTracks(ctx context.Context, repos domainRepositories, userID, a
 	memberIDs := make([]int64, 0, len(tracks))
 	for _, track := range tracks {
 		if !catalogEntityVisible(track.PublicationStatus, track.RequestedByUserID, userID) {
-			return albumTrackOrder{}, errAlbumOrderHidden
+			return albumTrackOrder{}, errTrackNumberHidden
 		}
 		memberIDs = append(memberIDs, track.ID)
 	}
 	if err := validateExactTrackOrder(item.TrackIDs, memberIDs); err != nil {
 		return albumTrackOrder{}, fmt.Errorf("%w: current album membership is inconsistent", errInvalidAlbum)
 	}
-	// This existing validator rejects nonpositive, duplicate, missing and extra
-	// IDs without normalizing them. It requires an exact permutation.
-	if err := validateExactTrackOrder(req.TrackIDs, item.TrackIDs); err != nil {
-		return albumTrackOrder{}, fmt.Errorf("%w: %v", errInvalidAlbum, err)
+	if err := validateTrackNumbers(req.Tracks, item.TrackIDs); err != nil {
+		return albumTrackOrder{}, err
 	}
-	if !slices.Equal(item.TrackIDs, req.TrackIDs) {
-		item.TrackIDs = append([]int64{}, req.TrackIDs...)
-		if err := repos.catalog.UpdateAlbum(ctx, &item); err != nil {
-			return albumTrackOrder{}, err
-		}
+	if err := repos.catalog.SetAlbumTrackNumbers(ctx, item.ID, req.Tracks); err != nil {
+		return albumTrackOrder{}, err
 	}
-	return albumTrackOrder{AlbumID: item.ID, TrackIDs: append([]int64{}, item.TrackIDs...), OrderRevision: item.OrderRevision}, nil
+	item, _, err = repos.catalog.FindAlbumByID(ctx, item.ID)
+	if err != nil {
+		return albumTrackOrder{}, err
+	}
+	tracks, err = repos.catalog.ListAlbumTracks(ctx, item.ID)
+	if err != nil {
+		return albumTrackOrder{}, err
+	}
+	return albumTrackOrder{AlbumID: item.ID, Tracks: assignmentsForTracks(tracks), OrderRevision: item.OrderRevision}, nil
 }
 
 func reorderAlbumTracksHandler(store *trackStore) http.HandlerFunc {
@@ -133,11 +135,11 @@ func reorderAlbumTracksHandler(store *trackStore) http.HandlerFunc {
 		}
 		result, err := store.reorderAlbumTracks(r.Context(), userID, id, req)
 		if err != nil {
-			if errors.Is(err, errAlbumOrderForbidden) {
+			if errors.Is(err, errTrackNumberForbidden) {
 				http.Error(w, err.Error(), http.StatusForbidden)
 				return
 			}
-			if errors.Is(err, errAlbumOrderStale) || errors.Is(err, errAlbumOrderState) || errors.Is(err, errAlbumOrderHidden) {
+			if errors.Is(err, errTrackNumberStale) || errors.Is(err, errTrackNumberState) || errors.Is(err, errTrackNumberHidden) {
 				http.Error(w, err.Error(), http.StatusConflict)
 				return
 			}

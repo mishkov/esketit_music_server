@@ -99,6 +99,7 @@ func TestRefreshAuthorPopularityPersistsRollingSnapshotAndOrdersAllAuthors(t *te
 		AuthorIDs:     []int64{authorOne.ID},
 		AlbumID:       albumItem.ID,
 		AudioFilePath: "/api/songs/first.mp3",
+		TrackNumber:   1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -108,6 +109,7 @@ func TestRefreshAuthorPopularityPersistsRollingSnapshotAndOrdersAllAuthors(t *te
 		AuthorIDs:     []int64{authorTwo.ID},
 		AlbumID:       albumItem.ID,
 		AudioFilePath: "/api/songs/second.mp3",
+		TrackNumber:   2,
 	})
 	if err != nil {
 		t.Fatal(err)

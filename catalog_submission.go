@@ -132,7 +132,7 @@ type createTrackSubmissionRequest struct {
 	Name             string           `json:"name"`
 	AuthorIDs        []int64          `json:"authorIds"`
 	AlbumID          int64            `json:"albumId"`
-	AlbumOrder       int              `json:"albumOrder"`
+	TrackNumber      int              `json:"trackNumber"`
 	AudioUploadToken string           `json:"audioUploadToken"`
 	AdditionalInfo   []additionalInfo `json:"additionalInfo"`
 	SourceMetadata   []sourceMetadata `json:"sourceMetadata"`
@@ -142,7 +142,7 @@ type updateTrackSubmissionRequest struct {
 	Name             string           `json:"name"`
 	AuthorIDs        []int64          `json:"authorIds"`
 	AlbumID          int64            `json:"albumId"`
-	AlbumOrder       int              `json:"albumOrder"`
+	TrackNumber      int              `json:"trackNumber"`
 	AudioUploadToken string           `json:"audioUploadToken,omitempty"`
 	AdditionalInfo   []additionalInfo `json:"additionalInfo"`
 	SourceMetadata   []sourceMetadata `json:"sourceMetadata"`
@@ -257,9 +257,6 @@ func (s *trackStore) createAuthorSubmission(requesterUserID int64, request upser
 }
 
 func (s *trackStore) createAlbumSubmission(requesterUserID int64, request upsertAlbumRequest) (catalogSubmissionResponse, error) {
-	if len(request.TrackIDs) != 0 {
-		return catalogSubmissionResponse{}, fmt.Errorf("%w: trackIds must be empty when submitting a new album", errInvalidAlbum)
-	}
 	request.AuthorIDs = normalizeAuthorIDs(request.AuthorIDs)
 	var result catalogSubmissionResponse
 	err := s.withinStateTransaction(stateCatalog, func(state *domainState) error {
@@ -312,7 +309,7 @@ func (s *trackStore) createTrackSubmission(requesterUserID int64, request create
 			return err
 		}
 		item, err := state.create(upsertTrackRequest{
-			Name: request.Name, AuthorIDs: request.AuthorIDs, AlbumID: request.AlbumID, AlbumOrder: request.AlbumOrder,
+			Name: request.Name, AuthorIDs: request.AuthorIDs, AlbumID: request.AlbumID, TrackNumber: request.TrackNumber,
 			AudioFilePath: "/api/catalog-submissions/tracks/pending/audio", AdditionalInfo: request.AdditionalInfo, SourceMetadata: request.SourceMetadata,
 		})
 		if err != nil {
@@ -508,7 +505,6 @@ func (s *trackStore) updateAlbumSubmission(requesterUserID, albumID int64, reque
 		if request.CoverImagePath == "" {
 			request.CoverImagePath = current.CoverImagePath
 		}
-		request.TrackIDs = append([]int64(nil), current.TrackIDs...)
 		item, found, err := state.updateAlbum(albumID, request)
 		if err != nil {
 			return err
@@ -578,7 +574,7 @@ func (s *trackStore) updateTrackSubmission(requesterUserID, trackID int64, reque
 			}
 		}
 		item, found, err := state.update(trackID, upsertTrackRequest{
-			Name: request.Name, AuthorIDs: request.AuthorIDs, AlbumID: request.AlbumID, AlbumOrder: request.AlbumOrder,
+			Name: request.Name, AuthorIDs: request.AuthorIDs, AlbumID: request.AlbumID, TrackNumber: request.TrackNumber,
 			AudioFilePath: current.AudioFilePath, AdditionalInfo: request.AdditionalInfo, SourceMetadata: request.SourceMetadata,
 		})
 		if err != nil {

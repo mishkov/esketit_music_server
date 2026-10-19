@@ -219,11 +219,11 @@ func TestYouTubeImportAddCurrentCreateDownloadsAndCreatesTrack(t *testing.T) {
 	}
 
 	dto, createdTrack, err := service.AddCurrent(ctx, 1, youtubeAddCurrentRequest{
-		Mode:       youtubeAddModeCreate,
-		Name:       "Imported Track",
-		AuthorIDs:  []int64{artist.ID},
-		AlbumID:    album.ID,
-		AlbumOrder: 0,
+		Mode:        youtubeAddModeCreate,
+		Name:        "Imported Track",
+		AuthorIDs:   []int64{artist.ID},
+		AlbumID:     album.ID,
+		TrackNumber: 1,
 	})
 	if err != nil {
 		t.Fatalf("AddCurrent() error = %v", err)
@@ -231,7 +231,7 @@ func TestYouTubeImportAddCurrentCreateDownloadsAndCreatesTrack(t *testing.T) {
 	if dto.Status != youtubeImportStatusCompleted || dto.Progress.Saved != 1 {
 		t.Fatalf("AddCurrent() dto = %#v", dto)
 	}
-	assertAlbumOrder(t, store, album.ID, []int64{createdTrack.ID}, album.OrderRevision+1)
+	assertTrackNumber(t, store, album.ID, []int64{createdTrack.ID}, album.OrderRevision+1)
 	if !strings.HasPrefix(createdTrack.AudioFilePath, "/api/songs/") {
 		t.Fatalf("created track audio path = %q", createdTrack.AudioFilePath)
 	}
@@ -299,11 +299,11 @@ func TestYouTubeImportSessionUsesRequestCookiesAndCleansThemUp(t *testing.T) {
 	}
 
 	_, _, err := service.AddCurrent(ctx, 1, youtubeAddCurrentRequest{
-		Mode:       youtubeAddModeCreate,
-		Name:       "Cookie Track",
-		AuthorIDs:  []int64{artist.ID},
-		AlbumID:    album.ID,
-		AlbumOrder: 0,
+		Mode:        youtubeAddModeCreate,
+		Name:        "Cookie Track",
+		AuthorIDs:   []int64{artist.ID},
+		AlbumID:     album.ID,
+		TrackNumber: 1,
 	})
 	if err != nil {
 		t.Fatalf("AddCurrent() error = %v", err)
@@ -342,7 +342,7 @@ func TestYouTubeImportAddCurrentAttachMergesMetadata(t *testing.T) {
 		Name:          "Track",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "/api/songs/existing-track.mp3",
 	})
 	if err != nil {
@@ -355,8 +355,9 @@ func TestYouTubeImportAddCurrentAttachMergesMetadata(t *testing.T) {
 	}
 
 	dto, updatedTrack, err := service.AddCurrent(ctx, 1, youtubeAddCurrentRequest{
-		Mode:    youtubeAddModeAttach,
-		TrackID: existingTrack.ID,
+		Mode:        youtubeAddModeAttach,
+		TrackID:     existingTrack.ID,
+		TrackNumber: 1,
 	})
 	if err != nil {
 		t.Fatalf("AddCurrent() attach error = %v", err)
@@ -398,7 +399,7 @@ func TestYouTubeImportSuggestionsIncludeExactSourceMatch(t *testing.T) {
 		Name:          "Matched Track",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "/api/songs/matched-track.mp3",
 		SourceMetadata: []sourceMetadata{
 			{

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"slices"
 	"time"
 )
 
@@ -41,6 +40,7 @@ type CatalogRepository interface {
 	ListAlbums(context.Context) ([]album, error)
 	ListTracks(context.Context) ([]track, error)
 	ListAlbumTracks(context.Context, int64) ([]track, error)
+	SetAlbumTrackNumbers(context.Context, int64, []trackNumberAssignment) error
 	FindAlbumByID(context.Context, int64) (album, bool, error)
 	FindTrackByID(context.Context, int64) (track, bool, error)
 	InsertAlbum(context.Context, album) error
@@ -540,7 +540,7 @@ func (r *sqliteRepositories) ListTracks(ctx context.Context) (items []track, ret
 // ListAlbumTracks returns unfiltered membership for domain validation, including
 // pending tracks. Public read projections must still apply catalog visibility.
 func (r *sqliteRepositories) ListAlbumTracks(ctx context.Context, albumID int64) (items []track, returnErr error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT `+trackColumns+` FROM tracks WHERE album_id = ? ORDER BY id`, albumID)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+trackColumns+` FROM tracks WHERE album_id = ? ORDER BY track_number`, albumID)
 	if err != nil {
 		return nil, translateSQLiteError(err)
 	}
@@ -559,7 +559,7 @@ func scanTrack(row rowScanner) (track, error) {
 	var item track
 	var authorIDsJSON, additionalInfoJSON, sourceMetadataJSON, createdAt string
 	var requestedBy sql.NullInt64
-	if err := row.Scan(&item.ID, &item.Name, &authorIDsJSON, &item.AlbumID, &item.AudioFilePath, &additionalInfoJSON, &sourceMetadataJSON, &createdAt, &item.PublicationStatus, &requestedBy); err != nil {
+	if err := row.Scan(&item.ID, &item.Name, &authorIDsJSON, &item.AlbumID, &item.AudioFilePath, &additionalInfoJSON, &sourceMetadataJSON, &createdAt, &item.PublicationStatus, &requestedBy, &item.TrackNumber); err != nil {
 		return track{}, translateSQLiteError(err)
 	}
 	if err := unmarshalJSONColumn(authorIDsJSON, &item.AuthorIDs); err != nil {
@@ -589,55 +589,32 @@ func (r *sqliteRepositories) FindTrackByID(ctx context.Context, id int64) (track
 	return item, err == nil, err
 }
 
-func encodeAlbum(item album) (string, string, string, error) {
-	authorIDsJSON, err := marshalJSONColumn(item.AuthorIDs)
+func encodeAlbum(item album) (string, string, error) {
+	authors, err := marshalJSONColumn(item.AuthorIDs)
 	if err != nil {
-		return "", "", "", err
+		return "", "", err
 	}
-	trackIDsJSON, err := marshalJSONColumn(item.TrackIDs)
-	if err != nil {
-		return "", "", "", err
-	}
-	additionalInfoJSON, err := marshalJSONColumn(item.AdditionalInfo)
-	if err != nil {
-		return "", "", "", err
-	}
-	return authorIDsJSON, trackIDsJSON, additionalInfoJSON, nil
+	info, err := marshalJSONColumn(item.AdditionalInfo)
+	return authors, info, err
 }
 
 func (r *sqliteRepositories) InsertAlbum(ctx context.Context, item album) error {
-	authorIDsJSON, trackIDsJSON, additionalInfoJSON, err := encodeAlbum(item)
+	authorIDsJSON, additionalInfoJSON, err := encodeAlbum(item)
 	if err != nil {
 		return err
 	}
-	_, err = r.q.ExecContext(ctx, `INSERT INTO albums (id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json, publication_status, requested_by_user_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, item.ID, item.Title, item.CoverImagePath, authorIDsJSON, formatSQLiteTime(item.ReleaseDate), boolToSQLiteInt(item.IsPublished), trackIDsJSON, additionalInfoJSON, normalizePublicationStatus(item.PublicationStatus), item.RequestedByUserID)
+	_, err = r.q.ExecContext(ctx, `INSERT INTO albums (id, title, cover_image_path, author_ids_json, release_date, is_published, additional_info_json, publication_status, requested_by_user_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, item.ID, item.Title, item.CoverImagePath, authorIDsJSON, formatSQLiteTime(item.ReleaseDate), boolToSQLiteInt(item.IsPublished), additionalInfoJSON, normalizePublicationStatus(item.PublicationStatus), item.RequestedByUserID)
 	return translateSQLiteError(err)
 }
 
-// UpdateAlbum owns ordering revisions for every catalog mutation, including
-// legacy writes and submission removal. Callers use transaction-bound repositories.
-// Returning the stored revision through item keeps responses and snapshots current.
+// UpdateAlbum changes metadata only. Track mutations own the order revision.
 func (r *sqliteRepositories) UpdateAlbum(ctx context.Context, item *album) error {
-	current, found, err := r.FindAlbumByID(ctx, item.ID)
+	authorIDsJSON, additionalInfoJSON, err := encodeAlbum(*item)
 	if err != nil {
 		return err
 	}
-	if !found {
-		return errRepositoryNotFound
-	}
-	increment := 0
-	if !slices.Equal(current.TrackIDs, item.TrackIDs) {
-		increment = 1
-	}
-	authorIDsJSON, trackIDsJSON, additionalInfoJSON, err := encodeAlbum(*item)
-	if err != nil {
-		return err
-	}
-	err = r.q.QueryRowContext(ctx, `UPDATE albums SET title = ?, cover_image_path = ?, author_ids_json = ?, release_date = ?,
- is_published = ?, track_ids_json = ?, additional_info_json = ?, publication_status = ?, requested_by_user_id = ?,
- order_revision = order_revision + ? WHERE id = ? RETURNING order_revision`,
-		item.Title, item.CoverImagePath, authorIDsJSON, formatSQLiteTime(item.ReleaseDate), boolToSQLiteInt(item.IsPublished), trackIDsJSON, additionalInfoJSON, normalizePublicationStatus(item.PublicationStatus), item.RequestedByUserID, increment, item.ID).Scan(&item.OrderRevision)
+	err = r.q.QueryRowContext(ctx, `UPDATE albums SET title=?,cover_image_path=?,author_ids_json=?,release_date=?,is_published=?,additional_info_json=?,publication_status=?,requested_by_user_id=? WHERE id=? RETURNING order_revision`, item.Title, item.CoverImagePath, authorIDsJSON, formatSQLiteTime(item.ReleaseDate), boolToSQLiteInt(item.IsPublished), additionalInfoJSON, normalizePublicationStatus(item.PublicationStatus), item.RequestedByUserID, item.ID).Scan(&item.OrderRevision)
 	return translateSQLiteError(err)
 }
 
@@ -670,9 +647,9 @@ func (r *sqliteRepositories) InsertTrack(ctx context.Context, item track) error 
 	if err != nil {
 		return err
 	}
-	_, err = r.q.ExecContext(ctx, `INSERT INTO tracks (id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at, publication_status, requested_by_user_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, item.ID, item.Name, authorIDsJSON, item.AlbumID, item.AudioFilePath, additionalInfoJSON, sourceMetadataJSON, formatSQLiteTime(item.CreatedAt), normalizePublicationStatus(item.PublicationStatus), item.RequestedByUserID)
-	return translateSQLiteError(err)
+	_, err = r.q.ExecContext(ctx, `INSERT INTO tracks (id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at, publication_status, requested_by_user_id, track_number)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, item.ID, item.Name, authorIDsJSON, item.AlbumID, item.AudioFilePath, additionalInfoJSON, sourceMetadataJSON, formatSQLiteTime(item.CreatedAt), normalizePublicationStatus(item.PublicationStatus), item.RequestedByUserID, item.TrackNumber)
+	return trackWriteError(err)
 }
 
 func (r *sqliteRepositories) UpdateTrack(ctx context.Context, item track) error {
@@ -681,10 +658,10 @@ func (r *sqliteRepositories) UpdateTrack(ctx context.Context, item track) error 
 		return err
 	}
 	result, err := r.q.ExecContext(ctx, `UPDATE tracks SET name = ?, author_ids_json = ?, album_id = ?, audio_file_path = ?,
-		additional_info_json = ?, source_metadata_json = ?, created_at = ?, publication_status = ?, requested_by_user_id = ? WHERE id = ?`,
-		item.Name, authorIDsJSON, item.AlbumID, item.AudioFilePath, additionalInfoJSON, sourceMetadataJSON, formatSQLiteTime(item.CreatedAt), normalizePublicationStatus(item.PublicationStatus), item.RequestedByUserID, item.ID)
+		additional_info_json = ?, source_metadata_json = ?, created_at = ?, publication_status = ?, requested_by_user_id = ?, track_number = ? WHERE id = ?`,
+		item.Name, authorIDsJSON, item.AlbumID, item.AudioFilePath, additionalInfoJSON, sourceMetadataJSON, formatSQLiteTime(item.CreatedAt), normalizePublicationStatus(item.PublicationStatus), item.RequestedByUserID, item.TrackNumber, item.ID)
 	if err != nil {
-		return translateSQLiteError(err)
+		return trackWriteError(err)
 	}
 	return requireAffected(result)
 }

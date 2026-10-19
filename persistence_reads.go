@@ -57,8 +57,8 @@ func init() {
 }
 
 const (
-	albumColumns    = `id, title, cover_image_path, author_ids_json, release_date, is_published, track_ids_json, additional_info_json, publication_status, requested_by_user_id, order_revision`
-	trackColumns    = `id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at, publication_status, requested_by_user_id`
+	albumColumns    = `id, title, cover_image_path, author_ids_json, release_date, is_published, (SELECT json_group_array(id) FROM (SELECT id FROM tracks WHERE album_id = albums.id ORDER BY track_number)), additional_info_json, publication_status, requested_by_user_id, order_revision`
+	trackColumns    = `id, name, author_ids_json, album_id, audio_file_path, additional_info_json, source_metadata_json, created_at, publication_status, requested_by_user_id, track_number`
 	authorColumns   = `id, current_name, photos_json, publication_status, requested_by_user_id`
 	playlistColumns = `id, user_id, name, description, cover_image_path, visibility, share_token, track_items_json, system, kind`
 )
@@ -120,9 +120,8 @@ func albumReadFilter(filter albumListFilter) (string, []any) {
 		ownedDraftArgs := make([]any, 0, 2)
 		ownedDraft := catalogSQLOwnedDraft("albums", filter.ViewerUserID, &ownedDraftArgs)
 		predicates = append(predicates, `(EXISTS (
-			SELECT 1 FROM json_each(albums.track_ids_json) album_track
-			JOIN tracks visible_track ON visible_track.id = CAST(album_track.value AS INTEGER)
-			WHERE `+visibleTrack+`
+			SELECT 1 FROM tracks visible_track
+			WHERE visible_track.album_id = albums.id AND `+visibleTrack+`
 		) OR `+ownedDraft+`)`)
 		args = append(args, visibleTrackArgs...)
 		args = append(args, ownedDraftArgs...)
@@ -141,6 +140,9 @@ func (r *sqliteRepositories) ListTracksPage(ctx context.Context, filter trackLis
 		return nil, 0, err
 	}
 	orderBy := "id ASC"
+	if filter.AlbumID > 0 {
+		orderBy = "track_number ASC, id ASC"
+	}
 	if filter.Order == sortOrderDesc {
 		orderBy = "id DESC"
 	}
@@ -353,9 +355,8 @@ func (r *sqliteRepositories) SearchPage(ctx context.Context, userID int64, filte
 		ownedDraftArgs := make([]any, 0, 2)
 		ownedDraft := catalogSQLOwnedDraft("albums", userID, &ownedDraftArgs)
 		albumEmptyPredicate = ` AND (EXISTS (
-			SELECT 1 FROM json_each(albums.track_ids_json) search_album_item
-			JOIN tracks search_album_track ON search_album_track.id = CAST(search_album_item.value AS INTEGER)
-			WHERE ` + visibleTrack + `) OR ` + ownedDraft + `)`
+			SELECT 1 FROM tracks search_album_track
+			WHERE search_album_track.album_id = albums.id AND ` + visibleTrack + `) OR ` + ownedDraft + `)`
 		albumEmptyArgs = append(albumEmptyArgs, visibleTrackArgs...)
 		albumEmptyArgs = append(albumEmptyArgs, ownedDraftArgs...)
 	}

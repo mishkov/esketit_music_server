@@ -248,7 +248,7 @@ func TestMCPAudioAlbumAndApproval(t *testing.T) {
 	author := callMCP(t, s, "submit_author", map[string]any{"requestId": "author", "currentName": "Artist"})
 	cover := uploadMCP(t, s, "album_cover", "cover-1", "cover.png", catalogTestPNG(t, 2, 2))
 	album := callMCP(t, s, "submit_album", map[string]any{"requestId": "album", "title": "Album", "releaseDate": "2024-01-01T00:00:00Z", "authorIds": []int64{mcpID(author, "entityId")}, "coverUploadToken": cover["uploadToken"], "additionalInfo": []any{map[string]any{"type": "text", "title": "Note", "text": "Keep me"}}})
-	track := callMCP(t, s, "submit_track", map[string]any{"requestId": "track", "name": "Recording", "authorIds": []int64{mcpID(author, "entityId")}, "albumId": mcpID(album, "entityId"), "audioUploadToken": audio["uploadToken"], "sourceMetadata": []any{map[string]any{"provider": "website", "identity": map[string]any{"url": "https://example.com/recording"}, "url": "https://example.com/recording"}}})
+	track := callMCP(t, s, "submit_track", map[string]any{"requestId": "track", "name": "Recording", "authorIds": []int64{mcpID(author, "entityId")}, "albumId": mcpID(album, "entityId"), "audioUploadToken": audio["uploadToken"], "sourceMetadata": []any{map[string]any{"provider": "website", "identity": map[string]any{"url": "https://example.com/recording"}, "url": "https://example.com/recording"}}, "trackNumber": fixtureNextTrackNumber(t, s.store, mcpID(album, "entityId"))})
 	upload := callMCP(t, s, "get_upload", map[string]any{"uploadToken": audio["uploadToken"]})
 	if int64(upload["claimedSubmissionId"].(float64)) != mcpID(track, "submissionId") {
 		t.Fatalf("claim=%v", upload)
@@ -497,7 +497,7 @@ func TestMCPReplacementRollbackAndCancellation(t *testing.T) {
 	first := uploadMCP(t, s, "audio", "first-audio", "first.mp3", audio)
 	artist := callMCP(t, s, "submit_author", map[string]any{"requestId": "artist", "currentName": "Artist"})
 	album := callMCP(t, s, "submit_album", map[string]any{"requestId": "album", "title": "Album", "authorIds": []int64{mcpID(artist, "entityId")}, "releaseDate": "2024-01-01T00:00:00Z"})
-	args := map[string]any{"requestId": "track", "name": "Original", "authorIds": []int64{mcpID(artist, "entityId")}, "albumId": mcpID(album, "entityId"), "audioUploadToken": first["uploadToken"]}
+	args := map[string]any{"requestId": "track", "name": "Original", "authorIds": []int64{mcpID(artist, "entityId")}, "albumId": mcpID(album, "entityId"), "audioUploadToken": first["uploadToken"], "trackNumber": 1}
 	created := callMCP(t, s, "submit_track", args)
 	reviewer := mustCreateCatalogTestUser(t, s.store, "reviewer@example.com")
 	lease, err := s.store.acquireCatalogReviewLease(reviewer.ID, requester.ID)
@@ -643,7 +643,7 @@ func TestMCPOfficialClientInteroperability(t *testing.T) {
 	}
 }
 
-func TestMCPTrackPatchPreservesAlbumOrder(t *testing.T) {
+func TestMCPTrackPatchPreservesTrackNumber(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg required for real MP3 validation")
 	}
@@ -654,8 +654,8 @@ func TestMCPTrackPatchPreservesAlbumOrder(t *testing.T) {
 	var second map[string]any
 	for i := 0; i < 2; i++ {
 		upload := uploadMCP(t, s, "audio", fmt.Sprintf("audio-%d", i), "track.mp3", audio)
-		result := callMCP(t, s, "submit_track", map[string]any{"requestId": fmt.Sprintf("track-%d", i), "name": fmt.Sprintf("Track %d", i), "authorIds": []int64{mcpID(artist, "entityId")}, "albumId": mcpID(album, "entityId"), "audioUploadToken": upload["uploadToken"]})
-		if result["entity"].(map[string]any)["albumOrder"].(float64) != float64(i) {
+		result := callMCP(t, s, "submit_track", map[string]any{"requestId": fmt.Sprintf("track-%d", i), "name": fmt.Sprintf("Track %d", i), "authorIds": []int64{mcpID(artist, "entityId")}, "albumId": mcpID(album, "entityId"), "audioUploadToken": upload["uploadToken"], "trackNumber": fixtureNextTrackNumber(t, s.store, mcpID(album, "entityId"))})
+		if result["entity"].(map[string]any)["trackNumber"].(float64) != float64(i+1) {
 			t.Fatalf("new track not appended: %v", result)
 		}
 		second = result
@@ -670,11 +670,11 @@ func TestMCPTrackPatchPreservesAlbumOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := callMCP(t, s, "update_track_submission", map[string]any{"requestId": "rename", "submissionId": feedback.ID, "expectedRevision": feedback.Revision, "name": "Renamed"})
-	if result["entity"].(map[string]any)["albumOrder"].(float64) != 1 {
+	if result["entity"].(map[string]any)["trackNumber"].(float64) != 2 {
 		t.Fatalf("patch moved track: %v", result)
 	}
 	visible := callMCP(t, s, "get_catalog_item", map[string]any{"entityType": "track", "entityId": feedback.EntityID})
-	if visible["albumOrder"].(float64) != 1 {
+	if visible["trackNumber"].(float64) != 2 {
 		t.Fatalf("catalog order=%v", visible)
 	}
 }

@@ -210,10 +210,11 @@ func TestYouTubeImportAddCurrentEnforcesDownloadTimeout(t *testing.T) {
 
 	started := time.Now()
 	_, _, err := service.AddCurrent(context.Background(), 1, youtubeAddCurrentRequest{
-		Mode:      youtubeAddModeCreate,
-		Name:      item.ParsedTitle,
-		AuthorIDs: []int64{artist.ID},
-		AlbumID:   album.ID,
+		Mode:        youtubeAddModeCreate,
+		Name:        item.ParsedTitle,
+		AuthorIDs:   []int64{artist.ID},
+		AlbumID:     album.ID,
+		TrackNumber: 1,
 	})
 	if !errors.Is(err, errYouTubeDownloadFailed) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("AddCurrent() error = %v, want download failure with deadline cause", err)
@@ -346,11 +347,11 @@ func installPassingYouTubeFFmpeg(t *testing.T, service *youtubeImportService) {
 
 func youtubeCreateRequest(artist author, albumItem album, name string) youtubeAddCurrentRequest {
 	return youtubeAddCurrentRequest{
-		Mode:      youtubeAddModeCreate,
-		Name:      name,
-		AuthorIDs: []int64{artist.ID},
-		AlbumID:   albumItem.ID,
-	}
+		Mode:        youtubeAddModeCreate,
+		Name:        name,
+		AuthorIDs:   []int64{artist.ID},
+		AlbumID:     albumItem.ID,
+		TrackNumber: 1}
 }
 
 func TestYouTubeImportSerializesAddAndCancel(t *testing.T) {

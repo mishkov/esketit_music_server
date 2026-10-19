@@ -100,8 +100,8 @@ to an active staged upload after a crash between those steps.
   one transaction.
 - Album reordering checks the dedicated permission, approval, full visible
   membership, and expected order revision before updating in one transaction.
-  Album orderRevision starts at 1; the catalog repository advances it only when
-  the persisted ordered track IDs change, covering legacy and submission writes.
+  Album orderRevision starts at 1; database triggers advance it on track insertion, deletion, moves, or number changes.
+  Bulk assignment changes coalesce their intermediate trigger increments to one revision.
   Reads return it with trackIds from the same snapshot. It is separate from
   submission revisions; MCP includes its persisted retry receipt in the transaction.
 - Track movement updates the track plus its old and new album rows atomically.
@@ -162,3 +162,18 @@ a separate version with compare-and-swap updates and access-control audit rows.
 Retry receipts and media tokens are bound to the selected user through foreign
 keys. They intentionally have no automatic expiry; get_submission/get_upload
 return current state while replayed writes return their original receipt.
+
+## Persistent track numbers (migration 12)
+
+`tracks.album_id` and required positive `tracks.track_number` are authoritative.
+A unique `(album_id, track_number)` constraint prevents collisions. Album `trackIds`
+are derived in ascending number order; the stored `albums.track_ids_json` is removed.
+Gaps survive creation, deletion, review, moves, and explicit assignments. No disc
+column is introduced. Playlists keep independent ordering.
+
+Migration 12 runs automatically in one transaction. It assigns old album positions
+to 1..N without guessing intended numbers, migrates saved proposal payloads, and
+preserves staged upload links. Inconsistent old membership aborts and rolls back
+the migration. Back up SQLite before deployment and deploy updated clients with
+the server; older binaries cannot use the new schema. Restoring a backup is needed
+to roll back the schema. No manual SQL is needed for consistent data.
