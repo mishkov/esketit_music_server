@@ -610,7 +610,7 @@ func TestDislikePreferenceIsIdempotentAndMutuallyExclusive(t *testing.T) {
 		Name:          "Track",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       albumItem.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "/api/songs/track.mp3",
 	})
 	if err != nil {
@@ -658,7 +658,7 @@ func TestDislikeTrackRoutes(t *testing.T) {
 		t.Fatalf("createUser() error = %v", err)
 	}
 	artist, albumItem := seedPlaylistTrackDependencies(t, store)
-	trackItem, err := store.create(upsertTrackRequest{Name: "Track", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AlbumOrder: 0, AudioFilePath: "/api/songs/track.mp3"})
+	trackItem, err := store.create(upsertTrackRequest{Name: "Track", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, TrackNumber: 1, AudioFilePath: "/api/songs/track.mp3"})
 	if err != nil {
 		t.Fatalf("create() error = %v", err)
 	}
@@ -702,7 +702,7 @@ func TestDislikedTracksRemainInAlbumAndPlaylistResponses(t *testing.T) {
 		Name:          "Track",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       albumItem.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "/api/songs/track.mp3",
 	})
 	if err != nil {
@@ -742,11 +742,11 @@ func TestAutoplayExcludesDislikedTracks(t *testing.T) {
 		t.Fatalf("createUser() error = %v", err)
 	}
 	artist, albumItem := seedPlaylistTrackDependencies(t, store)
-	first, err := store.create(upsertTrackRequest{Name: "First", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AlbumOrder: 0, AudioFilePath: "/api/songs/first.mp3"})
+	first, err := store.create(upsertTrackRequest{Name: "First", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, TrackNumber: 1, AudioFilePath: "/api/songs/first.mp3"})
 	if err != nil {
 		t.Fatalf("create(first) error = %v", err)
 	}
-	second, err := store.create(upsertTrackRequest{Name: "Second", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AlbumOrder: 1, AudioFilePath: "/api/songs/second.mp3"})
+	second, err := store.create(upsertTrackRequest{Name: "Second", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, TrackNumber: 2, AudioFilePath: "/api/songs/second.mp3"})
 	if err != nil {
 		t.Fatalf("create(second) error = %v", err)
 	}
@@ -770,7 +770,7 @@ func TestSystemPlaylistsRejectGenericMutation(t *testing.T) {
 		t.Fatalf("createUser() error = %v", err)
 	}
 	artist, albumItem := seedPlaylistTrackDependencies(t, store)
-	trackItem, err := store.create(upsertTrackRequest{Name: "Track", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AlbumOrder: 0, AudioFilePath: "/api/songs/track.mp3"})
+	trackItem, err := store.create(upsertTrackRequest{Name: "Track", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, TrackNumber: 1, AudioFilePath: "/api/songs/track.mp3"})
 	if err != nil {
 		t.Fatalf("create() error = %v", err)
 	}
@@ -881,7 +881,7 @@ func TestDeleteTrackKeepsUnavailablePlaylistEntry(t *testing.T) {
 		Name:          "Track",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "/api/songs/track.mp3",
 	})
 	if err != nil {
@@ -988,6 +988,7 @@ func TestPublicAndSharedPlaylistHandlersAllowAnonymousReads(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       albumItem.ID,
 		AudioFilePath: "/api/songs/open-track.mp3",
+		TrackNumber:   2,
 	})
 	if err != nil {
 		t.Fatalf("create() error = %v", err)
@@ -1145,6 +1146,7 @@ func TestListTrackResponsesAppliesPaginationFiltersAndSearch(t *testing.T) {
 		AuthorIDs:     []int64{artistOne.ID},
 		AlbumID:       albumOne.ID,
 		AudioFilePath: "/api/songs/skyline.mp3",
+		TrackNumber:   1,
 	})
 	if err != nil {
 		t.Fatalf("create() skyline error = %v", err)
@@ -1154,6 +1156,7 @@ func TestListTrackResponsesAppliesPaginationFiltersAndSearch(t *testing.T) {
 		AuthorIDs:     []int64{artistOne.ID, artistTwo.ID},
 		AlbumID:       albumTwo.ID,
 		AudioFilePath: "/api/songs/night-drive.mp3",
+		TrackNumber:   1,
 	})
 	if err != nil {
 		t.Fatalf("create() night drive error = %v", err)
@@ -1163,6 +1166,7 @@ func TestListTrackResponsesAppliesPaginationFiltersAndSearch(t *testing.T) {
 		AuthorIDs:     []int64{artistTwo.ID},
 		AlbumID:       albumOne.ID,
 		AudioFilePath: "/api/songs/morning-light.mp3",
+		TrackNumber:   2,
 	})
 	if err != nil {
 		t.Fatalf("create() morning light error = %v", err)
@@ -1223,6 +1227,7 @@ func TestListTrackResponsesSortsByCreatedAtDesc(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
 		AudioFilePath: "/api/songs/first.mp3",
+		TrackNumber:   1,
 	})
 	if err != nil {
 		t.Fatalf("create() first error = %v", err)
@@ -1232,6 +1237,7 @@ func TestListTrackResponsesSortsByCreatedAtDesc(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
 		AudioFilePath: "/api/songs/second.mp3",
+		TrackNumber:   2,
 	})
 	if err != nil {
 		t.Fatalf("create() second error = %v", err)
@@ -1241,6 +1247,7 @@ func TestListTrackResponsesSortsByCreatedAtDesc(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
 		AudioFilePath: "/api/songs/third.mp3",
+		TrackNumber:   3,
 	})
 	if err != nil {
 		t.Fatalf("create() third error = %v", err)
@@ -1306,7 +1313,7 @@ func TestCreateTrackAcceptsExternalLinkAndSourceMetadata(t *testing.T) {
 		Name:          "Imported Track",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "/api/songs/imported-track.mp3",
 		AdditionalInfo: []additionalInfo{
 			{
@@ -1354,7 +1361,7 @@ func TestCreateTrackRejectsDuplicateSourceMetadataProviderIdentity(t *testing.T)
 		Name:          "Duplicate Source",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "/api/songs/duplicate-source.mp3",
 		SourceMetadata: []sourceMetadata{
 			{"provider": "telegram", "identity": map[string]any{"chatId": "chan", "messageId": "42"}},
@@ -1393,7 +1400,7 @@ func TestSearchHandlerReturnsCombinedPaginatedResults(t *testing.T) {
 		Name:          "Dream State",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       albumItem.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "/api/songs/dream-state.mp3",
 	})
 	if err != nil {
@@ -1543,7 +1550,7 @@ func TestSearchHandlerReturnsDisplayReadyTrackResults(t *testing.T) {
 		Name:           "Display Ready Track",
 		AuthorIDs:      []int64{artistOne.ID, artistTwo.ID},
 		AlbumID:        albumItem.ID,
-		AlbumOrder:     0,
+		TrackNumber:    1,
 		AudioFilePath:  "/api/songs/display-ready-track.mp3",
 		AdditionalInfo: []additionalInfo{{"type": "external_link", "provider": "site", "url": "https://example.com/track"}},
 	})
@@ -1636,7 +1643,7 @@ func TestSearchHandlerUsesOptionalAuthForFavoritesAndAdminAlbumVisibility(t *tes
 		Name:          "Echo Song",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       fullAlbum.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "/api/songs/echo-song.mp3",
 	})
 	if err != nil {
@@ -1748,7 +1755,7 @@ func TestListAlbumsHandlerHidesEmptyAlbumsForNonAdmin(t *testing.T) {
 		Name:          "Track",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       fullAlbum.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "/api/songs/full.mp3",
 	}); err != nil {
 		t.Fatalf("create() error = %v", err)
@@ -1820,7 +1827,7 @@ func TestDeleteSongHandlerRejectsReferencedSong(t *testing.T) {
 		Name:          "Track",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "/api/songs/track.mp3",
 	})
 	if err != nil {
@@ -1878,7 +1885,7 @@ func TestListUnusedSongsHandlerReturnsOnlyUnreferencedSongs(t *testing.T) {
 		Name:          "Track",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "https://cdn.example.com/songs/used.mp3?token=abc",
 	})
 	if err != nil {
@@ -2160,7 +2167,7 @@ func TestAutoplayNextHandlerSupportsAllSourceTypes(t *testing.T) {
 		Name:          "Track One",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       albumItem.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "/api/songs/track-one.mp3",
 	})
 	if err != nil {
@@ -2170,7 +2177,7 @@ func TestAutoplayNextHandlerSupportsAllSourceTypes(t *testing.T) {
 		Name:          "Track Two",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       albumItem.ID,
-		AlbumOrder:    1,
+		TrackNumber:   2,
 		AudioFilePath: "/api/songs/track-two.mp3",
 	})
 	if err != nil {
@@ -2281,13 +2288,13 @@ func TestAuthorAutoplayOrdersAndFiltersTracks(t *testing.T) {
 		}
 		return albumItem
 	}
-	createTrack := func(name string, authorIDs []int64, albumItem album, albumOrder int) track {
+	createTrack := func(name string, authorIDs []int64, albumItem album, trackNumber int) track {
 		t.Helper()
 		trackItem, createErr := store.create(upsertTrackRequest{
 			Name:          name,
 			AuthorIDs:     authorIDs,
 			AlbumID:       albumItem.ID,
-			AlbumOrder:    albumOrder,
+			TrackNumber:   trackNumber + 1,
 			AudioFilePath: "/api/songs/" + strings.ToLower(strings.ReplaceAll(name, " ", "-")) + ".mp3",
 		})
 		if createErr != nil {
@@ -2375,7 +2382,7 @@ func TestAuthorAutoplayExcludesMissingLocalAudioFiles(t *testing.T) {
 		Name:          "Available",
 		AuthorIDs:     []int64{authorItem.ID},
 		AlbumID:       albumItem.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "/api/songs/available.mp3",
 	})
 	if err != nil {
@@ -2385,7 +2392,7 @@ func TestAuthorAutoplayExcludesMissingLocalAudioFiles(t *testing.T) {
 		Name:          "Missing",
 		AuthorIDs:     []int64{authorItem.ID},
 		AlbumID:       albumItem.ID,
-		AlbumOrder:    1,
+		TrackNumber:   2,
 		AudioFilePath: "/api/songs/missing.mp3",
 	})
 	if err != nil {
@@ -2502,6 +2509,7 @@ func TestNewTrackStoreNormalizesStoredBareAudioFilePath(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       albumItem.ID,
 		AudioFilePath: "/api/songs/original.mp3",
+		TrackNumber:   1,
 	})
 	if err != nil {
 		t.Fatalf("create() error = %v", err)
@@ -2568,6 +2576,7 @@ func TestNewTrackStorePersistsAndReloadsSQLiteData(t *testing.T) {
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       albumItem.ID,
 		AudioFilePath: "/api/songs/reloaded-track.mp3",
+		TrackNumber:   1,
 	})
 	if err != nil {
 		t.Fatalf("create() error = %v", err)
@@ -2751,11 +2760,11 @@ func TestStoreMutationsReturnPersistenceFailureAfterDatabaseClose(t *testing.T) 
 			t.Fatal(err)
 		}
 		artist, albumItem := seedPlaylistTrackDependencies(t, store)
-		first, err := store.create(upsertTrackRequest{Name: "First", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AudioFilePath: "/api/songs/first.mp3"})
+		first, err := store.create(upsertTrackRequest{Name: "First", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AudioFilePath: "/api/songs/first.mp3", TrackNumber: 1})
 		if err != nil {
 			t.Fatal(err)
 		}
-		second, err := store.create(upsertTrackRequest{Name: "Second", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AudioFilePath: "/api/songs/second.mp3"})
+		second, err := store.create(upsertTrackRequest{Name: "Second", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AudioFilePath: "/api/songs/second.mp3", TrackNumber: 2})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2878,7 +2887,7 @@ func TestAutoplayReportsUnexpectedLocalSongStatFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	artist, albumItem := seedPlaylistTrackDependencies(t, store)
-	trackItem, err := store.create(upsertTrackRequest{Name: "Track", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AudioFilePath: "/api/songs/track.mp3"})
+	trackItem, err := store.create(upsertTrackRequest{Name: "Track", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID, AudioFilePath: "/api/songs/track.mp3", TrackNumber: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

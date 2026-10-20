@@ -14,7 +14,7 @@ import (
 
 const catalogSubmissionEntityAlbumTrackOrder = "album_track_order"
 
-var errAlbumOrderProposalExists = fmt.Errorf("%w: an active order proposal already exists for this requester and album", errCatalogSubmissionState)
+var errTrackNumberProposalExists = fmt.Errorf("%w: an active order proposal already exists for this requester and album", errCatalogSubmissionState)
 
 type createAlbumTrackOrderSubmissionRequest struct {
 	AlbumID int64 `json:"albumId"`
@@ -23,10 +23,10 @@ type createAlbumTrackOrderSubmissionRequest struct {
 }
 
 type updateAlbumTrackOrderSubmissionRequest struct {
-	ExpectedRevision      int64    `json:"expectedRevision"`
-	TrackIDs              *[]int64 `json:"trackIds"`
-	ExpectedOrderRevision *int64   `json:"expectedOrderRevision"`
-	Reason                *string  `json:"reason"`
+	ExpectedRevision      int64                    `json:"expectedRevision"`
+	Tracks                *[]trackNumberAssignment `json:"tracks"`
+	ExpectedOrderRevision *int64                   `json:"expectedOrderRevision"`
+	Reason                *string                  `json:"reason"`
 }
 
 func (r *updateAlbumTrackOrderSubmissionRequest) UnmarshalJSON(raw []byte) error {
@@ -41,7 +41,7 @@ func (r *updateAlbumTrackOrderSubmissionRequest) UnmarshalJSON(raw []byte) error
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return err
 	}
-	for _, key := range []string{"trackIds", "expectedOrderRevision", "reason"} {
+	for _, key := range []string{"tracks", "expectedOrderRevision", "reason"} {
 		if field, supplied := fields[key]; supplied && strings.TrimSpace(string(field)) == "null" {
 			return fmt.Errorf("%s must not be null; omit it to preserve the current value", key)
 		}
@@ -52,25 +52,25 @@ func (r *updateAlbumTrackOrderSubmissionRequest) UnmarshalJSON(raw []byte) error
 
 // The snapshot describes a proposal, never the mutable catalog album itself.
 type albumTrackOrderProposal struct {
-	AlbumID               int64   `json:"albumId"`
-	BaseTrackIDs          []int64 `json:"baseTrackIds"`
-	TrackIDs              []int64 `json:"trackIds"`
-	ExpectedOrderRevision int64   `json:"expectedOrderRevision"`
-	Reason                string  `json:"reason"`
-	AppliedOrderRevision  int64   `json:"appliedOrderRevision,omitempty"`
+	AlbumID               int64                   `json:"albumId"`
+	BaseTracks            []trackNumberAssignment `json:"baseTracks"`
+	Tracks                []trackNumberAssignment `json:"tracks"`
+	ExpectedOrderRevision int64                   `json:"expectedOrderRevision"`
+	Reason                string                  `json:"reason"`
+	AppliedOrderRevision  int64                   `json:"appliedOrderRevision,omitempty"`
 }
 
-type albumOrderTrackSummary struct {
+type trackNumberTrackSummary struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
 }
 
 type albumTrackOrderSubmissionView struct {
 	albumTrackOrderProposal
-	TargetAvailable      bool                     `json:"targetAvailable"`
-	CurrentTrackIDs      []int64                  `json:"currentTrackIds"`
-	CurrentOrderRevision int64                    `json:"currentOrderRevision,omitempty"`
-	Tracks               []albumOrderTrackSummary `json:"tracks"`
+	TargetAvailable      bool                      `json:"targetAvailable"`
+	CurrentTracks        []trackNumberAssignment   `json:"currentTracks"`
+	CurrentOrderRevision int64                     `json:"currentOrderRevision,omitempty"`
+	TrackDetails         []trackNumberTrackSummary `json:"trackDetails"`
 }
 
 // Rebuild the parent table without losing feedback, rating links or claimed MCP
@@ -129,8 +129,8 @@ func decodeAlbumTrackOrderProposal(item catalogSubmission) (albumTrackOrderPropo
 }
 
 func validateAlbumTrackOrderProposal(ctx context.Context, repos domainRepositories, userID int64, req createAlbumTrackOrderSubmissionRequest) (album, error) {
-	if req.AlbumID < 1 || req.TrackIDs == nil || req.ExpectedOrderRevision < 1 {
-		return album{}, fmt.Errorf("%w: albumId, trackIds and positive expectedOrderRevision are required", errInvalidAlbum)
+	if req.AlbumID < 1 || req.Tracks == nil || req.ExpectedOrderRevision < 1 {
+		return album{}, fmt.Errorf("%w: albumId, tracks and positive expectedOrderRevision are required", errInvalidAlbum)
 	}
 	if utf8.RuneCountInString(strings.TrimSpace(req.Reason)) > 1000 {
 		return album{}, fmt.Errorf("%w: reason must be at most 1000 characters", errInvalidAlbum)
@@ -143,10 +143,10 @@ func validateAlbumTrackOrderProposal(ctx context.Context, repos domainRepositori
 		return album{}, errRepositoryNotFound
 	}
 	if normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished {
-		return album{}, errAlbumOrderState
+		return album{}, errTrackNumberState
 	}
 	if item.OrderRevision != req.ExpectedOrderRevision {
-		return album{}, errAlbumOrderStale
+		return album{}, errTrackNumberStale
 	}
 	tracks, err := repos.catalog.ListAlbumTracks(ctx, item.ID)
 	if err != nil {
@@ -155,21 +155,21 @@ func validateAlbumTrackOrderProposal(ctx context.Context, repos domainRepositori
 	memberIDs := make([]int64, 0, len(tracks))
 	for _, track := range tracks {
 		if !catalogEntityVisible(track.PublicationStatus, track.RequestedByUserID, userID) {
-			return album{}, errAlbumOrderHidden
+			return album{}, errTrackNumberHidden
 		}
 		memberIDs = append(memberIDs, track.ID)
 	}
 	if err := validateExactTrackOrder(item.TrackIDs, memberIDs); err != nil {
 		return album{}, fmt.Errorf("%w: current album membership is inconsistent", errInvalidAlbum)
 	}
-	if err := validateExactTrackOrder(req.TrackIDs, item.TrackIDs); err != nil {
+	if err := validateTrackNumbers(req.Tracks, item.TrackIDs); err != nil {
 		return album{}, fmt.Errorf("%w: %v", errInvalidAlbum, err)
 	}
 	return item, nil
 }
 
 func proposalRequest(p albumTrackOrderProposal) createAlbumTrackOrderSubmissionRequest {
-	return createAlbumTrackOrderSubmissionRequest{AlbumID: p.AlbumID, reorderAlbumTracksRequest: reorderAlbumTracksRequest{TrackIDs: p.TrackIDs, ExpectedOrderRevision: p.ExpectedOrderRevision}, Reason: p.Reason}
+	return createAlbumTrackOrderSubmissionRequest{AlbumID: p.AlbumID, reorderAlbumTracksRequest: reorderAlbumTracksRequest{Tracks: p.Tracks, ExpectedOrderRevision: p.ExpectedOrderRevision}, Reason: p.Reason}
 }
 
 func (s *trackStore) createAlbumTrackOrderSubmission(userID int64, req createAlbumTrackOrderSubmissionRequest) (catalogSubmissionResponse, error) {
@@ -193,10 +193,14 @@ func (s *trackStore) createAlbumTrackOrderSubmission(userID int64, req createAlb
 		}
 		for _, sub := range owned {
 			if sub.EntityType == catalogSubmissionEntityAlbumTrackOrder && sub.EntityID == item.ID && (sub.Status == catalogSubmissionStatusPendingReview || sub.Status == catalogSubmissionStatusChangesRequested) {
-				return errAlbumOrderProposalExists
+				return errTrackNumberProposalExists
 			}
 		}
-		proposal := albumTrackOrderProposal{AlbumID: item.ID, BaseTrackIDs: append([]int64{}, item.TrackIDs...), TrackIDs: append([]int64{}, req.TrackIDs...), ExpectedOrderRevision: item.OrderRevision, Reason: strings.TrimSpace(req.Reason)}
+		base, err := repos.catalog.ListAlbumTracks(ctx, item.ID)
+		if err != nil {
+			return err
+		}
+		proposal := albumTrackOrderProposal{AlbumID: item.ID, BaseTracks: assignmentsForTracks(base), Tracks: append([]trackNumberAssignment{}, req.Tracks...), ExpectedOrderRevision: item.OrderRevision, Reason: strings.TrimSpace(req.Reason)}
 		sub, err := newCatalogSubmission(catalogSubmissionEntityAlbumTrackOrder, item.ID, userID, proposal, time.Now().UTC())
 		if err != nil {
 			return err
@@ -247,15 +251,15 @@ func (s *trackStore) updateAlbumTrackOrderSubmission(userID, submissionID int64,
 		if err := validateSubmissionEditable(sub); err != nil {
 			return err
 		}
-		if req.TrackIDs == nil && req.ExpectedOrderRevision == nil && req.Reason == nil {
+		if req.Tracks == nil && req.ExpectedOrderRevision == nil && req.Reason == nil {
 			return fmt.Errorf("%w: at least one proposal field is required", errInvalidAlbum)
 		}
 		proposal, err := decodeAlbumTrackOrderProposal(sub)
 		if err != nil {
 			return err
 		}
-		if req.TrackIDs != nil {
-			proposal.TrackIDs = *req.TrackIDs
+		if req.Tracks != nil {
+			proposal.Tracks = *req.Tracks
 		}
 		if req.ExpectedOrderRevision != nil {
 			proposal.ExpectedOrderRevision = *req.ExpectedOrderRevision
@@ -267,7 +271,11 @@ func (s *trackStore) updateAlbumTrackOrderSubmission(userID, submissionID int64,
 		if err != nil {
 			return err
 		}
-		proposal.BaseTrackIDs = append([]int64{}, item.TrackIDs...)
+		base, err := repos.catalog.ListAlbumTracks(ctx, item.ID)
+		if err != nil {
+			return err
+		}
+		proposal.BaseTracks = assignmentsForTracks(base)
 		if err := updateSubmissionSnapshot(ctx, repos, &sub, proposal, &result); err != nil {
 			return err
 		}
@@ -279,7 +287,7 @@ func (s *trackStore) updateAlbumTrackOrderSubmission(userID, submissionID int64,
 
 func albumTrackOrderProposalView(ctx context.Context, repos domainRepositories, sub catalogSubmission) (albumTrackOrderSubmissionView, error) {
 	proposal, err := decodeAlbumTrackOrderProposal(sub)
-	view := albumTrackOrderSubmissionView{albumTrackOrderProposal: proposal, CurrentTrackIDs: []int64{}, Tracks: []albumOrderTrackSummary{}}
+	view := albumTrackOrderSubmissionView{albumTrackOrderProposal: proposal, CurrentTracks: []trackNumberAssignment{}, TrackDetails: []trackNumberTrackSummary{}}
 	if err != nil {
 		return view, err
 	}
@@ -304,8 +312,8 @@ func albumTrackOrderProposalView(ctx context.Context, repos domainRepositories, 
 	}
 	for _, id := range item.TrackIDs {
 		if t, ok := visible[id]; ok {
-			view.CurrentTrackIDs = append(view.CurrentTrackIDs, id)
-			view.Tracks = append(view.Tracks, albumOrderTrackSummary{ID: id, Name: t.Name})
+			view.CurrentTracks = append(view.CurrentTracks, trackNumberAssignment{TrackID: id, TrackNumber: t.TrackNumber})
+			view.TrackDetails = append(view.TrackDetails, trackNumberTrackSummary{ID: id, Name: t.Name})
 		}
 	}
 	return view, nil
@@ -320,8 +328,11 @@ func applyAlbumTrackOrderProposal(ctx context.Context, repos domainRepositories,
 	if err != nil {
 		return proposal, err
 	}
-	item.TrackIDs = append([]int64{}, proposal.TrackIDs...)
-	if err := repos.catalog.UpdateAlbum(ctx, &item); err != nil {
+	if err := repos.catalog.SetAlbumTrackNumbers(ctx, item.ID, proposal.Tracks); err != nil {
+		return proposal, err
+	}
+	item, _, err = repos.catalog.FindAlbumByID(ctx, item.ID)
+	if err != nil {
 		return proposal, err
 	}
 	proposal.AppliedOrderRevision = item.OrderRevision
@@ -377,7 +388,7 @@ func albumTrackOrderDependenciesReady(ctx context.Context, repos domainRepositor
 	}
 	_, err = validateAlbumTrackOrderProposal(ctx, repos, sub.RequesterUserID, proposalRequest(proposal))
 	if err != nil {
-		if errors.Is(err, errAlbumOrderStale) || errors.Is(err, errAlbumOrderState) || errors.Is(err, errAlbumOrderHidden) || errors.Is(err, errInvalidAlbum) || errors.Is(err, errRepositoryNotFound) {
+		if errors.Is(err, errTrackNumberStale) || errors.Is(err, errTrackNumberState) || errors.Is(err, errTrackNumberHidden) || errors.Is(err, errInvalidAlbum) || errors.Is(err, errRepositoryNotFound) {
 			return fmt.Errorf("%w: refresh the album order proposal: %w", errCatalogSubmissionDependency, err)
 		}
 	}

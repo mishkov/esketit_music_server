@@ -224,7 +224,7 @@ func seedLyricsTrack(t *testing.T, store *trackStore) track {
 		Name:          "Lyrics Track",
 		AuthorIDs:     []int64{artist.ID},
 		AlbumID:       album.ID,
-		AlbumOrder:    0,
+		TrackNumber:   1,
 		AudioFilePath: "/api/songs/lyrics-track.mp3",
 	})
 	if err != nil {

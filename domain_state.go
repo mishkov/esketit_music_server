@@ -281,18 +281,12 @@ func (s *trackStore) get(id int64) (track, bool, error) {
 
 func (s *trackStore) createAlbum(req upsertAlbumRequest) (result album, returnErr error) {
 	returnErr = s.withinStateTransaction(stateCatalog, func(state *domainState) error {
-		for _, trackID := range normalizeTrackIDs(req.TrackIDs) {
-			if item, ok := state.tracks[trackID]; ok && normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished {
-				return fmt.Errorf("%w: pending tracks must be managed through catalog submissions", errCatalogSubmissionState)
-			}
-		}
 		var err error
 		result, err = state.createAlbum(req)
 		return err
 	})
 	return
 }
-
 func (s *trackStore) updateAlbum(id int64, req upsertAlbumRequest) (result album, found bool, returnErr error) {
 	returnErr = s.withinStateTransaction(stateCatalog, func(state *domainState) error {
 		current, exists := state.albums[id]
@@ -300,20 +294,8 @@ func (s *trackStore) updateAlbum(id int64, req upsertAlbumRequest) (result album
 			return nil
 		}
 		if normalizePublicationStatus(current.PublicationStatus) != catalogPublicationPublished {
-			return fmt.Errorf("%w: pending albums must be managed through catalog submissions", errCatalogSubmissionState)
+			return errCatalogSubmissionState
 		}
-		requestedTrackIDs := normalizeTrackIDs(req.TrackIDs)
-		for _, trackID := range requestedTrackIDs {
-			if item, ok := state.tracks[trackID]; ok && normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished && !containsInt64(current.TrackIDs, trackID) {
-				return fmt.Errorf("%w: pending tracks must be managed through catalog submissions", errCatalogSubmissionState)
-			}
-		}
-		for _, trackID := range current.TrackIDs {
-			if item, ok := state.tracks[trackID]; ok && normalizePublicationStatus(item.PublicationStatus) != catalogPublicationPublished && !containsInt64(requestedTrackIDs, trackID) {
-				requestedTrackIDs = append(requestedTrackIDs, trackID)
-			}
-		}
-		req.TrackIDs = requestedTrackIDs
 		var err error
 		result, found, err = state.updateAlbum(id, req)
 		return err
@@ -1113,32 +1095,6 @@ func (s *trackStore) getTrack(trackID int64) (track, bool, error) {
 		return track{}, false, fmt.Errorf("get import track: %w", err)
 	}
 	return cloneTrack(item), ok, nil
-}
-
-func (s *trackStore) getTrackAlbumOrder(trackID int64) (int, bool, error) {
-	var order int
-	var found bool
-	err := s.withinReadTransaction(func(ctx context.Context, repositories domainRepositories) error {
-		item, ok, err := repositories.catalog.FindTrackByID(ctx, trackID)
-		if err != nil || !ok {
-			return err
-		}
-		albumItem, ok, err := repositories.catalog.FindAlbumByID(ctx, item.AlbumID)
-		if err != nil || !ok {
-			return err
-		}
-		for index, existingTrackID := range albumItem.TrackIDs {
-			if existingTrackID == trackID {
-				order, found = index, true
-				break
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return 0, false, fmt.Errorf("get track album order: %w", err)
-	}
-	return order, found, nil
 }
 
 func (s *trackStore) findTrackBySourceMetadata(target sourceMetadata) (track, bool, error) {

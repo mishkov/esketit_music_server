@@ -809,7 +809,7 @@ paths:
         Requires authentication and `albums.reorder_tracks` (granted to administrators
         by default). Only albums with `publicationStatus: published` are eligible;
         the separate `isPublished` flag does not control approval.
-        Supply every current track exactly once. Duplicate, missing, additional,
+        Supply every current track exactly once with a distinct positive trackNumber; gaps are allowed. Duplicate, missing, additional,
         unknown, or foreign-album IDs are rejected without normalization. This
         operation changes order only and cannot add, remove, move, or repair tracks.
         Validation, permission and revision checks, and persistence are transactional.
@@ -819,7 +819,7 @@ paths:
         reordering a filtered subset. Pending albums cannot be repaired here.
         An identical order with the current revision succeeds without advancing it.
         Ordering revisions are independent of submission revisions and advance on
-        all membership or order changes, including legacy mutations and cancellations.
+        all membership or order changes, including number changes and cancellations.
       security:
         - bearerAuth: []
       parameters:
@@ -837,7 +837,7 @@ paths:
             schema:
               $ref: '#/components/schemas/ReorderAlbumTracksRequest'
             example:
-              trackIds: [103, 101, 102]
+              tracks: [{trackId: 103, trackNumber: 1}, {trackId: 101, trackNumber: 4}, {trackId: 102, trackNumber: 10}]
               expectedOrderRevision: 4
       responses:
         '200':
@@ -848,7 +848,7 @@ paths:
                 $ref: '#/components/schemas/AlbumTrackOrder'
               example:
                 albumId: 42
-                trackIds: [103, 101, 102]
+                tracks: [{trackId: 103, trackNumber: 1}, {trackId: 101, trackNumber: 4}, {trackId: 102, trackNumber: 10}]
                 orderRevision: 5
         '400':
           $ref: '#/components/responses/BadRequest'
@@ -2485,7 +2485,7 @@ paths:
         Requires catalog_submissions.update_own. The path id is a submission ID.
         expectedRevision must match the submission revision. Omitted proposal fields
         are preserved; an empty reason clears it. Refresh expectedOrderRevision and
-        trackIds against the album when the proposal is stale. At least one proposal
+        number assignments against the album when the proposal is stale. At least one proposal
         field must be supplied. Editing leaves changes_requested status unchanged;
         use the existing resubmit endpoint to return it to review. No catalog change occurs.
       security:
@@ -2522,7 +2522,7 @@ paths:
     post:
       tags: [Catalog Submissions]
       summary: Submit a new album
-      description: Requires `albums.submit`. `trackIds` must be empty; `authorIds` may reference published authors or the requester's pending authors. Images are optional and must be uploaded as multipart files (`photos` for authors, `cover` for albums), with a `metadata` JSON form field. Image URLs and paths are rejected. JPEG, PNG, and GIF files are supported, with a 10 MiB limit per file, 32 MiB per request, and maximum dimensions of 4096 by 4096 pixels. Uploaded images are re-encoded; GIFs become static PNGs. JSON requests support metadata only.
+      description: Requires `albums.submit`. `authorIds` may reference published authors or the requester's pending authors. Images are optional and must be uploaded as multipart files (`photos` for authors, `cover` for albums), with a `metadata` JSON form field. Image URLs and paths are rejected. JPEG, PNG, and GIF files are supported, with a 10 MiB limit per file, 32 MiB per request, and maximum dimensions of 4096 by 4096 pixels. Uploaded images are re-encoded; GIFs become static PNGs. JSON requests support metadata only.
       security:
         - bearerAuth: []
       requestBody:
@@ -3625,20 +3625,17 @@ components:
     CreateAlbumTrackOrderSubmissionRequest:
       type: object
       additionalProperties: false
-      required: [albumId, trackIds, expectedOrderRevision]
+      required: [albumId, tracks, expectedOrderRevision]
       properties:
         albumId:
           type: integer
           format: int64
           minimum: 1
-        trackIds:
+        tracks:
           type: array
-          uniqueItems: true
-          description: Every current album track exactly once, in proposed order.
+          description: Assign a unique positive number to every current album track exactly once. Gaps are allowed.
           items:
-            type: integer
-            format: int64
-            minimum: 1
+            $ref: '#/components/schemas/TrackNumberAssignment'
         expectedOrderRevision:
           type: integer
           format: int64
@@ -3658,13 +3655,11 @@ components:
           type: integer
           format: int64
           minimum: 1
-        trackIds:
+        tracks:
           type: array
-          uniqueItems: true
+          description: Assign a unique positive number to every current album track exactly once. Gaps are allowed.
           items:
-            type: integer
-            format: int64
-            minimum: 1
+            $ref: '#/components/schemas/TrackNumberAssignment'
         expectedOrderRevision:
           type: integer
           format: int64
@@ -3729,9 +3724,9 @@ components:
           additionalProperties: true
           description: |
             Current author, album, or track; falls back to the snapshot after removal.
-            For album_track_order, returns albumId, baseTrackIds, proposed trackIds,
+            For album_track_order, returns albumId, baseTracks, proposed tracks,
             expectedOrderRevision, reason, optional appliedOrderRevision, targetAvailable,
-            currentTrackIds, currentOrderRevision, and visible track summaries (id/name).
+            currentTracks, currentOrderRevision, and trackDetails summaries (id/name).
             The snapshot retains proposal data independently of current album data;
             entityId is the target album ID and submission id identifies each proposal.
         feedback:
@@ -3809,9 +3804,10 @@ components:
           type: integer
           format: int64
           minimum: 1
-        albumOrder:
+        trackNumber:
           type: integer
-          minimum: 0
+          minimum: 1
+          description: Required one-based album number. Gaps are allowed; occupied numbers are rejected without shifting other tracks.
         audioUploadToken:
           type: string
           minLength: 1
@@ -3823,7 +3819,7 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SourceMetadata'
-      required: [name, authorIds, albumId, audioUploadToken, additionalInfo, sourceMetadata]
+      required: [name, authorIds, albumId, trackNumber, audioUploadToken, additionalInfo, sourceMetadata]
 
     UpdateTrackSubmissionRequest:
       type: object
@@ -3842,9 +3838,10 @@ components:
           type: integer
           format: int64
           minimum: 1
-        albumOrder:
+        trackNumber:
           type: integer
-          minimum: 0
+          minimum: 1
+          description: Required one-based album number. Gaps are allowed; occupied numbers are rejected without shifting other tracks.
         audioUploadToken:
           type: string
           description: Optional replacement upload token; omit to retain the existing staged audio.
@@ -3856,7 +3853,7 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SourceMetadata'
-      required: [name, authorIds, albumId, additionalInfo, sourceMetadata]
+      required: [name, authorIds, albumId, trackNumber, additionalInfo, sourceMetadata]
 
     CatalogReviewDecisionRequest:
       type: object
@@ -4177,23 +4174,33 @@ components:
           nullable: true
       required: [id, title, coverImagePath, authorIds, releaseDate, isPublished, trackIds, orderRevision, additionalInfo, publicationStatus]
 
+    TrackNumberAssignment:
+      type: object
+      additionalProperties: false
+      properties:
+        trackId:
+          type: integer
+          format: int64
+          minimum: 1
+        trackNumber:
+          type: integer
+          minimum: 1
+      required: [trackId, trackNumber]
+
     ReorderAlbumTracksRequest:
       type: object
       additionalProperties: false
       properties:
-        trackIds:
+        tracks:
           type: array
-          uniqueItems: true
-          description: Every current album track ID exactly once, including owned pending tracks.
+          description: Assign a unique positive number to every current album track exactly once. Gaps are allowed.
           items:
-            type: integer
-            format: int64
-            minimum: 1
+            $ref: '#/components/schemas/TrackNumberAssignment'
         expectedOrderRevision:
           type: integer
           format: int64
           minimum: 1
-      required: [trackIds, expectedOrderRevision]
+      required: [tracks, expectedOrderRevision]
 
     AlbumTrackOrder:
       type: object
@@ -4201,17 +4208,16 @@ components:
         albumId:
           type: integer
           format: int64
-        trackIds:
+        tracks:
           type: array
+          description: Assign a unique positive number to every current album track exactly once. Gaps are allowed.
           items:
-            type: integer
-            format: int64
-            minimum: 1
+            $ref: '#/components/schemas/TrackNumberAssignment'
         orderRevision:
           type: integer
           format: int64
           minimum: 1
-      required: [albumId, trackIds, orderRevision]
+      required: [albumId, tracks, orderRevision]
 
     UpsertAlbumRequest:
       type: object
@@ -4232,24 +4238,17 @@ components:
             type: integer
             format: int64
             minimum: 1
-          description: Ignored on write; server recalculates this field from album tracks.
+          description: Used for empty albums; server derives authors from tracks for nonempty albums.
         releaseDate:
           type: string
           format: date-time
         isPublished:
           type: boolean
-        trackIds:
-          type: array
-          items:
-            type: integer
-            format: int64
-            minimum: 1
-          description: May be empty when creating or updating an album.
         additionalInfo:
           type: array
           items:
             $ref: '#/components/schemas/AdditionalInfo'
-      required: [title, releaseDate, isPublished, trackIds, additionalInfo]
+      required: [title, releaseDate, isPublished, additionalInfo]
 
     Track:
       type: object
@@ -4276,6 +4275,11 @@ components:
           type: integer
           format: int64
           minimum: 1
+        trackNumber:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: Persisted one-based album track number; gaps are retained. Null only for unavailable historic playlist entries whose number is unknown.
         coverImagePath:
           type: string
           description: |
@@ -4309,7 +4313,7 @@ components:
           format: int64
           minimum: 1
           nullable: true
-      required: [id, name, authorIds, albumId, audioFilePath, additionalInfo, sourceMetadata, createdAt, isFavorite, isDisliked, isAvailable, publicationStatus]
+      required: [id, name, authorIds, albumId, trackNumber, audioFilePath, additionalInfo, sourceMetadata, createdAt, isFavorite, isDisliked, isAvailable, publicationStatus]
 
     UpsertTrackRequest:
       type: object
@@ -4328,9 +4332,10 @@ components:
           type: integer
           format: int64
           minimum: 1
-        albumOrder:
+        trackNumber:
           type: integer
-          minimum: 0
+          minimum: 1
+          description: Required one-based album number. Gaps are allowed; occupied numbers are rejected without shifting other tracks.
         audioFilePath:
           type: string
           description: |
@@ -4348,7 +4353,7 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SourceMetadata'
-      required: [name, authorIds, albumId, albumOrder, audioFilePath, additionalInfo, sourceMetadata]
+      required: [name, authorIds, albumId, trackNumber, audioFilePath, additionalInfo, sourceMetadata]
 
     LyricsType:
       type: string
@@ -5323,9 +5328,10 @@ components:
           type: integer
           format: int64
           minimum: 1
-        albumOrder:
+        trackNumber:
           type: integer
-          minimum: 0
+          minimum: 1
+          description: Required one-based album number. Gaps are allowed; occupied numbers are rejected without shifting other tracks.
       required: [mode]
 
     YouTubeImportAddResponse:

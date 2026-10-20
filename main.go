@@ -145,7 +145,6 @@ type upsertAlbumRequest struct {
 	AuthorIDs      []int64          `json:"authorIds"`
 	ReleaseDate    time.Time        `json:"releaseDate"`
 	IsPublished    bool             `json:"isPublished"`
-	TrackIDs       []int64          `json:"trackIds"`
 	AdditionalInfo []additionalInfo `json:"additionalInfo"`
 }
 
@@ -154,6 +153,7 @@ type track struct {
 	Name              string           `json:"name"`
 	AuthorIDs         []int64          `json:"authorIds"`
 	AlbumID           int64            `json:"albumId"`
+	TrackNumber       int              `json:"trackNumber"`
 	AudioFilePath     string           `json:"audioFilePath"`
 	AdditionalInfo    []additionalInfo `json:"additionalInfo"`
 	SourceMetadata    []sourceMetadata `json:"sourceMetadata"`
@@ -206,7 +206,7 @@ type upsertTrackRequest struct {
 	Name           string           `json:"name"`
 	AuthorIDs      []int64          `json:"authorIds"`
 	AlbumID        int64            `json:"albumId"`
-	AlbumOrder     int              `json:"albumOrder"`
+	TrackNumber    int              `json:"trackNumber"`
 	AudioFilePath  string           `json:"audioFilePath"`
 	AdditionalInfo []additionalInfo `json:"additionalInfo"`
 	SourceMetadata []sourceMetadata `json:"sourceMetadata"`
@@ -353,6 +353,7 @@ type trackResponse struct {
 	AuthorIDs         []int64          `json:"authorIds"`
 	Authors           []author         `json:"authors,omitempty"`
 	AlbumID           int64            `json:"albumId"`
+	TrackNumber       *int             `json:"trackNumber"`
 	CoverImagePath    string           `json:"coverImagePath,omitempty"`
 	AudioFilePath     string           `json:"audioFilePath"`
 	AdditionalInfo    []additionalInfo `json:"additionalInfo"`
@@ -1462,106 +1463,39 @@ func (s *domainState) createAlbum(req upsertAlbumRequest) (album, error) {
 		return album{}, err
 	}
 	a := album{
-		ID:                id,
-		Title:             strings.TrimSpace(req.Title),
-		CoverImagePath:    strings.TrimSpace(req.CoverImagePath),
-		ReleaseDate:       req.ReleaseDate.UTC(),
-		IsPublished:       req.IsPublished,
-		TrackIDs:          normalizeTrackIDs(req.TrackIDs),
-		AdditionalInfo:    normalizeAdditionalInfo(req.AdditionalInfo),
-		PublicationStatus: catalogPublicationPublished,
-		OrderRevision:     1,
+		ID: id, Title: strings.TrimSpace(req.Title), CoverImagePath: strings.TrimSpace(req.CoverImagePath),
+		ReleaseDate: req.ReleaseDate.UTC(), IsPublished: req.IsPublished, TrackIDs: []int64{},
+		AdditionalInfo: normalizeAdditionalInfo(req.AdditionalInfo), PublicationStatus: catalogPublicationPublished, OrderRevision: 1,
 	}
 	if err := s.validateAlbumLocked(a); err != nil {
 		return album{}, err
 	}
-	previousAlbumIDs := make(map[int64]struct{})
-	for _, trackID := range a.TrackIDs {
-		if item, ok := s.tracks[trackID]; ok && item.AlbumID > 0 {
-			previousAlbumIDs[item.AlbumID] = struct{}{}
-		}
-	}
-	s.albums[a.ID] = a
-	if err := s.applyAlbumTrackIDsLocked(a.ID, a.TrackIDs, false); err != nil {
+	if err := s.repositories.catalog.InsertAlbum(s.ctx, a); err != nil {
 		return album{}, err
 	}
-	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
-		return album{}, err
-	}
-	if err := s.repositories.catalog.InsertAlbum(s.ctx, s.albums[a.ID]); err != nil {
-		return album{}, err
-	}
-	for _, trackID := range a.TrackIDs {
-		if err := s.repositories.catalog.UpdateTrack(s.ctx, s.tracks[trackID]); err != nil {
-			return album{}, err
-		}
-	}
-	delete(previousAlbumIDs, a.ID)
-	for previousID := range previousAlbumIDs {
-		if previous, ok := s.albums[previousID]; ok {
-			if err := s.repositories.catalog.UpdateAlbum(s.ctx, &previous); err != nil {
-				return album{}, err
-			}
-		}
-	}
-	return s.albums[a.ID], nil
+	s.albums[id] = a
+	return a, nil
 }
-
 func (s *domainState) updateAlbum(id int64, req upsertAlbumRequest) (album, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	current, ok := s.albums[id]
 	if !ok {
 		return album{}, false, nil
 	}
-	updated := album{
-		ID:                id,
-		Title:             strings.TrimSpace(req.Title),
-		CoverImagePath:    strings.TrimSpace(req.CoverImagePath),
-		ReleaseDate:       req.ReleaseDate.UTC(),
-		IsPublished:       req.IsPublished,
-		TrackIDs:          normalizeTrackIDs(req.TrackIDs),
-		AdditionalInfo:    normalizeAdditionalInfo(req.AdditionalInfo),
-		PublicationStatus: current.PublicationStatus,
-		RequestedByUserID: current.RequestedByUserID,
-		OrderRevision:     current.OrderRevision,
-	}
-	if err := s.validateAlbumLocked(updated); err != nil {
+	current.Title = strings.TrimSpace(req.Title)
+	current.CoverImagePath = strings.TrimSpace(req.CoverImagePath)
+	current.ReleaseDate = req.ReleaseDate.UTC()
+	current.IsPublished = req.IsPublished
+	current.AdditionalInfo = normalizeAdditionalInfo(req.AdditionalInfo)
+	if err := s.validateAlbumLocked(current); err != nil {
 		return album{}, true, err
 	}
-	if removedTrackIDs := subtractTrackIDs(current.TrackIDs, updated.TrackIDs); len(removedTrackIDs) > 0 {
-		return album{}, true, fmt.Errorf("%w: cannot remove tracks from album using album update", errInvalidAlbum)
-	}
-
-	affectedAlbumIDs := map[int64]struct{}{id: {}}
-	movedTrackIDs := make([]int64, 0)
-	for _, trackID := range updated.TrackIDs {
-		if item, ok := s.tracks[trackID]; ok && item.AlbumID != id {
-			movedTrackIDs = append(movedTrackIDs, trackID)
-			if item.AlbumID > 0 {
-				affectedAlbumIDs[item.AlbumID] = struct{}{}
-			}
-		}
-	}
-	s.albums[id] = updated
-	if err := s.applyAlbumTrackIDsLocked(id, updated.TrackIDs, false); err != nil {
+	if err := s.repositories.catalog.UpdateAlbum(s.ctx, &current); err != nil {
 		return album{}, true, err
 	}
-	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
-		return album{}, true, err
-	}
-	for _, trackID := range movedTrackIDs {
-		if err := s.repositories.catalog.UpdateTrack(s.ctx, s.tracks[trackID]); err != nil {
-			return album{}, true, err
-		}
-	}
-	for albumID := range affectedAlbumIDs {
-		if err := s.persistAlbumLocked(albumID); err != nil {
-			return album{}, true, err
-		}
-	}
-	return s.albums[id], true, nil
+	s.albums[id] = current
+	return current, true, nil
 }
 
 func (s *domainState) deleteAlbum(id int64) (bool, error) {
@@ -1600,6 +1534,7 @@ func (s *domainState) create(req upsertTrackRequest) (track, error) {
 		Name:              strings.TrimSpace(req.Name),
 		AuthorIDs:         normalizeAuthorIDs(req.AuthorIDs),
 		AlbumID:           req.AlbumID,
+		TrackNumber:       req.TrackNumber,
 		AudioFilePath:     normalizeAudioFilePath(req.AudioFilePath),
 		AdditionalInfo:    normalizeAdditionalInfo(req.AdditionalInfo),
 		SourceMetadata:    normalizeSourceMetadata(req.SourceMetadata),
@@ -1610,15 +1545,7 @@ func (s *domainState) create(req upsertTrackRequest) (track, error) {
 		return track{}, err
 	}
 
-	albumOrder, err := normalizeAlbumOrder(req.AlbumOrder, len(s.albums[req.AlbumID].TrackIDs), true)
-	if err != nil {
-		return track{}, fmt.Errorf("%w: %v", errInvalidTrack, err)
-	}
-
 	s.tracks[t.ID] = t
-	targetAlbum := s.albums[req.AlbumID]
-	insertTrackIntoAlbumLocked(&targetAlbum, t.ID, albumOrder)
-	s.albums[req.AlbumID] = targetAlbum
 	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
 		return track{}, err
 	}
@@ -1648,6 +1575,7 @@ func (s *domainState) update(id int64, req upsertTrackRequest) (track, bool, err
 		Name:              strings.TrimSpace(req.Name),
 		AuthorIDs:         normalizeAuthorIDs(req.AuthorIDs),
 		AlbumID:           req.AlbumID,
+		TrackNumber:       req.TrackNumber,
 		AudioFilePath:     normalizeAudioFilePath(req.AudioFilePath),
 		AdditionalInfo:    normalizeAdditionalInfo(req.AdditionalInfo),
 		SourceMetadata:    normalizeSourceMetadata(req.SourceMetadata),
@@ -1659,23 +1587,7 @@ func (s *domainState) update(id int64, req upsertTrackRequest) (track, bool, err
 		return track{}, true, err
 	}
 
-	currentAlbum := s.albums[current.AlbumID]
-	targetAlbum := s.albums[updated.AlbumID]
-	targetLength := len(targetAlbum.TrackIDs)
-	if current.AlbumID == updated.AlbumID {
-		targetLength--
-	}
-	albumOrder, err := normalizeAlbumOrder(req.AlbumOrder, targetLength, true)
-	if err != nil {
-		return track{}, true, fmt.Errorf("%w: %v", errInvalidTrack, err)
-	}
-
 	s.tracks[id] = updated
-	removeTrackFromAlbumLocked(&currentAlbum, id)
-	s.albums[current.AlbumID] = currentAlbum
-	targetAlbum = s.albums[updated.AlbumID]
-	insertTrackIntoAlbumLocked(&targetAlbum, id, albumOrder)
-	s.albums[updated.AlbumID] = targetAlbum
 	if err := s.rebuildAlbumDerivedDataLocked(); err != nil {
 		return track{}, true, err
 	}
@@ -3444,7 +3356,7 @@ func createAlbumHandler(store *trackStore) http.HandlerFunc {
 
 		a, err := store.createAlbum(req)
 		if err != nil {
-			if errors.Is(err, errCatalogSubmissionState) {
+			if errors.Is(err, errCatalogSubmissionState) || errors.Is(err, errTrackNumberConflict) {
 				http.Error(w, err.Error(), http.StatusConflict)
 				return
 			}
@@ -3527,7 +3439,7 @@ func updateAlbumByRouteHandler(store *trackStore) http.HandlerFunc {
 		}
 		a, exists, err := store.updateAlbum(id, req)
 		if err != nil {
-			if errors.Is(err, errCatalogSubmissionState) {
+			if errors.Is(err, errCatalogSubmissionState) || errors.Is(err, errTrackNumberConflict) {
 				http.Error(w, err.Error(), http.StatusConflict)
 				return
 			}
@@ -3981,7 +3893,7 @@ func createTrackHandler(store *trackStore) http.HandlerFunc {
 
 		t, err := store.create(req)
 		if err != nil {
-			if errors.Is(err, errCatalogSubmissionState) {
+			if errors.Is(err, errCatalogSubmissionState) || errors.Is(err, errTrackNumberConflict) {
 				http.Error(w, err.Error(), http.StatusConflict)
 				return
 			}
@@ -4047,7 +3959,7 @@ func updateTrackHandler(store *trackStore) http.HandlerFunc {
 
 		t, exists, err := store.update(id, req)
 		if err != nil {
-			if errors.Is(err, errCatalogSubmissionState) {
+			if errors.Is(err, errCatalogSubmissionState) || errors.Is(err, errTrackNumberConflict) {
 				http.Error(w, err.Error(), http.StatusConflict)
 				return
 			}
@@ -4081,7 +3993,7 @@ func deleteTrackHandler(store *trackStore) http.HandlerFunc {
 
 		deleted, err := store.delete(id)
 		if err != nil {
-			if errors.Is(err, errCatalogSubmissionState) {
+			if errors.Is(err, errCatalogSubmissionState) || errors.Is(err, errTrackNumberConflict) {
 				http.Error(w, err.Error(), http.StatusConflict)
 				return
 			}
@@ -4448,7 +4360,7 @@ func updateAuthorHandler(store *trackStore) http.HandlerFunc {
 
 		a, exists, err := store.updateAuthor(id, req)
 		if err != nil {
-			if errors.Is(err, errCatalogSubmissionState) {
+			if errors.Is(err, errCatalogSubmissionState) || errors.Is(err, errTrackNumberConflict) {
 				http.Error(w, err.Error(), http.StatusConflict)
 				return
 			}
@@ -5644,11 +5556,18 @@ func playlistKindSortRank(kind string) int {
 }
 
 func (s *domainState) validateTrackLocked(t track) error {
+	for _, other := range s.tracks {
+		if other.ID != t.ID && other.AlbumID == t.AlbumID && other.TrackNumber == t.TrackNumber {
+			return errTrackNumberConflict
+		}
+	}
 	switch {
 	case t.Name == "":
 		return fmt.Errorf("%w: name is required", errInvalidTrack)
 	case len(t.AuthorIDs) == 0:
 		return fmt.Errorf("%w: at least one authorId is required", errInvalidTrack)
+	case t.TrackNumber <= 0:
+		return fmt.Errorf("%w: trackNumber is required and must be positive", errInvalidTrack)
 	case t.AlbumID <= 0:
 		return fmt.Errorf("%w: albumId is required", errInvalidTrack)
 	case t.AudioFilePath == "":
@@ -6068,61 +5987,27 @@ func (s *domainState) markTrackUnavailableLocked(t track) {
 }
 
 func (s *domainState) rebuildAlbumDerivedDataLocked() error {
-	for albumID, albumItem := range s.albums {
-		normalizedTrackIDs := make([]int64, 0, len(albumItem.TrackIDs))
-		authorSet := make(map[int64]struct{})
-		for _, trackID := range normalizeTrackIDs(albumItem.TrackIDs) {
-			t, ok := s.tracks[trackID]
-			if !ok {
-				return fmt.Errorf("%w: trackId %d does not exist", errInvalidAlbum, trackID)
-			}
-			if t.AlbumID != albumID {
-				return fmt.Errorf("%w: trackId %d does not belong to albumId %d", errInvalidAlbum, trackID, albumID)
-			}
-			normalizedTrackIDs = append(normalizedTrackIDs, trackID)
-			for _, authorID := range t.AuthorIDs {
-				authorSet[authorID] = struct{}{}
+	for albumID, item := range s.albums {
+		members := []track{}
+		authors := map[int64]struct{}{}
+		for _, t := range s.tracks {
+			if t.AlbumID == albumID {
+				members = append(members, t)
+				for _, id := range t.AuthorIDs {
+					authors[id] = struct{}{}
+				}
 			}
 		}
-
-		albumItem.TrackIDs = normalizedTrackIDs
-		albumItem.AuthorIDs = setToSortedIDs(authorSet)
-		if err := s.validateAlbumLocked(albumItem); err != nil {
-			return err
+		sort.Slice(members, func(i, j int) bool { return members[i].TrackNumber < members[j].TrackNumber })
+		item.TrackIDs = []int64{}
+		for _, t := range members {
+			item.TrackIDs = append(item.TrackIDs, t.ID)
 		}
-		s.albums[albumID] = albumItem
-	}
-	return nil
-}
-
-func (s *domainState) applyAlbumTrackIDsLocked(albumID int64, trackIDs []int64, allowRemoval bool) error {
-	albumItem, ok := s.albums[albumID]
-	if !ok {
-		return fmt.Errorf("%w: albumId %d does not exist", errInvalidAlbum, albumID)
-	}
-
-	if !allowRemoval {
-		for _, existingTrackID := range albumItem.TrackIDs {
-			if !containsInt64(trackIDs, existingTrackID) {
-				return fmt.Errorf("%w: cannot remove tracks from album using album update", errInvalidAlbum)
-			}
+		if len(members) > 0 {
+			item.AuthorIDs = setToSortedIDs(authors)
 		}
+		s.albums[albumID] = item
 	}
-
-	for _, trackID := range trackIDs {
-		t, ok := s.tracks[trackID]
-		if !ok {
-			return fmt.Errorf("%w: trackId %d does not exist", errInvalidAlbum, trackID)
-		}
-		if t.AlbumID > 0 && t.AlbumID != albumID {
-			s.removeTrackFromAlbumLocked(t.AlbumID, trackID)
-		}
-		t.AlbumID = albumID
-		s.tracks[trackID] = t
-	}
-
-	albumItem.TrackIDs = normalizeTrackIDs(trackIDs)
-	s.albums[albumID] = albumItem
 	return nil
 }
 
@@ -6146,24 +6031,6 @@ func removeTrackFromAlbumLocked(albumItem *album, trackID int64) {
 	albumItem.TrackIDs = filtered
 }
 
-func insertTrackIntoAlbumLocked(albumItem *album, trackID int64, index int) {
-	filtered := make([]int64, 0, len(albumItem.TrackIDs)+1)
-	for _, existingID := range albumItem.TrackIDs {
-		if existingID == trackID {
-			continue
-		}
-		filtered = append(filtered, existingID)
-	}
-	if index < 0 {
-		index = 0
-	}
-	if index > len(filtered) {
-		index = len(filtered)
-	}
-	filtered = append(filtered[:index], append([]int64{trackID}, filtered[index:]...)...)
-	albumItem.TrackIDs = filtered
-}
-
 func setToSortedIDs(items map[int64]struct{}) []int64 {
 	ids := make([]int64, 0, len(items))
 	for id := range items {
@@ -6182,20 +6049,6 @@ func containsInt64(items []int64, target int64) bool {
 		}
 	}
 	return false
-}
-
-func normalizeAlbumOrder(order, maxIndex int, allowAppend bool) (int, error) {
-	if order < 0 {
-		return 0, errors.New("albumOrder must be greater than or equal to 0")
-	}
-	limit := maxIndex
-	if allowAppend {
-		limit = maxIndex
-	}
-	if order > limit {
-		return 0, fmt.Errorf("albumOrder must be less than or equal to %d", limit)
-	}
-	return order, nil
 }
 
 func parsePlaylistListFilter(values url.Values) (playlistListFilter, error) {
@@ -6382,22 +6235,13 @@ func reorderPlaylistTrackItems(items []playlistTrack, trackIDs []int64) []playli
 	return reordered
 }
 
-func subtractTrackIDs(left, right []int64) []int64 {
-	missing := make([]int64, 0)
-	for _, id := range left {
-		if !containsInt64(right, id) {
-			missing = append(missing, id)
-		}
-	}
-	return missing
-}
-
 func toTrackResponse(t track, isFavorite, isAvailable bool) trackResponse {
 	return trackResponse{
 		ID:                t.ID,
 		Name:              t.Name,
 		AuthorIDs:         append([]int64(nil), t.AuthorIDs...),
 		AlbumID:           t.AlbumID,
+		TrackNumber:       knownTrackNumber(t.TrackNumber),
 		AudioFilePath:     normalizeAudioFilePath(t.AudioFilePath),
 		AdditionalInfo:    normalizeAdditionalInfo(t.AdditionalInfo),
 		SourceMetadata:    normalizeSourceMetadata(t.SourceMetadata),

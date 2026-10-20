@@ -27,8 +27,9 @@ func defaultSchemaMigrations() []schemaMigration {
 		{version: 7, name: "catalog submission approval workflow", apply: migrateCatalogSubmissionWorkflow},
 		{version: 8, name: "retain rejected catalog dependencies", apply: migrateRejectedCatalogDependencies},
 		{version: 9, name: "MCP submission integration", apply: migrateMCP},
-		{version: 10, name: "album ordering revisions and permission", apply: migrateAlbumOrder},
+		{version: 10, name: "album ordering revisions and permission", apply: migrateTrackNumber},
 		{version: 11, name: "reviewed album track order proposals", apply: migrateAlbumTrackOrderSubmissions},
+		{version: 12, name: "persistent album track numbers", apply: migratePersistentTrackNumbers},
 	}
 }
 
@@ -677,8 +678,8 @@ func validateSQLiteRelationships(ctx context.Context, tx *sql.Tx) error {
 		query  string
 	}{
 		{"authors", `SELECT id FROM authors WHERE id <= 0 OR TRIM(current_name) = '' OR json_valid(photos_json) = 0 OR (publication_status = 'published') != (requested_by_user_id IS NULL) ORDER BY id LIMIT 1`},
-		{"albums", `SELECT id FROM albums WHERE id <= 0 OR TRIM(title) = '' OR TRIM(release_date) = '' OR json_valid(author_ids_json) = 0 OR json_valid(track_ids_json) = 0 OR json_valid(additional_info_json) = 0 OR (publication_status = 'published') != (requested_by_user_id IS NULL) ORDER BY id LIMIT 1`},
-		{"tracks", `SELECT id FROM tracks WHERE id <= 0 OR TRIM(name) = '' OR TRIM(audio_file_path) = '' OR TRIM(created_at) = '' OR json_valid(author_ids_json) = 0 OR json_valid(additional_info_json) = 0 OR json_valid(source_metadata_json) = 0 OR (publication_status = 'published') != (requested_by_user_id IS NULL) ORDER BY id LIMIT 1`},
+		{"albums", `SELECT id FROM albums WHERE id <= 0 OR TRIM(title) = '' OR TRIM(release_date) = '' OR json_valid(author_ids_json) = 0 OR json_valid(additional_info_json) = 0 OR (publication_status = 'published') != (requested_by_user_id IS NULL) ORDER BY id LIMIT 1`},
+		{"tracks", `SELECT id FROM tracks WHERE id <= 0 OR TRIM(name) = '' OR TRIM(audio_file_path) = '' OR TRIM(created_at) = '' OR json_valid(author_ids_json) = 0 OR json_valid(additional_info_json) = 0 OR json_valid(source_metadata_json) = 0 OR track_number <= 0 OR (publication_status = 'published') != (requested_by_user_id IS NULL) ORDER BY id LIMIT 1`},
 		{"users", `SELECT id FROM users WHERE id <= 0 OR TRIM(email) = '' OR TRIM(password_hash) = '' OR TRIM(created_at) = '' ORDER BY id LIMIT 1`},
 		{"roles", `SELECT id FROM roles WHERE id <= 0 OR TRIM(name) = '' OR system NOT IN (0, 1) OR TRIM(created_at) = '' ORDER BY id LIMIT 1`},
 		{"permissions", `SELECT id FROM permissions WHERE id <= 0 OR TRIM(code) = '' OR TRIM(created_at) = '' ORDER BY id LIMIT 1`},
@@ -688,7 +689,6 @@ func validateSQLiteRelationships(ctx context.Context, tx *sql.Tx) error {
 		{"lyrics", `SELECT id FROM lyrics WHERE id <= 0 OR TRIM(type) = '' OR TRIM(updated_at) = '' OR TRIM(created_at) = '' OR json_valid(lines_json) = 0 ORDER BY id LIMIT 1`},
 		{"tracks", `SELECT tracks.id FROM tracks LEFT JOIN albums ON albums.id = tracks.album_id WHERE albums.id IS NULL ORDER BY tracks.id LIMIT 1`},
 		{"tracks", `SELECT tracks.id FROM tracks WHERE json_array_length(tracks.author_ids_json) = 0 OR EXISTS (SELECT 1 FROM json_each(tracks.author_ids_json) AS item LEFT JOIN authors ON authors.id = CAST(item.value AS INTEGER) WHERE authors.id IS NULL) ORDER BY tracks.id LIMIT 1`},
-		{"albums", `SELECT albums.id FROM albums WHERE EXISTS (SELECT 1 FROM json_each(albums.track_ids_json) AS item LEFT JOIN tracks ON tracks.id = CAST(item.value AS INTEGER) WHERE tracks.id IS NULL OR tracks.album_id != albums.id) ORDER BY albums.id LIMIT 1`},
 		{"refresh_sessions", `SELECT refresh_sessions.rowid FROM refresh_sessions LEFT JOIN users ON users.id = refresh_sessions.user_id WHERE users.id IS NULL ORDER BY refresh_sessions.rowid LIMIT 1`},
 		{"playlists", `SELECT playlists.id FROM playlists LEFT JOIN users ON users.id = playlists.user_id WHERE users.id IS NULL ORDER BY playlists.id LIMIT 1`},
 		{"lyrics", `SELECT lyrics.id FROM lyrics LEFT JOIN tracks ON tracks.id = lyrics.track_id WHERE tracks.id IS NULL ORDER BY lyrics.id LIMIT 1`},

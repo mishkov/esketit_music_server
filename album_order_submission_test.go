@@ -22,13 +22,13 @@ func orderProposalFixture(t *testing.T) (*trackStore, user, user, album, createA
 	t.Cleanup(func() { _ = s.db.Close() })
 	admin := mustCreateCatalogTestUser(t, s, "order-reviewer@example.com")
 	owner := mustCreateCatalogTestUser(t, s, "order-requester@example.com")
-	a, _, _ := albumOrderFixture(t, s)
+	a, _, _ := trackNumberFixture(t, s)
 	ids := slices.Clone(a.TrackIDs)
 	slices.Reverse(ids)
-	return s, admin, owner, a, createAlbumTrackOrderSubmissionRequest{AlbumID: a.ID, reorderAlbumTracksRequest: reorderAlbumTracksRequest{ids, a.OrderRevision}, Reason: "Original release order"}
+	return s, admin, owner, a, createAlbumTrackOrderSubmissionRequest{AlbumID: a.ID, reorderAlbumTracksRequest: reorderAlbumTracksRequest{fixtureNumberAssignments(ids), a.OrderRevision}, Reason: "Original release order"}
 }
 
-func TestAlbumOrderSubmissionLifecycle(t *testing.T) {
+func TestTrackNumberSubmissionLifecycle(t *testing.T) {
 	for _, action := range []string{"approve", "reject", "cancel"} {
 		t.Run(action, func(t *testing.T) {
 			s, admin, owner, a, req := orderProposalFixture(t)
@@ -36,12 +36,12 @@ func TestAlbumOrderSubmissionLifecycle(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			assertAlbumOrder(t, s, a.ID, a.TrackIDs, a.OrderRevision)
+			assertTrackNumber(t, s, a.ID, a.TrackIDs, a.OrderRevision)
 			view := sub.Entity.(albumTrackOrderSubmissionView)
-			if sub.Status != catalogSubmissionStatusPendingReview || !slices.Equal(view.BaseTrackIDs, a.TrackIDs) || !slices.Equal(view.TrackIDs, req.TrackIDs) || len(view.Tracks) != 3 {
+			if sub.Status != catalogSubmissionStatusPendingReview || !slices.Equal(assignmentTrackIDs(view.BaseTracks), a.TrackIDs) || !reflect.DeepEqual(view.Tracks, req.Tracks) || len(view.Tracks) != 3 {
 				t.Fatalf("proposal = %+v", sub)
 			}
-			if _, err := s.createAlbumTrackOrderSubmission(owner.ID, req); !errors.Is(err, errAlbumOrderProposalExists) {
+			if _, err := s.createAlbumTrackOrderSubmission(owner.ID, req); !errors.Is(err, errTrackNumberProposalExists) {
 				t.Fatalf("duplicate = %v", err)
 			}
 			if _, err := s.approveCatalogSubmission(admin.ID, sub.ID, "invalid"); !errors.Is(err, errCatalogReviewLeaseInvalid) {
@@ -70,7 +70,7 @@ func TestAlbumOrderSubmissionLifecycle(t *testing.T) {
 				t.Fatal(err)
 			}
 			if action == "approve" {
-				assertAlbumOrder(t, s, a.ID, req.TrackIDs, a.OrderRevision+1)
+				assertTrackNumber(t, s, a.ID, assignmentTrackIDs(req.Tracks), a.OrderRevision+1)
 				if sub.Status != catalogSubmissionStatusApproved {
 					t.Fatalf("status=%s", sub.Status)
 				}
@@ -82,7 +82,7 @@ func TestAlbumOrderSubmissionLifecycle(t *testing.T) {
 					t.Fatalf("repeat approval=%v", err)
 				}
 			} else {
-				assertAlbumOrder(t, s, a.ID, a.TrackIDs, a.OrderRevision)
+				assertTrackNumber(t, s, a.ID, a.TrackIDs, a.OrderRevision)
 			}
 			current, _, _ := s.getAlbum(a.ID)
 			if current.PublicationStatus != catalogPublicationPublished || current.RequestedByUserID != nil {
@@ -106,7 +106,7 @@ func TestAlbumOrderSubmissionLifecycle(t *testing.T) {
 	}
 }
 
-func TestAlbumOrderSubmissionStaleAndCorrection(t *testing.T) {
+func TestTrackNumberSubmissionStaleAndCorrection(t *testing.T) {
 	s, admin, owner, a, req := orderProposalFixture(t)
 	sub, err := s.createAlbumTrackOrderSubmission(owner.ID, req)
 	if err != nil {
@@ -123,13 +123,13 @@ func TestAlbumOrderSubmissionStaleAndCorrection(t *testing.T) {
 	}
 	// The deployed direct API remains functional and invalidates a pending proposal.
 	newOrder := []int64{a.TrackIDs[1], a.TrackIDs[0], a.TrackIDs[2]}
-	if _, err := s.reorderAlbumTracks(context.Background(), admin.ID, a.ID, reorderAlbumTracksRequest{newOrder, a.OrderRevision}); err != nil {
+	if _, err := s.reorderAlbumTracks(context.Background(), admin.ID, a.ID, reorderAlbumTracksRequest{fixtureNumberAssignments(newOrder), a.OrderRevision}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.approveCatalogSubmission(admin.ID, sub.ID, lease.LeaseToken); !errors.Is(err, errAlbumOrderStale) {
+	if _, err := s.approveCatalogSubmission(admin.ID, sub.ID, lease.LeaseToken); !errors.Is(err, errTrackNumberStale) {
 		t.Fatalf("stale approval=%v", err)
 	}
-	assertAlbumOrder(t, s, a.ID, newOrder, a.OrderRevision+1)
+	assertTrackNumber(t, s, a.ID, newOrder, a.OrderRevision+1)
 	sub, err = s.requestCatalogSubmissionChanges(admin.ID, sub.ID, lease.LeaseToken, catalogReviewDecisionRequest{Message: "Refresh order revision"})
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +137,7 @@ func TestAlbumOrderSubmissionStaleAndCorrection(t *testing.T) {
 	if _, err := s.resubmitCatalogSubmission(owner.ID, sub.ID); !errors.Is(err, errCatalogSubmissionDependency) {
 		t.Fatalf("stale resubmit=%v", err)
 	}
-	if _, err := s.updateAlbumTrackOrderSubmission(other.ID, sub.ID, updateAlbumTrackOrderSubmissionRequest{ExpectedRevision: sub.Revision, TrackIDs: &req.TrackIDs}); !errors.Is(err, errCatalogSubmissionForbidden) {
+	if _, err := s.updateAlbumTrackOrderSubmission(other.ID, sub.ID, updateAlbumTrackOrderSubmissionRequest{ExpectedRevision: sub.Revision, Tracks: &req.Tracks}); !errors.Is(err, errCatalogSubmissionForbidden) {
 		t.Fatalf("ownership=%v", err)
 	}
 	base := a.OrderRevision + 1
@@ -149,7 +149,7 @@ func TestAlbumOrderSubmissionStaleAndCorrection(t *testing.T) {
 	if _, err := s.updateAlbumTrackOrderSubmission(owner.ID, sub.ID, patch); !errors.Is(err, errMCPStaleRevision) {
 		t.Fatalf("stale patch=%v", err)
 	}
-	if !slices.Equal(sub.Entity.(albumTrackOrderSubmissionView).BaseTrackIDs, newOrder) {
+	if !slices.Equal(assignmentTrackIDs(sub.Entity.(albumTrackOrderSubmissionView).BaseTracks), newOrder) {
 		t.Fatalf("base was not refreshed: %+v", sub)
 	}
 	sub, err = s.resubmitCatalogSubmission(owner.ID, sub.ID)
@@ -159,7 +159,7 @@ func TestAlbumOrderSubmissionStaleAndCorrection(t *testing.T) {
 	if _, err := s.approveCatalogSubmission(admin.ID, sub.ID, lease.LeaseToken); err != nil {
 		t.Fatal(err)
 	}
-	assertAlbumOrder(t, s, a.ID, req.TrackIDs, base+1)
+	assertTrackNumber(t, s, a.ID, assignmentTrackIDs(req.Tracks), base+1)
 	if err := s.releaseCatalogReviewLease(admin.ID, owner.ID, lease.LeaseToken); err != nil {
 		t.Fatal(err)
 	}
@@ -167,17 +167,17 @@ func TestAlbumOrderSubmissionStaleAndCorrection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.approveCatalogSubmission(admin.ID, competing.ID, lease.LeaseToken); !errors.Is(err, errAlbumOrderStale) {
+	if _, err := s.approveCatalogSubmission(admin.ID, competing.ID, lease.LeaseToken); !errors.Is(err, errTrackNumberStale) {
 		t.Fatalf("competing proposal=%v", err)
 	}
 }
 
-func TestAlbumOrderSubmissionValidation(t *testing.T) {
+func TestTrackNumberSubmissionValidation(t *testing.T) {
 	s, _, owner, a, req := orderProposalFixture(t)
 	for name, ids := range map[string][]int64{"missing": a.TrackIDs[:2], "duplicate": {a.TrackIDs[0], a.TrackIDs[0], a.TrackIDs[1]}, "foreign": {a.TrackIDs[0], a.TrackIDs[1], 99999}, "nonpositive": {0, a.TrackIDs[1], a.TrackIDs[2]}, "null": nil} {
 		t.Run(name, func(t *testing.T) {
 			copy := req
-			copy.TrackIDs = ids
+			copy.Tracks = fixtureNumberAssignments(ids)
 			if _, err := s.createAlbumTrackOrderSubmission(owner.ID, copy); !errors.Is(err, errInvalidAlbum) {
 				t.Fatalf("invalid=%v", err)
 			}
@@ -189,33 +189,33 @@ func TestAlbumOrderSubmissionValidation(t *testing.T) {
 	}
 	copy := req
 	copy.AlbumID = pending.EntityID
-	copy.TrackIDs = []int64{}
+	copy.Tracks = []trackNumberAssignment{}
 	copy.ExpectedOrderRevision = 1
-	if _, err := s.createAlbumTrackOrderSubmission(owner.ID, copy); !errors.Is(err, errAlbumOrderState) {
+	if _, err := s.createAlbumTrackOrderSubmission(owner.ID, copy); !errors.Is(err, errTrackNumberState) {
 		t.Fatalf("pending album=%v", err)
 	}
 	// Another requester's staged track prevents proposing a filtered subset.
 	other := mustCreateCatalogTestUser(t, s, "hidden-track@example.com")
-	_, _, artist := albumOrderFixture(t, s)
+	_, _, artist := trackNumberFixture(t, s)
 	upload := catalogSubmissionUpload{Token: "hidden-audio", RequesterUserID: other.ID, StoredFileName: "hidden.mp3", OriginalName: "hidden.mp3", CreatedAt: time.Now().UTC()}
 	if err := newDomainRepositories(s.db).submissions.InsertSubmissionUpload(context.Background(), upload); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.createTrackSubmission(other.ID, createTrackSubmissionRequest{Name: "Hidden", AuthorIDs: []int64{artist.ID}, AlbumID: a.ID, AlbumOrder: len(a.TrackIDs), AudioUploadToken: upload.Token}); err != nil {
+	if _, err := s.createTrackSubmission(other.ID, createTrackSubmissionRequest{Name: "Hidden", AuthorIDs: []int64{artist.ID}, AlbumID: a.ID, TrackNumber: (len(a.TrackIDs)) + 1, AudioUploadToken: upload.Token}); err != nil {
 		t.Fatal(err)
 	}
 	req.ExpectedOrderRevision++
-	if _, err := s.createAlbumTrackOrderSubmission(owner.ID, req); !errors.Is(err, errAlbumOrderHidden) {
+	if _, err := s.createAlbumTrackOrderSubmission(owner.ID, req); !errors.Is(err, errTrackNumberHidden) {
 		t.Fatalf("hidden membership=%v", err)
 	}
 }
 
-func TestAlbumOrderSubmissionMCPRetriesAndActions(t *testing.T) {
+func TestTrackNumberSubmissionMCPRetriesAndActions(t *testing.T) {
 	s, owner := newMCPTestService(t)
-	a, _, _ := albumOrderFixture(t, s.store)
+	a, _, _ := trackNumberFixture(t, s.store)
 	ids := slices.Clone(a.TrackIDs)
 	slices.Reverse(ids)
-	args := map[string]any{"requestId": "propose-order", "albumId": a.ID, "trackIds": ids, "expectedOrderRevision": a.OrderRevision, "reason": "Release order"}
+	args := map[string]any{"requestId": "propose-order", "albumId": a.ID, "tracks": fixtureNumberAssignments(ids), "expectedOrderRevision": a.OrderRevision, "reason": "Release order"}
 	originalUOW := s.store.unitOfWork
 	s.store.unitOfWork = failingMCPUnitOfWork{originalUOW}
 	raw, _ := json.Marshal(args)
@@ -241,7 +241,7 @@ func TestAlbumOrderSubmissionMCPRetriesAndActions(t *testing.T) {
 	if !reflect.DeepEqual(first["allowedActions"], []any{"cancel_submission"}) {
 		t.Fatalf("actions=%v", first["allowedActions"])
 	}
-	assertAlbumOrder(t, s.store, a.ID, a.TrackIDs, a.OrderRevision)
+	assertTrackNumber(t, s.store, a.ID, a.TrackIDs, a.OrderRevision)
 	args["reason"] = "Changed payload"
 	raw, _ = json.Marshal(args)
 	if _, err := s.call(context.Background(), "submit_album_track_order", raw, true); !errors.Is(err, errMCPRequestConflict) {
@@ -273,7 +273,7 @@ func TestAlbumOrderSubmissionMCPRetriesAndActions(t *testing.T) {
 	if _, err := s.store.approveCatalogSubmission(admin.ID, sub.ID, lease.LeaseToken); err != nil {
 		t.Fatal(err)
 	}
-	assertAlbumOrder(t, s.store, a.ID, ids, a.OrderRevision+1)
+	assertTrackNumber(t, s.store, a.ID, ids, a.OrderRevision+1)
 	var sequence int
 	var databaseName, databasePath string
 	if err := s.store.db.QueryRow(`PRAGMA database_list`).Scan(&sequence, &databaseName, &databasePath); err != nil {
@@ -294,7 +294,7 @@ func TestAlbumOrderSubmissionMCPRetriesAndActions(t *testing.T) {
 	}
 }
 
-func TestAlbumOrderSubmissionApprovalRollback(t *testing.T) {
+func TestTrackNumberSubmissionApprovalRollback(t *testing.T) {
 	s, admin, owner, a, req := orderProposalFixture(t)
 	sub, err := s.createAlbumTrackOrderSubmission(owner.ID, req)
 	if err != nil {
@@ -310,14 +310,14 @@ func TestAlbumOrderSubmissionApprovalRollback(t *testing.T) {
 	if _, err := s.approveCatalogSubmission(admin.ID, sub.ID, lease.LeaseToken); err == nil {
 		t.Fatal("approval unexpectedly succeeded")
 	}
-	assertAlbumOrder(t, s, a.ID, a.TrackIDs, a.OrderRevision)
+	assertTrackNumber(t, s, a.ID, a.TrackIDs, a.OrderRevision)
 	stored, found, err := newDomainRepositories(s.db).submissions.FindSubmissionByID(context.Background(), sub.ID)
 	if err != nil || !found || stored.Status != catalogSubmissionStatusPendingReview || stored.Revision != sub.Revision {
 		t.Fatalf("rollback failed: %+v %v", stored, err)
 	}
 }
 
-func TestAlbumOrderSubmissionMembershipChange(t *testing.T) {
+func TestTrackNumberSubmissionMembershipChange(t *testing.T) {
 	s, admin, owner, a, req := orderProposalFixture(t)
 	sub, err := s.createAlbumTrackOrderSubmission(owner.ID, req)
 	if err != nil {
@@ -330,13 +330,13 @@ func TestAlbumOrderSubmissionMembershipChange(t *testing.T) {
 	if deleted, err := s.delete(a.TrackIDs[0]); err != nil || !deleted {
 		t.Fatalf("delete=%v %v", deleted, err)
 	}
-	if _, err := s.approveCatalogSubmission(admin.ID, sub.ID, lease.LeaseToken); !errors.Is(err, errAlbumOrderStale) {
+	if _, err := s.approveCatalogSubmission(admin.ID, sub.ID, lease.LeaseToken); !errors.Is(err, errTrackNumberStale) {
 		t.Fatalf("membership change=%v", err)
 	}
-	assertAlbumOrder(t, s, a.ID, a.TrackIDs[1:], a.OrderRevision+1)
+	assertTrackNumber(t, s, a.ID, a.TrackIDs[1:], a.OrderRevision+1)
 }
 
-func TestAlbumOrderSubmissionHTTP(t *testing.T) {
+func TestTrackNumberSubmissionHTTP(t *testing.T) {
 	s, admin, owner, a, req := orderProposalFixture(t)
 	auth := newAuthManager([]byte("proposal-http-test-secret"), time.Hour, time.Hour)
 	mux := http.NewServeMux()
@@ -383,7 +383,7 @@ func TestAlbumOrderSubmissionHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"trackIds", "expectedOrderRevision", "reason"} {
+	for _, field := range []string{"tracks", "expectedOrderRevision", "reason"} {
 		body := map[string]any{"expectedRevision": sub.Revision, "reason": "Explanation", field: nil}
 		if w := invoke("PUT", updatePath, owner.ID, body); w.Code != 400 {
 			t.Fatalf("null %s accepted: %d %s", field, w.Code, w.Body.String())
@@ -392,7 +392,7 @@ func TestAlbumOrderSubmissionHTTP(t *testing.T) {
 	if w := invoke("PUT", updatePath, owner.ID, map[string]any{"expectedRevision": sub.Revision, "reason": "Corrected"}); w.Code != 200 {
 		t.Fatalf("update=%d %s", w.Code, w.Body.String())
 	}
-	assertAlbumOrder(t, s, a.ID, a.TrackIDs, a.OrderRevision)
+	assertTrackNumber(t, s, a.ID, a.TrackIDs, a.OrderRevision)
 	role, err := s.createAccessRole(admin.ID, upsertAccessRoleRequest{Name: "no-proposals"})
 	if err != nil {
 		t.Fatal(err)
@@ -405,7 +405,7 @@ func TestAlbumOrderSubmissionHTTP(t *testing.T) {
 	}
 }
 
-func TestAlbumOrderSubmissionConcurrentApproval(t *testing.T) {
+func TestTrackNumberSubmissionConcurrentApproval(t *testing.T) {
 	s, admin, owner, a, req := orderProposalFixture(t)
 	sub, err := s.createAlbumTrackOrderSubmission(owner.ID, req)
 	if err != nil {
@@ -428,10 +428,10 @@ func TestAlbumOrderSubmissionConcurrentApproval(t *testing.T) {
 	if (errs[0] == nil) == (errs[1] == nil) {
 		t.Fatalf("concurrent approvals=%v", errs)
 	}
-	assertAlbumOrder(t, s, a.ID, req.TrackIDs, a.OrderRevision+1)
+	assertTrackNumber(t, s, a.ID, assignmentTrackIDs(req.Tracks), a.OrderRevision+1)
 }
 
-func TestAlbumOrderSubmissionMigrationPreservesHistory(t *testing.T) {
+func TestTrackNumberSubmissionMigrationPreservesHistory(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "upgrade.sqlite")
 	db, err := openSQLiteDB(path)
 	if err != nil {

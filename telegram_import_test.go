@@ -195,10 +195,10 @@ func TestTelegramImportSaveCurrentPromotesFileAndCreatesTrack(t *testing.T) {
 	}
 
 	dto, createdTrack, err := service.SaveCurrent(ctx, 1, telegramSaveTrackRequest{
-		Name:       "Final Track",
-		AuthorIDs:  []int64{artist.ID},
-		AlbumID:    album.ID,
-		AlbumOrder: 0,
+		Name:        "Final Track",
+		AuthorIDs:   []int64{artist.ID},
+		AlbumID:     album.ID,
+		TrackNumber: 1,
 		AdditionalInfo: []additionalInfo{
 			{
 				"type":     "external_link",
@@ -278,6 +278,7 @@ func TestTelegramPublicationDatabaseFailureRollsBackAndRemovesPromotedFile(t *te
 	}
 	if _, _, err := service.SaveCurrent(ctx, 1, telegramSaveTrackRequest{
 		Name: "Rollback", AuthorIDs: []int64{artist.ID}, AlbumID: albumItem.ID,
+		TrackNumber: 1,
 	}); err == nil {
 		t.Fatal("SaveCurrent error = nil, want injected persistence failure")
 	}
@@ -1038,9 +1039,10 @@ func TestTelegramSaveSerializesReplacementSession(t *testing.T) {
 	saveDone := make(chan error, 1)
 	go func() {
 		_, _, err := service.SaveCurrent(ctx, 1, telegramSaveTrackRequest{
-			Name:      "Old",
-			AuthorIDs: []int64{artist.ID},
-			AlbumID:   album.ID,
+			Name:        "Old",
+			AuthorIDs:   []int64{artist.ID},
+			AlbumID:     album.ID,
+			TrackNumber: 1,
 		})
 		saveDone <- err
 	}()

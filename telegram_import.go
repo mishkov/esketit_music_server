@@ -745,7 +745,7 @@ type telegramSaveTrackRequest struct {
 	Name           string           `json:"name"`
 	AuthorIDs      []int64          `json:"authorIds"`
 	AlbumID        int64            `json:"albumId"`
-	AlbumOrder     int              `json:"albumOrder"`
+	TrackNumber    int              `json:"trackNumber"`
 	AdditionalInfo []additionalInfo `json:"additionalInfo"`
 	SourceMetadata []sourceMetadata `json:"sourceMetadata"`
 }
@@ -1336,7 +1336,7 @@ func (s *telegramImportService) SaveCurrent(ctx context.Context, userID int64, r
 		Name:           strings.TrimSpace(req.Name),
 		AuthorIDs:      req.AuthorIDs,
 		AlbumID:        req.AlbumID,
-		AlbumOrder:     req.AlbumOrder,
+		TrackNumber:    req.TrackNumber,
 		AudioFilePath:  audioPath,
 		AdditionalInfo: req.AdditionalInfo,
 		SourceMetadata: req.SourceMetadata,
@@ -2076,6 +2076,8 @@ func writeTelegramError(w http.ResponseWriter, r *http.Request, err error, opera
 		http.Error(w, errTelegramSessionChanged.Error(), http.StatusConflict)
 	case errors.Is(err, errTelegramSessionNotFound):
 		http.Error(w, errTelegramSessionNotFound.Error(), http.StatusNotFound)
+	case errors.Is(err, errTrackNumberConflict):
+		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.Is(err, errInvalidTrack):
 		http.Error(w, errInvalidTrack.Error(), http.StatusBadRequest)
 	case isTelegramUpstreamError(err), errors.Is(err, errTelegramScanStalled), errors.Is(err, errTelegramTempFileMissing):

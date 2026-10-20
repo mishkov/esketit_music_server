@@ -200,6 +200,7 @@ func TestCatalogSubmissionApprovalWorkflow(t *testing.T) {
 	upload := mustCreateCatalogTestUpload(t, store, requester.ID, "requester-song.mp3")
 	trackSubmission, err := store.createTrackSubmission(requester.ID, createTrackSubmissionRequest{
 		Name: "Pending Song", AuthorIDs: []int64{authorID}, AlbumID: albumID, AudioUploadToken: upload.Token,
+		TrackNumber: 1,
 	})
 	if err != nil {
 		t.Fatalf("createTrackSubmission() error = %v", err)
@@ -236,6 +237,7 @@ func TestCatalogSubmissionApprovalWorkflow(t *testing.T) {
 
 	if _, _, err := store.update(trackID, upsertTrackRequest{
 		Name: "Reviewer edit", AuthorIDs: []int64{authorID}, AlbumID: albumID, AudioFilePath: "/api/songs/edited.mp3",
+		TrackNumber: 1,
 	}); !errors.Is(err, errCatalogSubmissionState) {
 		t.Fatalf("direct update pending track error = %v, want catalog submission state error", err)
 	}
@@ -273,6 +275,7 @@ func TestCatalogSubmissionApprovalWorkflow(t *testing.T) {
 	assertCatalogTrackVisibility(t, store, requester.ID, trackID, true)
 	updated, err := store.updateTrackSubmission(requester.ID, trackID, updateTrackSubmissionRequest{
 		Name: "Corrected Song", AuthorIDs: []int64{authorID}, AlbumID: albumID,
+		TrackNumber: 1,
 	})
 	if err != nil {
 		t.Fatalf("updateTrackSubmission() error = %v", err)
@@ -438,6 +441,7 @@ func TestCatalogSubmissionRejectRemovesEntityAndKeepsTombstone(t *testing.T) {
 	upload := mustCreateCatalogTestUpload(t, store, requester.ID, "rejected.mp3")
 	submission, err := store.createTrackSubmission(requester.ID, createTrackSubmissionRequest{
 		Name: "Rejected Song", AuthorIDs: []int64{authorItem.ID}, AlbumID: albumItem.ID, AudioUploadToken: upload.Token,
+		TrackNumber: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -488,6 +492,7 @@ func TestRejectedCatalogDependencyBlocksTrackReview(t *testing.T) {
 			upload := mustCreateCatalogTestUpload(t, store, requester.ID, rejectedType+"-song.mp3")
 			trackSubmission, err := store.createTrackSubmission(requester.ID, createTrackSubmissionRequest{
 				Name: "Song", AuthorIDs: []int64{authorID}, AlbumID: albumID, AudioUploadToken: upload.Token,
+				TrackNumber: 1,
 			})
 			if err != nil {
 				t.Fatal(err)
