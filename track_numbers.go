@@ -44,7 +44,9 @@ func migratePersistentTrackNumbers(ctx context.Context, tx *sql.Tx) error {
 		`INSERT INTO tracks_numbered SELECT t.id,t.name,t.author_ids_json,t.album_id,
  (SELECT CAST(j.key AS INTEGER)+1 FROM albums a,json_each(a.track_ids_json) j WHERE a.id=t.album_id AND CAST(j.value AS INTEGER)=t.id),
  t.audio_file_path,t.additional_info_json,t.source_metadata_json,t.created_at,t.publication_status,t.requested_by_user_id FROM tracks t`,
-		`CREATE TEMP TABLE numbered_uploads AS SELECT * FROM catalog_submission_uploads`,
+		// Dropping tracks cascades only claimed uploads. Unclaimed rows remain
+		// in place and must not be inserted again when restoring the claims.
+		`CREATE TEMP TABLE numbered_uploads AS SELECT * FROM catalog_submission_uploads WHERE claimed_track_id IS NOT NULL`,
 		`DROP TABLE tracks`,
 		`ALTER TABLE tracks_numbered RENAME TO tracks`,
 		`INSERT INTO catalog_submission_uploads SELECT * FROM numbered_uploads`,

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
@@ -113,16 +114,63 @@ func TestPersistentTrackNumbersMigration(t *testing.T) {
 		`INSERT INTO albums(id,title,cover_image_path,author_ids_json,release_date,is_published,track_ids_json,additional_info_json) VALUES(1,'Album','','[1]','2026-01-01T00:00:00Z',1,'[2,1]','[]')`,
 		`INSERT INTO tracks(id,name,author_ids_json,album_id,audio_file_path,additional_info_json,source_metadata_json,created_at) VALUES(1,'Second','[1]',1,'/songs/second.mp3','[]','[]','2026-01-01T00:00:00Z'),(2,'First','[1]',1,'/songs/first.mp3','[]','[]','2026-01-01T00:00:00Z')`,
 		`INSERT INTO catalog_submission_uploads(token,requester_user_id,stored_file_name,original_file_name,created_at,claimed_track_id) VALUES('preserved',1,'staged.mp3','staged.mp3','2026-01-01T00:00:00Z',1)`,
+		`INSERT INTO catalog_submission_uploads(token,requester_user_id,stored_file_name,original_file_name,created_at,claimed_track_id) VALUES('unclaimed',1,'unclaimed.mp3','Original unclaimed.mp3','2026-01-02T00:00:00Z',NULL)`,
 		`INSERT INTO catalog_submissions(entity_type,entity_id,requester_user_id,status,snapshot_json,created_at,submitted_at,updated_at) VALUES('album_track_order',1,1,'pending_review','{"albumId":1,"baseTrackIds":[2,1],"trackIds":[1,2],"expectedOrderRevision":1,"reason":"Release"}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`,
 	} {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatal(err)
 		}
 	}
+	repos := newDomainRepositories(db)
+	uploadsBefore := make(map[string]catalogSubmissionUpload)
+	for _, token := range []string{"preserved", "unclaimed"} {
+		upload, found, err := repos.submissions.FindSubmissionUpload(ctx, token)
+		if err != nil || !found {
+			t.Fatalf("load upload before migration: %s: %v", token, err)
+		}
+		uploadsBefore[token] = upload
+	}
+	assertUploadsPreserved := func() {
+		t.Helper()
+		for token, before := range uploadsBefore {
+			after, found, err := repos.submissions.FindSubmissionUpload(ctx, token)
+			if err != nil || !found || !reflect.DeepEqual(after, before) {
+				t.Fatalf("upload changed during migration: %s: before=%+v after=%+v error=%v", token, before, after, err)
+			}
+		}
+		var uploadCount int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM catalog_submission_uploads`).Scan(&uploadCount); err != nil || uploadCount != len(uploadsBefore) {
+			t.Fatalf("upload count after migration: %d: %v", uploadCount, err)
+		}
+	}
+	// A later migration failure must restore the old schema and both kinds of
+	// upload, leaving migration 12 available for the next startup to retry.
+	injected := errors.New("injected failure after upload restoration")
+	err = applySQLiteMigration(ctx, db, schemaMigration{
+		version: 12,
+		name:    "track numbers rollback test",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			if err := migratePersistentTrackNumbers(ctx, tx); err != nil {
+				return err
+			}
+			return injected
+		},
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("migration did not reach the injected failure: %v", err)
+	}
+	assertUploadsPreserved()
+	var originalOrder string
+	if err := db.QueryRow(`SELECT track_ids_json FROM albums WHERE id=1`).Scan(&originalOrder); err != nil || originalOrder != "[2,1]" {
+		t.Fatalf("rollback did not restore the original order: %q: %v", originalOrder, err)
+	}
+	var applied int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=12`).Scan(&applied); err != nil || applied != 0 {
+		t.Fatalf("failed migration was recorded as applied: %d: %v", applied, err)
+	}
 	if err := runSQLiteMigrations(ctx, db, migrations); err != nil {
 		t.Fatal(err)
 	}
-	repos := newDomainRepositories(db)
 	tracks, err := repos.catalog.ListAlbumTracks(ctx, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -134,6 +182,7 @@ func TestPersistentTrackNumbersMigration(t *testing.T) {
 	if err != nil || !found || upload.ClaimedTrackID == nil || *upload.ClaimedTrackID != 1 {
 		t.Fatalf("upload lost=%+v %v", upload, err)
 	}
+	assertUploadsPreserved()
 	sub, found, err := repos.submissions.FindSubmissionByID(ctx, 1)
 	if err != nil || !found {
 		t.Fatal(err)
