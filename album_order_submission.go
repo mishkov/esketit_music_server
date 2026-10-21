@@ -67,6 +67,9 @@ type trackNumberTrackSummary struct {
 
 type albumTrackOrderSubmissionView struct {
 	albumTrackOrderProposal
+	AlbumTitle           string                    `json:"albumTitle"`
+	CoverImagePath       string                    `json:"coverImagePath"`
+	Outdated             bool                      `json:"outdated"`
 	TargetAvailable      bool                      `json:"targetAvailable"`
 	CurrentTracks        []trackNumberAssignment   `json:"currentTracks"`
 	CurrentOrderRevision int64                     `json:"currentOrderRevision,omitempty"`
@@ -288,6 +291,8 @@ func (s *trackStore) updateAlbumTrackOrderSubmission(userID, submissionID int64,
 func albumTrackOrderProposalView(ctx context.Context, repos domainRepositories, sub catalogSubmission) (albumTrackOrderSubmissionView, error) {
 	proposal, err := decodeAlbumTrackOrderProposal(sub)
 	view := albumTrackOrderSubmissionView{albumTrackOrderProposal: proposal, CurrentTracks: []trackNumberAssignment{}, TrackDetails: []trackNumberTrackSummary{}}
+	active := sub.Status == catalogSubmissionStatusPendingReview || sub.Status == catalogSubmissionStatusChangesRequested
+	view.Outdated = active // An unavailable target cannot be approved.
 	if err != nil {
 		return view, err
 	}
@@ -299,6 +304,8 @@ func albumTrackOrderProposalView(ctx context.Context, repos domainRepositories, 
 		return view, nil
 	}
 	view.TargetAvailable = true
+	view.AlbumTitle = item.Title
+	view.CoverImagePath = item.CoverImagePath
 	view.CurrentOrderRevision = item.OrderRevision
 	tracks, err := repos.reads.ListTracksByIDs(ctx, item.TrackIDs)
 	if err != nil {
@@ -316,7 +323,40 @@ func albumTrackOrderProposalView(ctx context.Context, repos domainRepositories, 
 			view.TrackDetails = append(view.TrackDetails, trackNumberTrackSummary{ID: id, Name: t.Name})
 		}
 	}
+	view.Outdated = active && (proposal.ExpectedOrderRevision != item.OrderRevision || !sameTrackNumberAssignments(proposal.BaseTracks, view.CurrentTracks))
 	return view, nil
+}
+
+// Track numbers define the order; JSON array order is irrelevant.
+func sameTrackNumberAssignments(before, current []trackNumberAssignment) bool {
+	if len(before) != len(current) {
+		return false
+	}
+	numbers := make(map[int64]int, len(before))
+	for _, item := range before {
+		if _, duplicate := numbers[item.TrackID]; duplicate {
+			return false
+		}
+		numbers[item.TrackID] = item.TrackNumber
+	}
+	for _, item := range current {
+		if number, found := numbers[item.TrackID]; !found || number != item.TrackNumber {
+			return false
+		}
+		delete(numbers, item.TrackID)
+	}
+	return len(numbers) == 0
+}
+
+func validateAlbumTrackOrderBase(ctx context.Context, repos domainRepositories, proposal albumTrackOrderProposal) error {
+	tracks, err := repos.catalog.ListAlbumTracks(ctx, proposal.AlbumID)
+	if err != nil {
+		return err
+	}
+	if !sameTrackNumberAssignments(proposal.BaseTracks, assignmentsForTracks(tracks)) {
+		return errTrackNumberStale
+	}
+	return nil
 }
 
 func applyAlbumTrackOrderProposal(ctx context.Context, repos domainRepositories, sub catalogSubmission) (albumTrackOrderProposal, error) {
@@ -326,6 +366,9 @@ func applyAlbumTrackOrderProposal(ctx context.Context, repos domainRepositories,
 	}
 	item, err := validateAlbumTrackOrderProposal(ctx, repos, sub.RequesterUserID, proposalRequest(proposal))
 	if err != nil {
+		return proposal, err
+	}
+	if err := validateAlbumTrackOrderBase(ctx, repos, proposal); err != nil {
 		return proposal, err
 	}
 	if err := repos.catalog.SetAlbumTrackNumbers(ctx, item.ID, proposal.Tracks); err != nil {
@@ -387,6 +430,9 @@ func albumTrackOrderDependenciesReady(ctx context.Context, repos domainRepositor
 		return err
 	}
 	_, err = validateAlbumTrackOrderProposal(ctx, repos, sub.RequesterUserID, proposalRequest(proposal))
+	if err == nil {
+		err = validateAlbumTrackOrderBase(ctx, repos, proposal)
+	}
 	if err != nil {
 		if errors.Is(err, errTrackNumberStale) || errors.Is(err, errTrackNumberState) || errors.Is(err, errTrackNumberHidden) || errors.Is(err, errInvalidAlbum) || errors.Is(err, errRepositoryNotFound) {
 			return fmt.Errorf("%w: refresh the album order proposal: %w", errCatalogSubmissionDependency, err)
