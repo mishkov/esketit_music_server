@@ -3726,7 +3726,11 @@ components:
             Current author, album, or track; falls back to the snapshot after removal.
             For album_track_order, returns albumId, baseTracks, proposed tracks,
             expectedOrderRevision, reason, optional appliedOrderRevision, targetAvailable,
-            currentTracks, currentOrderRevision, and trackDetails summaries (id/name).
+            currentTracks, currentOrderRevision, albumTitle, coverImagePath, outdated,
+            and trackDetails summaries (id/name). Active proposals are outdated if the
+            target is unavailable, its revision changed, or baseTracks differs from
+            currentTracks. Outdated proposals cannot be approved; reviewers can
+            request changes or reject them.
             The snapshot retains proposal data independently of current album data;
             entityId is the target album ID and submission id identifies each proposal.
         feedback:
