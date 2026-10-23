@@ -778,6 +778,8 @@ func run() (runErr error) {
 	mux.Handle("GET /api/catalog-submissions", requirePermission(auth, store, permissionCatalogSubmissionsRead, listOwnCatalogSubmissionsHandler(store)))
 	mux.Handle("POST /api/catalog-submissions/audio", requirePermission(auth, store, permissionTracksSubmit, uploadCatalogSubmissionAudioHandler(store)))
 	mux.Handle("POST /api/catalog-submissions/authors", requirePermission(auth, store, permissionAuthorsSubmit, createAuthorSubmissionHandler(store, authorPhotosDir)))
+	mux.Handle("POST /api/catalog-submissions/track-lyrics", requirePermission(auth, store, permissionTracksSubmit, trackLyricsSubmissionHandler(store, false)))
+	mux.Handle("PUT /api/catalog-submissions/track-lyrics/", requirePermission(auth, store, permissionCatalogSubmissionsUpdate, trackLyricsSubmissionHandler(store, true)))
 	mux.Handle("POST /api/catalog-submissions/album-track-orders", requirePermission(auth, store, permissionAlbumsSubmitTrackOrder, albumTrackOrderSubmissionHandler(store, false)))
 	mux.Handle("PUT /api/catalog-submissions/album-track-orders/", requirePermission(auth, store, permissionCatalogSubmissionsUpdate, albumTrackOrderSubmissionHandler(store, true)))
 	mux.Handle("POST /api/catalog-submissions/albums", requirePermission(auth, store, permissionAlbumsSubmit, createAlbumSubmissionHandler(store, albumCoversDir)))

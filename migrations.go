@@ -30,6 +30,7 @@ func defaultSchemaMigrations() []schemaMigration {
 		{version: 10, name: "album ordering revisions and permission", apply: migrateTrackNumber},
 		{version: 11, name: "reviewed album track order proposals", apply: migrateAlbumTrackOrderSubmissions},
 		{version: 12, name: "persistent album track numbers", apply: migratePersistentTrackNumbers},
+		{version: 13, name: "reviewed track lyrics proposals", apply: migrateTrackLyricsSubmissions},
 	}
 }
 
@@ -701,6 +702,7 @@ func validateSQLiteRelationships(ctx context.Context, tx *sql.Tx) error {
 				(entity_type = 'author' AND EXISTS (SELECT 1 FROM authors WHERE authors.id = entity_id AND authors.requested_by_user_id = requester_user_id AND authors.publication_status = status)) OR
 				(entity_type = 'album' AND EXISTS (SELECT 1 FROM albums WHERE albums.id = entity_id AND albums.requested_by_user_id = requester_user_id AND albums.publication_status = status)) OR
 				(entity_type = 'track' AND EXISTS (SELECT 1 FROM tracks WHERE tracks.id = entity_id AND tracks.requested_by_user_id = requester_user_id AND tracks.publication_status = status)) OR
+				(entity_type = 'track_lyrics' AND CAST(json_extract(snapshot_json, '$.trackId') AS INTEGER) = entity_id) OR
 				(entity_type = 'album_track_order' AND CAST(json_extract(snapshot_json, '$.albumId') AS INTEGER) = entity_id)
 			) ORDER BY id LIMIT 1`},
 		{"catalog_submissions", `SELECT catalog_submissions.id FROM catalog_submissions

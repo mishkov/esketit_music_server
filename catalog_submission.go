@@ -76,6 +76,7 @@ type catalogSubmissionFeedback struct {
 
 type catalogSubmissionResponse struct {
 	catalogSubmission
+	Lyrics   *lyricsResponse             `json:"lyrics,omitempty"`
 	Entity   any                         `json:"entity,omitempty"`
 	Feedback []catalogSubmissionFeedback `json:"feedback"`
 }
@@ -129,23 +130,25 @@ type catalogReviewDecisionRequest struct {
 }
 
 type createTrackSubmissionRequest struct {
-	Name             string           `json:"name"`
-	AuthorIDs        []int64          `json:"authorIds"`
-	AlbumID          int64            `json:"albumId"`
-	TrackNumber      int              `json:"trackNumber"`
-	AudioUploadToken string           `json:"audioUploadToken"`
-	AdditionalInfo   []additionalInfo `json:"additionalInfo"`
-	SourceMetadata   []sourceMetadata `json:"sourceMetadata"`
+	Lyrics           *upsertLyricsRequest `json:"lyrics,omitempty"`
+	Name             string               `json:"name"`
+	AuthorIDs        []int64              `json:"authorIds"`
+	AlbumID          int64                `json:"albumId"`
+	TrackNumber      int                  `json:"trackNumber"`
+	AudioUploadToken string               `json:"audioUploadToken"`
+	AdditionalInfo   []additionalInfo     `json:"additionalInfo"`
+	SourceMetadata   []sourceMetadata     `json:"sourceMetadata"`
 }
 
 type updateTrackSubmissionRequest struct {
-	Name             string           `json:"name"`
-	AuthorIDs        []int64          `json:"authorIds"`
-	AlbumID          int64            `json:"albumId"`
-	TrackNumber      int              `json:"trackNumber"`
-	AudioUploadToken string           `json:"audioUploadToken,omitempty"`
-	AdditionalInfo   []additionalInfo `json:"additionalInfo"`
-	SourceMetadata   []sourceMetadata `json:"sourceMetadata"`
+	Lyrics           *upsertLyricsRequest `json:"lyrics,omitempty"`
+	Name             string               `json:"name"`
+	AuthorIDs        []int64              `json:"authorIds"`
+	AlbumID          int64                `json:"albumId"`
+	TrackNumber      int                  `json:"trackNumber"`
+	AudioUploadToken string               `json:"audioUploadToken,omitempty"`
+	AdditionalInfo   []additionalInfo     `json:"additionalInfo"`
+	SourceMetadata   []sourceMetadata     `json:"sourceMetadata"`
 }
 
 type catalogSubmissionUpload struct {
@@ -325,6 +328,11 @@ func (s *trackStore) createTrackSubmission(requesterUserID int64, request create
 		if err := state.repositories.submissions.ClaimSubmissionUpload(state.ctx, request.AudioUploadToken, requesterUserID, item.ID); err != nil {
 			return err
 		}
+		if request.Lyrics != nil {
+			if _, _, err := saveLyrics(state.ctx, state.repositories, item.ID, *request.Lyrics); err != nil {
+				return err
+			}
+		}
 		submission, err := newCatalogSubmission(catalogSubmissionEntityTrack, item.ID, requesterUserID, item, time.Now().UTC())
 		if err != nil {
 			return err
@@ -333,7 +341,11 @@ func (s *trackStore) createTrackSubmission(requesterUserID int64, request create
 		if err != nil {
 			return err
 		}
-		result = catalogSubmissionResponse{catalogSubmission: submission, Entity: item, Feedback: []catalogSubmissionFeedback{}}
+		responses, err := buildCatalogSubmissionResponses(state.ctx, state.repositories, []catalogSubmission{submission})
+		if err != nil {
+			return err
+		}
+		result = responses[0]
 		return nil
 	})
 	return result, err
@@ -404,13 +416,24 @@ func buildCatalogSubmissionResponses(ctx context.Context, repositories domainRep
 		if itemFeedback == nil {
 			itemFeedback = []catalogSubmissionFeedback{}
 		}
-		result = append(result, catalogSubmissionResponse{catalogSubmission: item, Entity: entity, Feedback: itemFeedback})
+		response := catalogSubmissionResponse{catalogSubmission: item, Entity: entity, Feedback: itemFeedback}
+		if item.EntityType == catalogSubmissionEntityTrack {
+			if lyrics, exists, err := repositories.lyrics.FindByTrackID(ctx, item.EntityID); err != nil {
+				return nil, err
+			} else if exists {
+				value := toLyricsResponse(lyrics)
+				response.Lyrics = &value
+			}
+		}
+		result = append(result, response)
 	}
 	return result, nil
 }
 
 func catalogSubmissionEntity(ctx context.Context, repositories domainRepositories, submission catalogSubmission) (any, error) {
 	switch submission.EntityType {
+	case catalogSubmissionEntityTrackLyrics:
+		return trackLyricsProposalView(ctx, repositories, submission)
 	case catalogSubmissionEntityAlbumTrackOrder:
 		return albumTrackOrderProposalView(ctx, repositories, submission)
 	case catalogSubmissionEntityAuthor:
@@ -583,6 +606,11 @@ func (s *trackStore) updateTrackSubmission(requesterUserID, trackID int64, reque
 		if !found {
 			return errCatalogSubmissionNotFound
 		}
+		if request.Lyrics != nil {
+			if _, _, err := saveLyrics(state.ctx, state.repositories, item.ID, *request.Lyrics); err != nil {
+				return err
+			}
+		}
 		return updateSubmissionSnapshot(state.ctx, state.repositories, &submission, item, &result)
 	})
 	if err == nil && oldStagedFile != "" {
@@ -609,7 +637,10 @@ func updateSubmissionSnapshot(ctx context.Context, repositories domainRepositori
 		return err
 	}
 	*result = catalogSubmissionResponse{catalogSubmission: *submission, Entity: entity, Feedback: feedback}
-	return nil
+	if submission.EntityType == catalogSubmissionEntityTrack {
+		result.Lyrics, err = currentLyricsResponse(ctx, repositories, submission.EntityID)
+	}
+	return err
 }
 
 func (s *trackStore) resubmitCatalogSubmission(requesterUserID, submissionID int64) (catalogSubmissionResponse, error) {
@@ -632,7 +663,7 @@ func (s *trackStore) resubmitCatalogSubmission(requesterUserID, submissionID int
 			return err
 		}
 		var entity any = item.Snapshot
-		if item.EntityType != catalogSubmissionEntityAlbumTrackOrder {
+		if !isCatalogProposal(item.EntityType) {
 			entity, err = setCatalogEntityPublication(context.Background(), repositories, item.EntityType, item.EntityID, catalogPublicationPendingReview, requestedByUserID(requesterUserID))
 		}
 		if err != nil {
@@ -663,6 +694,9 @@ func (s *trackStore) resubmitCatalogSubmission(requesterUserID, submissionID int
 }
 
 func ensureSubmissionDependenciesReady(ctx context.Context, repositories domainRepositories, submission catalogSubmission) error {
+	if submission.EntityType == catalogSubmissionEntityTrackLyrics {
+		return trackLyricsDependenciesReady(ctx, repositories, submission)
+	}
 	if submission.EntityType == catalogSubmissionEntityAlbumTrackOrder {
 		return albumTrackOrderDependenciesReady(ctx, repositories, submission)
 	}
@@ -903,7 +937,7 @@ func (s *trackStore) requestCatalogSubmissionChanges(reviewerUserID, submissionI
 			}
 		}
 		var entity any = item.Snapshot
-		if item.EntityType != catalogSubmissionEntityAlbumTrackOrder {
+		if !isCatalogProposal(item.EntityType) {
 			entity, err = setCatalogEntityPublication(ctx, repositories, item.EntityType, item.EntityID, catalogPublicationChangesRequested, requestedByUserID(item.RequesterUserID))
 		}
 		if err != nil {
@@ -967,7 +1001,12 @@ func (s *trackStore) approveCatalogSubmission(reviewerUserID, submissionID int64
 			return errCatalogSubmissionState
 		}
 
-		if item.EntityType == catalogSubmissionEntityAlbumTrackOrder {
+		if item.EntityType == catalogSubmissionEntityTrackLyrics {
+			result.Entity, err = applyTrackLyricsProposal(ctx, repositories, item)
+			if err != nil {
+				return err
+			}
+		} else if item.EntityType == catalogSubmissionEntityAlbumTrackOrder {
 			result.Entity, err = applyAlbumTrackOrderProposal(ctx, repositories, item)
 			if err != nil {
 				return err
@@ -1217,7 +1256,7 @@ func (s *trackStore) rejectCatalogSubmission(reviewerUserID, submissionID int64,
 			}
 		}
 		var entity any = item.Snapshot
-		if item.EntityType != catalogSubmissionEntityAlbumTrackOrder {
+		if !isCatalogProposal(item.EntityType) {
 			entity, err = catalogEntityByType(ctx, repositories, item.EntityType, item.EntityID)
 		}
 		if err != nil {
@@ -1234,7 +1273,7 @@ func (s *trackStore) rejectCatalogSubmission(reviewerUserID, submissionID int64,
 			fmt.Sprintf("feedback:%d:penalty", feedback.ID), "review_penalty", -request.RatingPenalty, request.Message, now); err != nil {
 			return err
 		}
-		if item.EntityType != catalogSubmissionEntityAlbumTrackOrder {
+		if !isCatalogProposal(item.EntityType) {
 			stagedFile, err = deleteCatalogSubmissionEntity(ctx, repositories, item.EntityType, item.EntityID)
 		}
 		if errors.Is(err, errCatalogSubmissionDependency) && item.EntityType != catalogSubmissionEntityTrack {
@@ -1294,13 +1333,13 @@ func (s *trackStore) cancelCatalogSubmission(requesterUserID, submissionID int64
 			return errCatalogSubmissionState
 		}
 		var entity any = item.Snapshot
-		if item.EntityType != catalogSubmissionEntityAlbumTrackOrder {
+		if !isCatalogProposal(item.EntityType) {
 			entity, err = catalogEntityByType(ctx, repositories, item.EntityType, item.EntityID)
 		}
 		if err != nil {
 			return err
 		}
-		if item.EntityType != catalogSubmissionEntityAlbumTrackOrder {
+		if !isCatalogProposal(item.EntityType) {
 			stagedFile, err = deleteCatalogSubmissionEntity(ctx, repositories, item.EntityType, item.EntityID)
 		}
 		if err != nil {

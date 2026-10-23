@@ -248,3 +248,39 @@ and album write `trackIds` are rejected; direct reorder and proposals require
 `tracks: [{trackId, trackNumber}]`. Album read `trackIds` remains a derived list.
 The automatic database migration preserves existing relative order as 1..N;
 repair previously incorrect ordering with explicit assignments.
+
+## Synced lyrics and published-track corrections
+
+`submit_track` accepts optional `lyrics` in the same format as `PUT /api/tracks/{id}/lyrics`.
+`update_track_submission` accepts the same field; omitting it preserves existing lyrics.
+Track creation and lyrics validation are atomic: invalid lyrics do not claim the upload or create a track.
+`get_submission`, `list_submissions`, and the reviewer queue include a top-level `lyrics` object for track submissions.
+
+```json
+{
+  "type": "synced",
+  "lines": [
+    {"startMs": 1000, "endMs": 2800, "text": "Example first line"},
+    {"startMs": 3000, "text": "Example final line"}
+  ]
+}
+```
+
+Use sourced lyrics and timestamps. Starts must strictly increase; lines cannot overlap.
+Every line except the last requires `endMs`. Synced lyrics cannot include `plainText`.
+
+For an already published track, use `submit_track_lyrics` with `requestId`, `trackId`,
+and `lyrics` (plain or synced). It creates a `track_lyrics` review proposal without
+changing the track, audio, or current public lyrics. Requires `tracks.submit`.
+After requested changes, call `update_track_lyrics_submission` with `submissionId`,
+`expectedRevision`, and optional replacement `lyrics`, then `resubmit_submission`.
+Updating refreshes the proposal's published baseline. Approval rejects stale proposals
+when published lyrics or the audio path changed. Rejecting or cancelling a proposal
+leaves the published track and lyrics intact. Normal ownership, leases, revisions,
+and persistent request receipts apply. One active proposal per requester and track;
+terminal proposals do not prevent later corrections.
+
+REST equivalents: `POST /api/catalog-submissions/track-lyrics` and
+`PUT /api/catalog-submissions/track-lyrics/{submissionId}`. Reviewers use the normal
+review queue and decision endpoints. The console previews the proposed lyrics
+against the published audio for corrections and staged audio for new tracks.
