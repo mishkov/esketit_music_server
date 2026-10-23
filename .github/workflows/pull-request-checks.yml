@@ -49,6 +49,11 @@ jobs:
       - name: Run static analysis
         run: go vet ./...
 
+      - name: Install the MP3 validator
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+
       - name: Run tests
         run: go test -race -count=1 ./...
 

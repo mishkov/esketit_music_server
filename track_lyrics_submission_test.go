@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -173,6 +174,9 @@ func TestTrackLyricsSubmissionHTTP(t *testing.T) {
 func lyricsTestString(value string) *string { return &value }
 
 func TestMCPSubmitAndPatchSyncedTrackLyrics(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg required for real MP3 validation")
+	}
 	svc, owner := newMCPTestService(t)
 	a, _, artist := trackNumberFixture(t, svc.store)
 	audio, err := os.ReadFile("testdata/mcp-silence.mp3")
