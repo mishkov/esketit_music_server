@@ -172,6 +172,78 @@ func TestTrackNumberSubmissionStaleAndCorrection(t *testing.T) {
 	}
 }
 
+func TestTrackNumberSubmissionReviewMetadataAndBaseCheck(t *testing.T) {
+	for _, action := range []string{"changes", "reject"} {
+		t.Run(action, func(t *testing.T) {
+			s, admin, owner, a, req := orderProposalFixture(t)
+			if _, err := s.db.Exec(`UPDATE albums SET title = ?, cover_image_path = ? WHERE id = ?`, "Blue Sky", "blue-sky.jpg", a.ID); err != nil {
+				t.Fatal(err)
+			}
+			sub, err := s.createAlbumTrackOrderSubmission(owner.ID, req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			view := sub.Entity.(albumTrackOrderSubmissionView)
+			if view.AlbumTitle != "Blue Sky" || view.CoverImagePath != "blue-sky.jpg" || view.Outdated {
+				t.Fatalf("review metadata = %+v", view)
+			}
+			lease, err := s.acquireCatalogReviewLease(admin.ID, owner.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Even an unchanged revision must not hide a changed saved base order.
+			if _, err := s.db.Exec(`UPDATE tracks SET track_number = 99 WHERE id = ?`, a.TrackIDs[0]); err != nil {
+				t.Fatal(err)
+			}
+			// Simulate an external writer that failed to advance the revision.
+			if _, err := s.db.Exec(`UPDATE albums SET order_revision = ? WHERE id = ?`, req.ExpectedOrderRevision, a.ID); err != nil {
+				t.Fatal(err)
+			}
+			queue, err := s.listCatalogReviewSubmissions(admin.ID, owner.ID, lease.LeaseToken)
+			if err != nil || len(queue) != 1 {
+				t.Fatalf("queue = %+v, %v", queue, err)
+			}
+			view = queue[0].Entity.(albumTrackOrderSubmissionView)
+			if !view.Outdated || view.CurrentOrderRevision != view.ExpectedOrderRevision {
+				t.Fatalf("base mismatch not detected: %+v", view)
+			}
+			if _, err := s.approveCatalogSubmission(admin.ID, sub.ID, lease.LeaseToken); !errors.Is(err, errTrackNumberStale) {
+				t.Fatalf("outdated approval = %v", err)
+			}
+			decision := catalogReviewDecisionRequest{Message: "Refresh the album order"}
+			if action == "changes" {
+				_, err = s.requestCatalogSubmissionChanges(admin.ID, sub.ID, lease.LeaseToken, decision)
+			} else {
+				_, err = s.rejectCatalogSubmission(admin.ID, sub.ID, lease.LeaseToken, decision)
+			}
+			if err != nil {
+				t.Fatalf("outdated feedback action = %v", err)
+			}
+		})
+	}
+}
+
+func TestSameTrackNumberAssignments(t *testing.T) {
+	base := []trackNumberAssignment{{1, 1}, {2, 10}}
+	for _, test := range []struct {
+		name    string
+		current []trackNumberAssignment
+		want    bool
+	}{
+		{"array order is irrelevant", []trackNumberAssignment{{2, 10}, {1, 1}}, true},
+		{"changed number", []trackNumberAssignment{{1, 1}, {2, 4}}, false},
+		{"removed track", []trackNumberAssignment{{1, 1}}, false},
+		{"replaced track", []trackNumberAssignment{{1, 1}, {3, 10}}, false},
+		{"duplicate track", []trackNumberAssignment{{1, 1}, {1, 1}}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := sameTrackNumberAssignments(base, test.current); got != test.want {
+				t.Fatalf("got %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestTrackNumberSubmissionValidation(t *testing.T) {
 	s, _, owner, a, req := orderProposalFixture(t)
 	for name, ids := range map[string][]int64{"missing": a.TrackIDs[:2], "duplicate": {a.TrackIDs[0], a.TrackIDs[0], a.TrackIDs[1]}, "foreign": {a.TrackIDs[0], a.TrackIDs[1], 99999}, "nonpositive": {0, a.TrackIDs[1], a.TrackIDs[2]}, "null": nil} {

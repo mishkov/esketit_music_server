@@ -218,10 +218,15 @@ coexist. Filter `list_submissions` by `entityType: album_track_order` and use
 - `currentTracks`, `currentOrderRevision`, `targetAvailable`, and visible
   `trackDetails` summaries (`id`/`name`) for comparison;
 - `appliedOrderRevision` once approved. The saved snapshot remains historical.
+- `albumTitle`, `coverImagePath`, and `outdated` for review presentation. An active
+  proposal is outdated when the album is unavailable, its revision changed, or
+  its saved `baseTracks` no longer matches `currentTracks`. Reviewers can request
+  changes or reject it, but cannot approve it.
 
 Review uses existing reviewer endpoints, permissions, and requester leases;
 there are no new MCP review tools. Approval rechecks current membership and the
-base ordering revision in the same transaction as the order change and decision.
+base track-number assignments and ordering revision in the same transaction as
+the order change and decision.
 If a direct reorder, track insertion/removal, or competing approval made the
 proposal stale, approval returns conflict and leaves it pending and the album
 unchanged. Request changes, fetch the latest album, patch the proposal with fresh
