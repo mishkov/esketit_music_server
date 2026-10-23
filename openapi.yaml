@@ -2435,6 +2435,74 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /api/catalog-submissions/track-lyrics:
+    post:
+      tags: [Catalog submissions]
+      summary: Propose lyrics for a published track
+      description: Requires tracks.submit. Current lyrics and audio remain published until human approval. One active proposal per requester and track. Approval rejects proposals whose published lyrics or audio changed; request changes and refresh the proposal first.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTrackLyricsSubmissionRequest'
+      responses:
+        '201':
+          description: Lyrics proposal submitted for review
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '400':
+          description: Invalid lyrics or track ID
+        '401':
+          description: Authentication required
+        '403':
+          description: Permission denied
+        '404':
+          description: Track not found
+        '409':
+          description: Track is unpublished or an active proposal already exists
+  /api/catalog-submissions/track-lyrics/{id}:
+    put:
+      tags: [Catalog submissions]
+      summary: Update an owned lyrics proposal with requested changes
+      description: Requires catalog_submissions.update_own. ID is a submission ID. Omitted lyrics are preserved. Refreshes the baseline to the current published lyrics and audio. Resubmit through the normal submission workflow.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTrackLyricsSubmissionRequest'
+      responses:
+        '200':
+          description: Updated proposal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '400':
+          description: Invalid lyrics
+        '401':
+          description: Authentication required
+        '403':
+          description: Not owned or permission denied
+        '404':
+          description: Proposal or published track not found
+        '409':
+          description: Stale expectedRevision or invalid workflow state
+
   /api/catalog-submissions/album-track-orders:
     post:
       tags: [Catalog Submissions]
@@ -3620,7 +3688,7 @@ components:
 
     CatalogSubmissionEntityType:
       type: string
-      enum: [author, album, track, album_track_order]
+      enum: [author, album, track, album_track_order, track_lyrics]
 
     CreateAlbumTrackOrderSubmissionRequest:
       type: object
@@ -3667,6 +3735,29 @@ components:
         reason:
           type: string
           maxLength: 1000
+
+    CreateTrackLyricsSubmissionRequest:
+      type: object
+      additionalProperties: false
+      required: [trackId, lyrics]
+      properties:
+        trackId:
+          type: integer
+          format: int64
+          minimum: 1
+        lyrics:
+          $ref: '#/components/schemas/UpsertTrackLyricsRequest'
+    UpdateTrackLyricsSubmissionRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedRevision]
+      properties:
+        expectedRevision:
+          type: integer
+          format: int64
+          minimum: 1
+        lyrics:
+          $ref: '#/components/schemas/UpsertTrackLyricsRequest'
 
     CatalogSubmissionFeedback:
       type: object
@@ -3724,11 +3815,18 @@ components:
           additionalProperties: true
           description: |
             Current author, album, or track; falls back to the snapshot after removal.
+            For track_lyrics, returns trackId, name, audioFilePath, proposed lyrics,
+            baseLyrics, targetAvailable, and isOutdated. Proposal lyrics use the
+            UpsertTrackLyricsRequest format. entityId is the published track ID.
+            For track submissions, the optional top-level lyrics field includes
+            staged plain or synced lyrics for reviewer playback.
             For album_track_order, returns albumId, baseTracks, proposed tracks,
             expectedOrderRevision, reason, optional appliedOrderRevision, targetAvailable,
             currentTracks, currentOrderRevision, and trackDetails summaries (id/name).
             The snapshot retains proposal data independently of current album data;
             entityId is the target album ID and submission id identifies each proposal.
+        lyrics:
+          $ref: '#/components/schemas/TrackLyrics'
         feedback:
           type: array
           items:
@@ -3790,6 +3888,8 @@ components:
     CreateTrackSubmissionRequest:
       type: object
       properties:
+        lyrics:
+          $ref: '#/components/schemas/UpsertTrackLyricsRequest'
         name:
           type: string
           minLength: 1
@@ -3824,6 +3924,8 @@ components:
     UpdateTrackSubmissionRequest:
       type: object
       properties:
+        lyrics:
+          $ref: '#/components/schemas/UpsertTrackLyricsRequest'
         name:
           type: string
           minLength: 1

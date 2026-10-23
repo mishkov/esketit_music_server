@@ -220,54 +220,70 @@ func (s *trackStore) upsertLyricsContextMode(ctx context.Context, trackID int64,
 				return errCatalogSubmissionState
 			}
 		}
-		previous, exists, err := repositories.lyrics.FindByTrackID(ctx, trackID)
+		saved, created, err = saveLyrics(ctx, repositories, trackID, req)
 		if err != nil {
 			return err
 		}
-		now := time.Now().UTC()
-		item := lyrics{
-			TrackID: trackID, Type: normalizeLyricsType(req.Type), PlainText: normalizeOptionalString(req.PlainText),
-			LanguageCode: normalizeOptionalString(req.LanguageCode), Source: normalizeOptionalString(req.Source),
-			IsVerified: req.IsVerified, UpdatedAt: now, CreatedAt: now,
-			Lines: make([]syncedLyricLine, 0, len(req.Lines)),
-		}
-		if exists {
-			item.ID = previous.ID
-			item.CreatedAt = previous.CreatedAt
-		} else {
-			item.ID, err = repositories.metadata.AllocateID(ctx, "next_lyrics_id")
+		if len(submissionRequesterUserID) > 0 {
+			submission, _, err := repositories.submissions.FindByEntity(ctx, catalogSubmissionEntityTrack, trackID)
 			if err != nil {
 				return err
 			}
+			submission.UpdatedAt = time.Now().UTC()
+			return repositories.submissions.UpdateSubmission(ctx, submission)
 		}
-		for index, lineReq := range req.Lines {
-			lineID, err := repositories.metadata.AllocateID(ctx, "next_lyrics_line_id")
-			if err != nil {
-				return err
-			}
-			item.Lines = append(item.Lines, syncedLyricLine{
-				ID: lineID, LyricsID: item.ID, StartMs: lineReq.StartMs, EndMs: cloneOptionalInt(lineReq.EndMs),
-				Text: strings.TrimSpace(lineReq.Text), OrderIndex: index,
-			})
-		}
-		if err := validateLyrics(item); err != nil {
-			return err
-		}
-		if exists {
-			err = repositories.lyrics.Update(ctx, item)
-		} else {
-			err = repositories.lyrics.Insert(ctx, item)
-		}
-		if err != nil {
-			return fmt.Errorf("persist lyrics: %w", err)
-		}
-		saved, created = cloneLyrics(item), !exists
 		return nil
 	})
 	if err != nil {
 		return lyrics{}, false, fmt.Errorf("persist lyrics: %w", err)
 	}
 	return saved, created, nil
+}
+
+// saveLyrics participates in the caller's transaction, including submission creation.
+func saveLyrics(ctx context.Context, repositories domainRepositories, trackID int64, req upsertLyricsRequest) (lyrics, bool, error) {
+	previous, exists, err := repositories.lyrics.FindByTrackID(ctx, trackID)
+	if err != nil {
+		return lyrics{}, false, err
+	}
+	now := time.Now().UTC()
+	item := lyrics{
+		TrackID: trackID, Type: normalizeLyricsType(req.Type), PlainText: normalizeOptionalString(req.PlainText),
+		LanguageCode: normalizeOptionalString(req.LanguageCode), Source: normalizeOptionalString(req.Source),
+		IsVerified: req.IsVerified, UpdatedAt: now, CreatedAt: now,
+		Lines: make([]syncedLyricLine, 0, len(req.Lines)),
+	}
+	if exists {
+		item.ID = previous.ID
+		item.CreatedAt = previous.CreatedAt
+	} else {
+		item.ID, err = repositories.metadata.AllocateID(ctx, "next_lyrics_id")
+		if err != nil {
+			return lyrics{}, false, err
+		}
+	}
+	for index, lineReq := range req.Lines {
+		lineID, err := repositories.metadata.AllocateID(ctx, "next_lyrics_line_id")
+		if err != nil {
+			return lyrics{}, false, err
+		}
+		item.Lines = append(item.Lines, syncedLyricLine{
+			ID: lineID, LyricsID: item.ID, StartMs: lineReq.StartMs, EndMs: cloneOptionalInt(lineReq.EndMs),
+			Text: strings.TrimSpace(lineReq.Text), OrderIndex: index,
+		})
+	}
+	if err := validateLyrics(item); err != nil {
+		return lyrics{}, false, err
+	}
+	if exists {
+		err = repositories.lyrics.Update(ctx, item)
+	} else {
+		err = repositories.lyrics.Insert(ctx, item)
+	}
+	if err != nil {
+		return lyrics{}, false, fmt.Errorf("persist lyrics: %w", err)
+	}
+	return cloneLyrics(item), !exists, nil
 }
 
 func (s *trackStore) deleteLyrics(trackID int64) error {

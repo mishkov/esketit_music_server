@@ -76,6 +76,10 @@ type albumTrackOrderSubmissionView struct {
 // Rebuild the parent table without losing feedback, rating links or claimed MCP
 // uploads. Foreign keys remain enabled throughout this transactional migration.
 func migrateAlbumTrackOrderSubmissions(ctx context.Context, tx *sql.Tx) error {
+	return rebuildProposalSubmissions(ctx, tx, false)
+}
+
+func rebuildProposalSubmissions(ctx context.Context, tx *sql.Tx, includeLyrics bool) error {
 	statements := []string{
 		`CREATE TABLE catalog_submissions_new (
 		 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,10 +111,21 @@ func migrateAlbumTrackOrderSubmissions(ctx context.Context, tx *sql.Tx) error {
 		`CREATE INDEX idx_catalog_submissions_review_queue ON catalog_submissions(status,requester_user_id,submitted_at,id)`,
 		`CREATE INDEX idx_mcp_submissions_requester_updated ON catalog_submissions(requester_user_id,updated_at DESC,id DESC)`,
 	}
+	if includeLyrics {
+		for i, statement := range statements {
+			statement = strings.ReplaceAll(statement, "'track','album_track_order'", "'track','album_track_order','track_lyrics'")
+			statement = strings.ReplaceAll(statement, "WHERE entity_type != 'album_track_order'", "WHERE entity_type NOT IN ('album_track_order','track_lyrics')")
+			statements[i] = statement
+		}
+		statements = append(statements, `CREATE UNIQUE INDEX idx_track_lyrics_active ON catalog_submissions(requester_user_id,entity_id) WHERE entity_type = 'track_lyrics' AND status IN ('pending_review','changes_requested')`)
+	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return err
 		}
+	}
+	if includeLyrics {
+		return nil
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO permissions(code,description,created_at) VALUES(?,?,?)`, permissionAlbumsSubmitTrackOrder, "Propose album track order changes for review", formatSQLiteTime(time.Now().UTC())); err != nil {
 		return err
