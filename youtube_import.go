@@ -1704,7 +1704,11 @@ func (s *youtubeImportService) downloadCurrentToSongs(ctx context.Context, index
 			s.removeActiveFile(stagingPath, "remove staged audio file"),
 		)
 	}
-	if err := s.transcodeToMP3(operationCtx, tempSourcePath, stagingPath); err != nil {
+	preparationError := s.transcodeToMP3(operationCtx, tempSourcePath, stagingPath)
+	if preparationError == nil {
+		preparationError = validateMP3Audio(operationCtx, stagingPath)
+	}
+	if err := preparationError; err != nil {
 		return nil, errors.Join(
 			err,
 			s.removeActiveFile(tempSourcePath, "remove temporary audio file"),
@@ -1746,7 +1750,7 @@ func (s *youtubeImportService) transcodeToMP3(ctx context.Context, sourcePath, t
 		return youtubeStageError(errYouTubeTranscodeFailed, "ffmpeg lookup", dependencyErr)
 	}
 	args := []string{
-		"-y",
+		"-nostdin", "-y", "-v", "error", "-xerror", "-err_detect", "explode",
 		"-i", sourcePath,
 		"-vn",
 		"-codec:a", "libmp3lame",
@@ -3488,6 +3492,9 @@ func writeYouTubeImportError(w http.ResponseWriter, r *http.Request, err error, 
 	captureErr := sanitizeYouTubeCapturedError(err)
 	if hasYouTubeCleanupError(err) {
 		captureSentryError(r.Context(), captureErr, "youtube", operation)
+	}
+	if writeAudioValidationError(w, r, err, operation) {
+		return
 	}
 	switch {
 	case errors.Is(err, context.Canceled):

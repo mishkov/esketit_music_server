@@ -1252,7 +1252,11 @@ func newYouTubeImportTestService(t *testing.T, gateway youtubeImportGateway) (*y
 	}
 
 	ffmpegPath := filepath.Join(root, "fake-ffmpeg.sh")
-	ffmpegScript := "#!/bin/sh\nIN=\nOUT=\nPREV=\nfor ARG in \"$@\"; do\n  if [ \"$PREV\" = \"-i\" ]; then IN=\"$ARG\"; fi\n  OUT=\"$ARG\"\n  PREV=\"$ARG\"\ndone\ncp \"$IN\" \"$OUT\"\n"
+	fixturePath := filepath.Join(t.TempDir(), "fixture.mp3")
+	if err := os.WriteFile(fixturePath, validMP3TestAudio(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ffmpegScript := "#!/bin/sh\nfor argument in \"$@\"; do target=$argument; done\ncp '" + strings.ReplaceAll(fixturePath, "'", "'\"'\"'") + "' \"$target\"\n"
 	if err := os.WriteFile(ffmpegPath, []byte(ffmpegScript), 0o755); err != nil {
 		t.Fatalf("WriteFile(%s) error = %v", ffmpegPath, err)
 	}

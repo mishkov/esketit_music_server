@@ -338,7 +338,11 @@ func (g *blockingYouTubeMutationGateway) DownloadAudio(ctx context.Context, _ yo
 func installPassingYouTubeFFmpeg(t *testing.T, service *youtubeImportService) {
 	t.Helper()
 	binaryPath := filepath.Join(t.TempDir(), "fake-ffmpeg.sh")
-	script := "#!/bin/sh\nfor arg in \"$@\"; do target=$arg; done\nprintf 'mp3 audio' > \"$target\"\n"
+	fixturePath := filepath.Join(t.TempDir(), "fixture.mp3")
+	if err := os.WriteFile(fixturePath, validMP3TestAudio(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\nfor argument in \"$@\"; do target=$argument; done\ncp '" + strings.ReplaceAll(fixturePath, "'", "'\"'\"'") + "' \"$target\"\n"
 	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(%s) error = %v", binaryPath, err)
 	}

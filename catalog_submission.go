@@ -1207,8 +1207,10 @@ func (s *trackStore) publishStagedAudioToLibrary(upload catalogSubmissionUpload)
 		return "", "", "", errors.New("songs directory is not configured")
 	}
 	sourcePath := s.catalogSubmissionAudioPath(upload.StoredFileName)
+	// The stored extension comes from validated audio, not the client filename.
+	originalBase := strings.TrimSuffix(upload.OriginalName, filepath.Ext(upload.OriginalName))
 	for attempt := 0; attempt < 10; attempt++ {
-		name, err := randomizedStoredFileName(upload.OriginalName)
+		name, err := randomizedStoredFileName(originalBase + filepath.Ext(upload.StoredFileName))
 		if err != nil {
 			return "", "", "", err
 		}

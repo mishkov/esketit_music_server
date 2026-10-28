@@ -134,7 +134,18 @@ curl --fail-with-body \
 Exactly one `kind` text field and one `file` binary part are accepted.
 Kinds: audio, author_photo, album_cover. Audio supports MP3 up to 512 MiB;
 validation checks MP3 format and uses `FFMPEG_BINARY` (default ffmpeg) to decode
-the complete stream, with a five-minute validation deadline. Images accept
+the complete stream, with a five-minute validation deadline. The same validation
+also applies to regular song uploads and review-submission audio. Accepted audio
+keeps its original name in metadata, while stored and published filenames use
+`.mp3` so streaming responses have `audio/mpeg`. Corrupt audio is rejected before
+any upload token is registered. If FFmpeg is unavailable, uploads return 503 and
+can be retried; this is not reported as invalid input.
+
+Telegram imports automatically convert supported non-MP3 audio to validated MP3
+and normalize filenames, preserving valid MP3 bytes without re-encoding. YouTube
+imports validate their transcoded MP3 output before publication.
+
+Images accept
 JPEG/PNG/GIF up to 10 MiB and 4096 × 4096 pixels, and are re-encoded to strip
 metadata/trailing data (GIF becomes static PNG). Author submissions accept up
 to ten photos; albums accept one cover. The total multipart body is bounded by

@@ -314,11 +314,11 @@ func serveCatalogSubmissionAudioHandler(store *trackStore) http.HandlerFunc {
 			writeCatalogSubmissionError(w, r, err, "catalog_submissions.audio.read")
 			return
 		}
-		serveCatalogSubmissionAudioFile(w, r, store.catalogSubmissionAudioPath(upload.StoredFileName), upload.OriginalName)
+		serveCatalogSubmissionAudioFile(w, r, store.catalogSubmissionAudioPath(upload.StoredFileName))
 	}
 }
 
-func serveCatalogSubmissionAudioFile(w http.ResponseWriter, r *http.Request, path, displayName string) {
+func serveCatalogSubmissionAudioFile(w http.ResponseWriter, r *http.Request, path string) {
 	songsMutationMu.RLock()
 	file, err := os.Open(path)
 	if err != nil {
@@ -342,7 +342,8 @@ func serveCatalogSubmissionAudioFile(w http.ResponseWriter, r *http.Request, pat
 		http.NotFound(w, r)
 		return
 	}
-	http.ServeContent(w, r, displayName, info.ModTime(), file)
+	// Use the validated stored format even when the original filename has no extension.
+	http.ServeContent(w, r, filepath.Base(path), info.ModTime(), file)
 }
 
 func listCatalogReviewRequestersHandler(store *trackStore) http.HandlerFunc {

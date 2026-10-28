@@ -3180,6 +3180,16 @@ func uploadMediaFile(w http.ResponseWriter, r *http.Request, dir, createFailureM
 		return albumCoverInfo{}, err
 	}
 	originalName := name
+	if urlPrefix == "/api/songs/" || urlPrefix == "/api/catalog-submissions/audio/" {
+		if err := validateUploadedMP3(r.Context(), file); err != nil {
+			var invalid invalidAudioError
+			if errors.As(err, &invalid) || errors.Is(err, errAudioValidatorUnavailable) {
+				return albumCoverInfo{}, err
+			}
+			return albumCoverInfo{}, uploadError{message: "failed to process uploaded file", cause: err}
+		}
+		name = mp3UploadFileName(name)
+	}
 	if urlPrefix == "/api/songs/" {
 		songsMutationMu.Lock()
 		defer songsMutationMu.Unlock()
@@ -3302,6 +3312,9 @@ func randomFileNameToken(size int) (string, error) {
 }
 
 func writeUploadError(w http.ResponseWriter, r *http.Request, err error, operation string) {
+	if writeAudioValidationError(w, r, err, operation) {
+		return
+	}
 	switch err.Error() {
 	case "invalid multipart form", "file is required", "uploaded filename is required", "invalid song name", "uploaded file is empty":
 		http.Error(w, err.Error(), http.StatusBadRequest)
