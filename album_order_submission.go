@@ -82,7 +82,7 @@ func migrateAlbumTrackOrderSubmissions(ctx context.Context, tx *sql.Tx) error {
 	return rebuildProposalSubmissions(ctx, tx, false)
 }
 
-func rebuildProposalSubmissions(ctx context.Context, tx *sql.Tx, includeLyrics bool) error {
+func rebuildProposalSubmissions(ctx context.Context, tx *sql.Tx, includeLyrics bool, includeTrackUpdates ...bool) error {
 	statements := []string{
 		`CREATE TABLE catalog_submissions_new (
 		 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,6 +121,13 @@ func rebuildProposalSubmissions(ctx context.Context, tx *sql.Tx, includeLyrics b
 			statements[i] = statement
 		}
 		statements = append(statements, `CREATE UNIQUE INDEX idx_track_lyrics_active ON catalog_submissions(requester_user_id,entity_id) WHERE entity_type = 'track_lyrics' AND status IN ('pending_review','changes_requested')`)
+	}
+	if len(includeTrackUpdates) > 0 && includeTrackUpdates[0] {
+		for i, statement := range statements {
+			statement = strings.ReplaceAll(statement, "'album_track_order','track_lyrics'", "'album_track_order','track_lyrics','track_update'")
+			statements[i] = statement
+		}
+		statements = append(statements, "CREATE UNIQUE INDEX idx_track_update_active ON catalog_submissions(requester_user_id,entity_id) WHERE entity_type = 'track_update' AND status IN ('pending_review','changes_requested')")
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {

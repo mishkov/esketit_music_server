@@ -284,3 +284,59 @@ REST equivalents: `POST /api/catalog-submissions/track-lyrics` and
 `PUT /api/catalog-submissions/track-lyrics/{submissionId}`. Reviewers use the normal
 review queue and decision endpoints. The console previews the proposed lyrics
 against the published audio for corrections and staged audio for new tracks.
+
+
+## Changes to published tracks
+
+Use `submit_track_update` to propose a correction to any published track.
+It requires `tracks.submit`, not direct catalog-edit permission. The published
+track, audio, playlists and lyrics remain live until human approval.
+
+Search and inspect the track first. Supply `trackId` and any changed fields:
+`name`, `authorIds`, `albumId`, `trackNumber`, `additionalInfo`,
+`sourceMetadata`, `lyrics` or `audioUploadToken`. Identity, creation time and
+publication/review state are immutable. Changing albums requires an explicit
+destination number; occupied numbers are rejected. Retain original source
+identifiers when adding replacement provenance.
+
+Omitted fields are preserved. Empty metadata arrays clear those lists.
+`lyrics: null` removes lyrics. Upload replacement audio to
+`POST /api/mcp/uploads` first and pass its owned unused token; remote URLs and
+file paths are not accepted. An empty `audioUploadToken` on a correction
+removes a proposed replacement and uses the baseline audio. Tokens are
+consumed once and cannot be reused through the legacy submission API.
+
+Example MCP arguments:
+
+```json
+{
+  "requestId": "replace-track-2981-audio",
+  "trackId": 2981,
+  "audioUploadToken": "<owned-upload-token>",
+  "reason": "Replace compressed audio with the verified studio recording."
+}
+```
+
+The `track_update` submission retains `before`, `after`, `changedFields` and
+`reason`. Its current view adds `current`, `targetAvailable`, `isOutdated`,
+and artist/album names. The console compares both versions with separate
+authenticated audio players.
+
+Approval checks the published track and lyrics against the captured baseline.
+A changed/deleted target, newly occupied number or unavailable dependency
+prevents approval. After reviewer feedback, inspect `before`, `after` and
+`current`, then call `update_track_update_submission` using the fresh
+`expectedRevision`. Set `refreshBaseline: true` only after reviewing concurrent
+changes: rebasing copies only proposed changed fields onto the latest data.
+Then call `resubmit_submission`. Ownership, review leases, feedback,
+cancellation and idempotent request rules are unchanged. Rejection and
+cancellation discard private audio while retaining comparison history.
+
+Equivalent REST endpoints (authenticated user, no `requestId` field):
+
+- `POST /api/catalog-submissions/track-updates`
+- `PUT /api/catalog-submissions/track-updates/{submissionId}`
+- `GET /api/catalog-submissions/track-updates/{submissionId}/audio` (private
+  preview with range support; reviewers send a valid `X-Review-Lease`)
+
+Requires schema migration 14 and the matching console version.
