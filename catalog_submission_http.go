@@ -455,6 +455,11 @@ func parseCatalogReviewSubmissionID(path, action string) (int64, error) {
 }
 
 func writeCatalogSubmissionError(w http.ResponseWriter, r *http.Request, err error, operation string) {
+	var problem *mcpProblem
+	if errors.As(err, &problem) {
+		http.Error(w, err.Error(), mcpHTTPStatus(err))
+		return
+	}
 	switch {
 	case errors.Is(err, errTrackNumberConflict), errors.Is(err, errTrackNumberStale), errors.Is(err, errTrackNumberState), errors.Is(err, errTrackNumberHidden), errors.Is(err, errMCPStaleRevision), errors.Is(err, errCatalogSubmissionState):
 		http.Error(w, err.Error(), http.StatusConflict)
