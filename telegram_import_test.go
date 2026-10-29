@@ -123,7 +123,7 @@ func TestTelegramImportSessionConflictAndSkipReport(t *testing.T) {
 				ParsedTitle: "Artist - Second",
 			},
 		},
-		downloadData: []byte("mp3-bytes"),
+		downloadData: validMP3TestAudio(t),
 	})
 
 	ctx := context.Background()
@@ -184,7 +184,7 @@ func TestTelegramImportSaveCurrentPromotesFileAndCreatesTrack(t *testing.T) {
 				ParsedTitle: "Save Me",
 			},
 		},
-		downloadData: []byte("audio-data"),
+		downloadData: validMP3TestAudio(t),
 	})
 
 	artist, album := seedTrackDependencies(t, store)
@@ -264,7 +264,7 @@ func TestTelegramPublicationDatabaseFailureRollsBackAndRemovesPromotedFile(t *te
 			MessageID: 31, MessageLink: "https://t.me/test_channel/31", FileName: "rollback.mp3",
 			MimeType: "audio/mpeg", SizeBytes: 123, ParsedTitle: "Rollback",
 		}},
-		downloadData: []byte("audio-data"),
+		downloadData: validMP3TestAudio(t),
 	})
 	t.Cleanup(func() { _ = service.Close() })
 	t.Cleanup(func() { _ = store.db.Close() })
@@ -413,7 +413,7 @@ func TestTelegramImportCancelCleansTempFiles(t *testing.T) {
 				ParsedTitle: "Cancel",
 			},
 		},
-		downloadData: []byte("audio-data"),
+		downloadData: validMP3TestAudio(t),
 	})
 
 	ctx := context.Background()
@@ -507,7 +507,7 @@ func TestTelegramImportStartSessionFiltersFromMessageIDInclusive(t *testing.T) {
 				ParsedTitle: "Third",
 			},
 		},
-		downloadData: []byte("mp3-bytes"),
+		downloadData: validMP3TestAudio(t),
 	}
 	service, _, _, _ := newTelegramImportTestService(t, gateway)
 
@@ -952,7 +952,7 @@ func TestTelegramConcurrentCurrentSessionDownloadsTrackOnce(t *testing.T) {
 	release := func() { releaseOnce.Do(func() { close(releaseDownload) }) }
 	defer release()
 	gateway := &controlledTelegramGateway{
-		fakeTelegramGateway: &fakeTelegramGateway{downloadData: []byte("audio")},
+		fakeTelegramGateway: &fakeTelegramGateway{downloadData: validMP3TestAudio(t)},
 		scanBatches:         [][]telegramScannedTrack{{item}},
 		blockDownloadCall:   2,
 		downloadStarted:     make(chan struct{}),
@@ -1016,7 +1016,7 @@ func TestTelegramSaveSerializesReplacementSession(t *testing.T) {
 	release := func() { releaseOnce.Do(func() { close(releaseDownload) }) }
 	defer release()
 	gateway := &controlledTelegramGateway{
-		fakeTelegramGateway: &fakeTelegramGateway{downloadData: []byte("audio")},
+		fakeTelegramGateway: &fakeTelegramGateway{downloadData: validMP3TestAudio(t)},
 		scanBatches:         [][]telegramScannedTrack{{oldItem}, {newItem}},
 		blockDownloadCall:   2,
 		downloadStarted:     make(chan struct{}),
@@ -1289,7 +1289,11 @@ func (g *sequencedTelegramGateway) DownloadTrack(_ context.Context, _ telegramSc
 	if err := os.MkdirAll(filepath.Dir(destinationPath), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(destinationPath, []byte("audio"), 0o644)
+	data, err := os.ReadFile("testdata/mcp-silence.mp3")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(destinationPath, data, 0o644)
 }
 
 func TestTelegramReplacementIsAtomicWhenInitialDownloadFails(t *testing.T) {
@@ -1336,7 +1340,7 @@ func TestTelegramReplacementIsAtomicWhenInitialDownloadFails(t *testing.T) {
 func TestTelegramAudioLeaseSurvivesConcurrentCancel(t *testing.T) {
 	service, _, _, _ := newTelegramImportTestService(t, &fakeTelegramGateway{
 		scannedItems: []telegramScannedTrack{{MessageID: 1, FileName: "leased.mp3", MimeType: "audio/mpeg"}},
-		downloadData: []byte("leased audio"),
+		downloadData: validMP3TestAudio(t),
 	})
 	ctx := context.Background()
 	if _, err := service.StartSession(ctx, 1, "channel", 0, false); err != nil {
@@ -1354,8 +1358,8 @@ func TestTelegramAudioLeaseSurvivesConcurrentCancel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadAll(open lease) error = %v", err)
 	}
-	if got := string(data); got != "leased audio" {
-		t.Fatalf("leased audio = %q", got)
+	if !bytes.Equal(data, validMP3TestAudio(t)) {
+		t.Fatal("leased audio content changed")
 	}
 }
 
@@ -1383,7 +1387,7 @@ func TestTelegramPendingLoginExpires(t *testing.T) {
 func TestTelegramCompletedSessionExpiresAndOperationLockIsEvicted(t *testing.T) {
 	service, _, _, _ := newTelegramImportTestService(t, &fakeTelegramGateway{
 		scannedItems: []telegramScannedTrack{{MessageID: 1, FileName: "done.mp3", MimeType: "audio/mpeg"}},
-		downloadData: []byte("audio"),
+		downloadData: validMP3TestAudio(t),
 	})
 	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
 	service.now = func() time.Time { return now }
@@ -1419,7 +1423,7 @@ func TestTelegramCompletedSessionExpiresAndOperationLockIsEvicted(t *testing.T) 
 func TestTelegramSkippedReportEvictsCompletedSession(t *testing.T) {
 	service, _, _, _ := newTelegramImportTestService(t, &fakeTelegramGateway{
 		scannedItems: []telegramScannedTrack{{MessageID: 1, FileName: "done.mp3", MimeType: "audio/mpeg"}},
-		downloadData: []byte("audio"),
+		downloadData: validMP3TestAudio(t),
 	})
 	ctx := context.Background()
 	if _, err := service.StartSession(ctx, 1, "channel", 0, false); err != nil {
@@ -1445,7 +1449,7 @@ func TestTelegramSkippedReportEvictsCompletedSession(t *testing.T) {
 func TestTelegramCloseCleansSessionsPendingSecretsAndLocks(t *testing.T) {
 	service, _, _, tempRoot := newTelegramImportTestService(t, &fakeTelegramGateway{
 		scannedItems: []telegramScannedTrack{{MessageID: 1, FileName: "active.mp3", MimeType: "audio/mpeg"}},
-		downloadData: []byte("audio"),
+		downloadData: validMP3TestAudio(t),
 	})
 	ctx := context.Background()
 	for _, userID := range []int64{1, 2} {

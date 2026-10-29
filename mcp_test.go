@@ -227,8 +227,8 @@ func TestMCPAudioAlbumAndApproval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	audio := uploadMCP(t, s, "audio", "audio-1", "recording.mp3", mp3)
-	retry := uploadMCP(t, s, "audio", "audio-1", "recording.mp3", mp3)
+	audio := uploadMCP(t, s, "audio", "audio-1", "recording", mp3)
+	retry := uploadMCP(t, s, "audio", "audio-1", "recording", mp3)
 	if audio["uploadToken"] != retry["uploadToken"] {
 		t.Fatal("upload retry created new token")
 	}
@@ -242,7 +242,7 @@ func TestMCPAudioAlbumAndApproval(t *testing.T) {
 	} else {
 		t.Fatal("fixture has no encoder tag")
 	}
-	if rec := mcpUploadRequest(t, s, "audio", "audio-1", "recording.mp3", changed); rec.Code != 409 {
+	if rec := mcpUploadRequest(t, s, "audio", "audio-1", "recording", changed); rec.Code != 409 {
 		t.Fatalf("different upload: %d %s", rec.Code, rec.Body.String())
 	}
 	author := callMCP(t, s, "submit_author", map[string]any{"requestId": "author", "currentName": "Artist"})
@@ -282,6 +282,9 @@ func TestMCPAudioAlbumAndApproval(t *testing.T) {
 		t.Fatalf("final=%v", final)
 	}
 	path := final["entity"].(map[string]any)["audioFilePath"].(string)
+	if filepath.Ext(path) != ".mp3" {
+		t.Fatalf("approved audio lost MP3 extension: %s", path)
+	}
 	if _, err := os.Stat(filepath.Join(s.store.songsDir, filepath.Base(path))); err != nil {
 		t.Fatal("approved audio missing", err)
 	}

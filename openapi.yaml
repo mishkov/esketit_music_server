@@ -195,8 +195,12 @@ paths:
         Upload a song file and receive a `/api/songs/{name}` URL that can be stored in
         track `audioFilePath`.
 
-        The server preserves the original extension but rewrites the stored filename
-        by appending a random suffix before the extension.
+        Only MP3 audio that passes format inspection and complete decoding is accepted.
+        Filenames and client Content-Type headers are not trusted as validation.
+        Accepted files receive a randomized `.mp3` filename, including valid MP3s
+        uploaded without an extension. The original filename remains in the metadata.
+        `FFMPEG_BINARY` (default `ffmpeg`) is required; validation failure returns 400,
+        while an unavailable validator returns 503 without accepting the file.
 
         Song files are managed separately from track records. Updating or deleting a
         track does not remove any previously uploaded file from song storage.
@@ -223,6 +227,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '500':
           $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '507':
           $ref: '#/components/responses/InsufficientStorage'
 
@@ -311,8 +317,12 @@ paths:
         Upload an album cover file. The returned file can later be referenced from album
         or playlist `coverImagePath`. Preferred write format is `/api/album-covers/{name}`.
 
-        The server preserves the original extension but rewrites the stored filename
-        by appending a random suffix before the extension.
+        Only MP3 audio that passes format inspection and complete decoding is accepted.
+        Filenames and client Content-Type headers are not trusted as validation.
+        Accepted files receive a randomized `.mp3` filename, including valid MP3s
+        uploaded without an extension. The original filename remains in the metadata.
+        `FFMPEG_BINARY` (default `ffmpeg`) is required; validation failure returns 400,
+        while an unavailable validator returns 503 without accepting the file.
       security:
         - bearerAuth: []
       requestBody:
@@ -470,8 +480,12 @@ paths:
         Upload an author photo file. The returned `url` can later be stored in an
         author's `photos` array.
 
-        The server preserves the original extension but rewrites the stored filename
-        by appending a random suffix before the extension.
+        Only MP3 audio that passes format inspection and complete decoding is accepted.
+        Filenames and client Content-Type headers are not trusted as validation.
+        Accepted files receive a randomized `.mp3` filename, including valid MP3s
+        uploaded without an extension. The original filename remains in the metadata.
+        `FFMPEG_BINARY` (default `ffmpeg`) is required; validation failure returns 400,
+        while an unavailable validator returns 503 without accepting the file.
       security:
         - bearerAuth: []
       requestBody:
@@ -2038,6 +2052,9 @@ paths:
       summary: Start a Telegram import session
       description: |
         Scan a public Telegram channel for audio tracks and start an import session.
+        Downloads are validated before preview or publication. Valid MP3 bytes are preserved
+        and published with a `.mp3` extension. Other supported audio formats are automatically
+        converted to MP3 and fully validated; corrupt or unconvertible audio is rejected.
 
         When `startMessageId` is provided, only tracks from that Telegram message ID
         and newer are included in the session.
@@ -2074,6 +2091,7 @@ paths:
       description: |
         Resolve a YouTube or YouTube Music track, playlist, or artist/channel URL
         into a reviewable import session.
+        Transcoded MP3 output must pass complete decoding before publication.
       security:
         - bearerAuth: []
       requestBody:
@@ -2298,7 +2316,11 @@ paths:
     post:
       tags: [Catalog submissions]
       summary: Stage audio for a track submission
-      description: Requires `tracks.submit`. The returned token is single-use and can only be claimed by its owner.
+      description: |
+        Requires `tracks.submit`. The returned token is single-use and can only be claimed by its owner.
+        MP3 format inspection and complete decoding must succeed before a token is registered.
+        Valid uploads are stored with a `.mp3` extension through preview and publication.
+        Invalid audio returns 400; an unavailable validator returns 503. Rejected files are removed.
       security:
         - bearerAuth: []
       requestBody:
@@ -2324,6 +2346,8 @@ paths:
           $ref: '#/components/responses/PayloadTooLarge'
         '500':
           $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         '507':
           $ref: '#/components/responses/InsufficientStorage'
 

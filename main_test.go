@@ -1931,7 +1931,7 @@ func TestUploadSongHandlerRandomizesStoredFileName(t *testing.T) {
 	handler := uploadSongHandler(songsDir)
 
 	rec := httptest.NewRecorder()
-	req := newMultipartUploadRequest(t, http.MethodPost, "/api/songs", "demo track.mp3", []byte("mp3-data"))
+	req := newMultipartUploadRequest(t, http.MethodPost, "/api/songs", "demo track.mp3", validMP3TestAudio(t))
 
 	handler.ServeHTTP(rec, req)
 

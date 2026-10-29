@@ -574,7 +574,7 @@ func serveTrackUpdateAudioHandler(store *trackStore) http.HandlerFunc {
 			return
 		}
 		w.Header().Set("Cache-Control", "private, no-store")
-		serveCatalogSubmissionAudioFile(w, r, store.catalogSubmissionAudioPath(upload.StoredFileName), upload.OriginalName)
+		serveCatalogSubmissionAudioFile(w, r, store.catalogSubmissionAudioPath(upload.StoredFileName))
 	}
 }
 

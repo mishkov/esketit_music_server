@@ -1472,7 +1472,7 @@ func (s *telegramImportService) currentAudioPath(ctx context.Context, userID int
 	if err != nil {
 		return "", "", err
 	}
-	return path, item.FileName, nil
+	return path, mp3UploadFileName(item.FileName), nil
 }
 
 func (s *telegramImportService) SkippedReport(userID int64) ([]byte, error) {
@@ -1625,6 +1625,9 @@ func (s *telegramImportService) downloadTempFile(ctx context.Context, session *t
 	if downloadErr == nil {
 		downloadErr = validateTelegramDownloadedFile(targetPath)
 	}
+	if downloadErr == nil {
+		downloadErr = normalizeImportedMP3(ctx, targetPath)
+	}
 	if downloadErr != nil {
 		err := downloadErr
 		if cleanupErr := removeFileIfExists(targetPath); cleanupErr != nil {
@@ -1670,6 +1673,8 @@ func (s *telegramImportService) promoteTempFile(tempPath, originalFileName strin
 	if err != nil {
 		fileName = "telegram-track.bin"
 	}
+
+	fileName = mp3UploadFileName(fileName)
 
 	input, err := os.Open(tempPath)
 	if err != nil {
@@ -2050,6 +2055,9 @@ func writeTelegramError(w http.ResponseWriter, r *http.Request, err error, opera
 	captureErr := sanitizeTelegramCapturedError(err)
 	if hasTelegramCleanupError(err) {
 		captureSentryError(r.Context(), captureErr, "telegram", operation)
+	}
+	if writeAudioValidationError(w, r, err, operation) {
+		return
 	}
 	switch {
 	case errors.Is(err, context.Canceled):

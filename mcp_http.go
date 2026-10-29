@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -43,6 +42,10 @@ func writeMCPHTTPError(w http.ResponseWriter, err error, status int) {
 	writeJSON(w, status, mcpEnvelope{OK: false, Error: mcpError(err)})
 }
 func mcpHTTPStatus(err error) int {
+	var problem *mcpProblem
+	if errors.As(err, &problem) && problem.Code == "media_validator_unavailable" {
+		return http.StatusServiceUnavailable
+	}
 	switch {
 	case errors.Is(err, errMCPForbidden), errors.Is(err, errTrackNumberForbidden):
 		return http.StatusForbidden
@@ -550,65 +553,18 @@ func (s *mcpService) uploadHandler() http.HandlerFunc {
 	}
 }
 
-// Check MP3 format and decode the complete stream with the existing ffmpeg
-// dependency. Do not trust a filename, MIME header, or an ID3 tag alone.
+// Preserve the MCP error contract while sharing validation with HTTP uploads.
 func validateMCPMP3(ctx context.Context, path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return errRepositoryPersistence
+	err := validateMP3Audio(ctx, path)
+	if err == nil {
+		return nil
 	}
-	defer f.Close()
-	probe := make([]byte, 64<<10)
-	n, err := f.Read(probe)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return errRepositoryPersistence
+	var invalid invalidAudioError
+	if errors.As(err, &invalid) {
+		return mcpInvalid("file", invalid.Error())
 	}
-	probe = probe[:n]
-	offset := 0
-	if len(probe) >= 10 && string(probe[:3]) == "ID3" {
-		for _, v := range probe[6:10] {
-			if v&0x80 != 0 {
-				return mcpInvalid("file", "invalid MP3 ID3 header")
-			}
-		}
-		offset = 10 + (int(probe[6]) << 21) + (int(probe[7]) << 14) + (int(probe[8]) << 7) + int(probe[9])
-		if probe[5]&0x10 != 0 {
-			offset += 10
-		}
-		if _, err := f.Seek(int64(offset), io.SeekStart); err != nil {
-			return mcpInvalid("file", "invalid MP3 header")
-		}
-		probe = make([]byte, 64<<10)
-		n, _ = f.Read(probe)
-		probe = probe[:n]
+	if errors.Is(err, errAudioValidatorUnavailable) {
+		return &mcpProblem{Code: "media_validator_unavailable", Message: "The MP3 validator is unavailable.", Fields: []string{}, Retryable: true, Recovery: "Ask the administrator to check FFMPEG_BINARY, then retry the same upload."}
 	}
-	isMP3 := false
-	for i := 0; i+4 <= len(probe); i++ {
-		a, b, c := probe[i], probe[i+1], probe[i+2]
-		if a == 0xff && b&0xe0 == 0xe0 && b&0x18 != 0x08 && b&0x06 == 0x02 && c&0xf0 != 0 && c&0xf0 != 0xf0 && c&0x0c != 0x0c {
-			isMP3 = true
-			break
-		}
-	}
-	if !isMP3 {
-		return mcpInvalid("file", "file must contain MP3 audio")
-	}
-	binary := strings.TrimSpace(os.Getenv("FFMPEG_BINARY"))
-	if binary == "" {
-		binary = "ffmpeg"
-	}
-	decodeCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
-	command := exec.CommandContext(decodeCtx, binary, "-nostdin", "-v", "error", "-xerror", "-f", "mp3", "-i", path, "-map", "0:a:0", "-f", "null", "-")
-	if err := command.Run(); err != nil {
-		if decodeCtx.Err() != nil {
-			return decodeCtx.Err()
-		}
-		var missing *exec.Error
-		if errors.As(err, &missing) {
-			return &mcpProblem{Code: "media_validator_unavailable", Message: "The MP3 validator is unavailable.", Fields: []string{}, Retryable: true, Recovery: "Ask the administrator to check FFMPEG_BINARY, then retry the same upload."}
-		}
-		return mcpInvalid("file", "MP3 audio could not be decoded completely; download a valid recording and retry with a new Idempotency-Key")
-	}
-	return nil
+	return errRepositoryPersistence
 }
