@@ -241,8 +241,8 @@ func mcpToolSpecs() []mcpToolSpec {
 	specs := []mcpToolSpec{
 		{"get_context", "Read acting identity, permissions, editable workflow/upload guidance, upload limits and server-enforced rules. Call at session start.", schema(map[string]any{}), false},
 		{"search_catalog", "Find candidate matches among published entities and the acting user's pending entities. Search before creating; inspect IDs and relationships to confirm matches.", schema(map[string]any{"query": text("Case-insensitive substring search."), "entityType": kind, "page": page, "pageSize": pageSize}, "query"), false},
-		{"get_catalog_item", "Read a visible author, album or track and its relationship IDs. Albums include trackIds and orderRevision from one snapshot; trackIds exclude invisible pending tracks. Reordering requires the complete album membership.", schema(map[string]any{"entityType": kind, "entityId": id}, "entityType", "entityId"), false},
-		{"list_submissions", "List owned submissions, feedback, revisions, dependencies and allowedActions, including terminal records. Poll this tool to discover reviewer feedback.", schema(map[string]any{"status": map[string]any{"type": "string", "enum": []string{"pending_review", "changes_requested", "approved", "rejected", "cancelled"}}, "entityType": map[string]any{"type": "string", "enum": []string{"author", "album", "track", "album_track_order", "track_lyrics"}}, "updatedSince": map[string]any{"type": "string", "format": "date-time"}, "page": page, "pageSize": pageSize}), false},
+		{"get_catalog_item", "Read a visible author, album or track, including track lyrics and relationship IDs. Albums include trackIds and orderRevision from one snapshot; trackIds exclude invisible pending tracks. Reordering requires the complete album membership.", schema(map[string]any{"entityType": kind, "entityId": id}, "entityType", "entityId"), false},
+		{"list_submissions", "List owned submissions, feedback, revisions, dependencies and allowedActions, including terminal records. Poll this tool to discover reviewer feedback.", schema(map[string]any{"status": map[string]any{"type": "string", "enum": []string{"pending_review", "changes_requested", "approved", "rejected", "cancelled"}}, "entityType": map[string]any{"type": "string", "enum": []string{"author", "album", "track", "album_track_order", "track_lyrics", "track_update"}}, "updatedSince": map[string]any{"type": "string", "format": "date-time"}, "page": page, "pageSize": pageSize}), false},
 		{"get_submission", "Read full current entity data, feedback history, revision, dependencies and permitted next actions. Call before correcting or resubmitting.", schema(map[string]any{"submissionId": id}, "submissionId"), false},
 		{"get_upload", "Read an owned upload's kind, byte size, checksum and claimed submission ID. Claimed tokens cannot be reused for new submissions.", schema(map[string]any{"uploadToken": token}, "uploadToken"), false},
 	}
@@ -261,6 +261,28 @@ func mcpToolSpecs() []mcpToolSpec {
 		mcpToolSpec{"submit_album_track_order", "Propose explicit track-number assignments for every track in an approved album. No catalog changes until review approval. Requires albums.submit_track_order.", schema(map[string]any{"requestId": requestID, "albumId": id, "tracks": assignments, "expectedOrderRevision": id, "reason": map[string]any{"type": "string", "maxLength": 1000}}, "requestId", "albumId", "tracks", "expectedOrderRevision"), true},
 		mcpToolSpec{"update_album_track_order_submission", "Patch an owned changes_requested number proposal. Refresh tracks and expectedOrderRevision if stale; omitted fields are preserved.", schema(map[string]any{"requestId": requestID, "submissionId": id, "expectedRevision": id, "tracks": assignments, "expectedOrderRevision": id, "reason": map[string]any{"type": "string", "maxLength": 1000}}, "requestId", "submissionId", "expectedRevision"), true},
 	)
+	for _, update := range []bool{false, true} {
+		props := map[string]any{"requestId": requestID, "reason": map[string]any{"type": "string", "maxLength": 1000}}
+		for key, value := range fields["track"] {
+			props[key] = value
+		}
+		props["lyrics"] = map[string]any{"anyOf": []any{lyrics, map[string]any{"type": "null"}}}
+		props["audioUploadToken"] = map[string]any{"type": "string", "description": "Owned unused audio token from POST /api/mcp/uploads. Omit to preserve; empty string removes a proposed replacement."}
+		name := "submit_track_update"
+		description := "Propose any editable field of a published track for human review: title, authors, album/number, audio, metadata, provenance and lyrics. Requires tracks.submit. Omitted fields stay unchanged; [] clears metadata and null clears lyrics."
+		props["trackId"] = id
+		required := []string{"requestId", "trackId"}
+		if update {
+			name = "update_track_update_submission"
+			description = "Patch an owned changes_requested track update. Fetch get_submission first and use its revision. Inspect current/before/after before refreshBaseline=true; rebasing preserves only proposed field changes."
+			delete(props, "trackId")
+			props["submissionId"] = id
+			props["expectedRevision"] = id
+			props["refreshBaseline"] = map[string]any{"type": "boolean"}
+			required = []string{"requestId", "submissionId", "expectedRevision"}
+		}
+		specs = append(specs, mcpToolSpec{name, description, schema(props, required...), true})
+	}
 	for _, entityType := range []string{"author", "album", "track"} {
 		for _, create := range []bool{true, false} {
 			props := map[string]any{"requestId": requestID}

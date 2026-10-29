@@ -374,7 +374,7 @@ func (r *sqliteRepositories) findSubmissionUpload(ctx context.Context, predicate
 
 func (r *sqliteRepositories) ClaimSubmissionUpload(ctx context.Context, token string, requesterID, trackID int64) error {
 	result, err := r.q.ExecContext(ctx, `UPDATE catalog_submission_uploads SET claimed_track_id = ?
-		WHERE token = ? AND requester_user_id = ? AND claimed_track_id IS NULL`, trackID, token, requesterID)
+		WHERE token = ? AND requester_user_id = ? AND claimed_track_id IS NULL AND NOT EXISTS (SELECT 1 FROM mcp_uploads WHERE mcp_uploads.token = catalog_submission_uploads.token AND claimed_submission_id IS NOT NULL)`, trackID, token, requesterID)
 	if err != nil {
 		return translateSQLiteError(err)
 	}

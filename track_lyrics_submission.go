@@ -14,7 +14,7 @@ import (
 const catalogSubmissionEntityTrackLyrics = "track_lyrics"
 
 func isCatalogProposal(kind string) bool {
-	return kind == catalogSubmissionEntityAlbumTrackOrder || kind == catalogSubmissionEntityTrackLyrics
+	return kind == catalogSubmissionEntityAlbumTrackOrder || kind == catalogSubmissionEntityTrackLyrics || kind == catalogSubmissionEntityTrackUpdate
 }
 
 func migrateTrackLyricsSubmissions(ctx context.Context, tx *sql.Tx) error {

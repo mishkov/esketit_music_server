@@ -432,6 +432,8 @@ func buildCatalogSubmissionResponses(ctx context.Context, repositories domainRep
 
 func catalogSubmissionEntity(ctx context.Context, repositories domainRepositories, submission catalogSubmission) (any, error) {
 	switch submission.EntityType {
+	case catalogSubmissionEntityTrackUpdate:
+		return trackUpdateProposalView(ctx, repositories, submission)
 	case catalogSubmissionEntityTrackLyrics:
 		return trackLyricsProposalView(ctx, repositories, submission)
 	case catalogSubmissionEntityAlbumTrackOrder:
@@ -694,6 +696,9 @@ func (s *trackStore) resubmitCatalogSubmission(requesterUserID, submissionID int
 }
 
 func ensureSubmissionDependenciesReady(ctx context.Context, repositories domainRepositories, submission catalogSubmission) error {
+	if submission.EntityType == catalogSubmissionEntityTrackUpdate {
+		return trackUpdateDependenciesReady(ctx, repositories, submission)
+	}
 	if submission.EntityType == catalogSubmissionEntityTrackLyrics {
 		return trackLyricsDependenciesReady(ctx, repositories, submission)
 	}
@@ -1001,7 +1006,12 @@ func (s *trackStore) approveCatalogSubmission(reviewerUserID, submissionID int64
 			return errCatalogSubmissionState
 		}
 
-		if item.EntityType == catalogSubmissionEntityTrackLyrics {
+		if item.EntityType == catalogSubmissionEntityTrackUpdate {
+			result.Entity, movedFrom, movedTo, err = s.applyTrackUpdateProposal(ctx, repositories, item)
+			if err != nil {
+				return err
+			}
+		} else if item.EntityType == catalogSubmissionEntityTrackLyrics {
 			result.Entity, err = applyTrackLyricsProposal(ctx, repositories, item)
 			if err != nil {
 				return err
@@ -1278,6 +1288,15 @@ func (s *trackStore) rejectCatalogSubmission(reviewerUserID, submissionID int64,
 		if !isCatalogProposal(item.EntityType) {
 			stagedFile, err = deleteCatalogSubmissionEntity(ctx, repositories, item.EntityType, item.EntityID)
 		}
+		if item.EntityType == catalogSubmissionEntityTrackUpdate {
+			p, decodeErr := decodeTrackUpdateProposal(item)
+			if decodeErr != nil {
+				return decodeErr
+			}
+			if p.AudioUploadToken != "" {
+				stagedFile, err = releaseTrackUpdateUpload(ctx, repositories, item.RequesterUserID, p.AudioUploadToken, item.ID)
+			}
+		}
 		if errors.Is(err, errCatalogSubmissionDependency) && item.EntityType != catalogSubmissionEntityTrack {
 			// Keep referenced entities so pending tracks can be corrected or cancelled.
 			_, err = setCatalogEntityPublication(ctx, repositories, item.EntityType, item.EntityID, catalogPublicationRejected, requestedByUserID(item.RequesterUserID))
@@ -1343,6 +1362,15 @@ func (s *trackStore) cancelCatalogSubmission(requesterUserID, submissionID int64
 		}
 		if !isCatalogProposal(item.EntityType) {
 			stagedFile, err = deleteCatalogSubmissionEntity(ctx, repositories, item.EntityType, item.EntityID)
+		}
+		if item.EntityType == catalogSubmissionEntityTrackUpdate {
+			p, decodeErr := decodeTrackUpdateProposal(item)
+			if decodeErr != nil {
+				return decodeErr
+			}
+			if p.AudioUploadToken != "" {
+				stagedFile, err = releaseTrackUpdateUpload(ctx, repositories, item.RequesterUserID, p.AudioUploadToken, item.ID)
+			}
 		}
 		if err != nil {
 			return err

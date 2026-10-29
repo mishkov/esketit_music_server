@@ -2293,7 +2293,7 @@ paths:
 
   /api/catalog-submissions:
     get:
-      tags: [Catalog Submissions]
+      tags: [Catalog submissions]
       summary: List the authenticated user's catalog submissions
       description: Requires `catalog_submissions.read_own`. Includes immutable feedback history and the user's current import rating.
       security:
@@ -2314,7 +2314,7 @@ paths:
 
   /api/catalog-submissions/audio:
     post:
-      tags: [Catalog Submissions]
+      tags: [Catalog submissions]
       summary: Stage audio for a track submission
       description: |
         Requires `tracks.submit`. The returned token is single-use and can only be claimed by its owner.
@@ -2353,7 +2353,7 @@ paths:
 
   /api/catalog-submissions/authors:
     post:
-      tags: [Catalog Submissions]
+      tags: [Catalog submissions]
       summary: Submit a new author
       description: Requires `authors.submit`. The author is immediately visible only to its requester until approval. Images are optional and must be uploaded as multipart files (`photos` for authors, `cover` for albums), with a `metadata` JSON form field. Image URLs and paths are rejected. JPEG, PNG, and GIF files are supported, with a 10 MiB limit per file, 32 MiB per request, and maximum dimensions of 4096 by 4096 pixels. Uploaded images are re-encoded; GIFs become static PNGs. JSON requests support metadata only.
       security:
@@ -2405,7 +2405,7 @@ paths:
 
   /api/catalog-submissions/authors/{id}:
     put:
-      tags: [Catalog Submissions]
+      tags: [Catalog submissions]
       summary: Edit an author after changes were requested
       description: Requires `catalog_submissions.update_own`. This does not resubmit the author automatically. Images are optional and must be uploaded as multipart files (`photos` for authors, `cover` for albums), with a `metadata` JSON form field. Image URLs and paths are rejected. JPEG, PNG, and GIF files are supported, with a 10 MiB limit per file, 32 MiB per request, and maximum dimensions of 4096 by 4096 pixels. Uploaded images are re-encoded; GIFs become static PNGs. JSON requests support metadata only. Omitting image files preserves existing images; supplied files replace them.
       security:
@@ -2458,6 +2458,96 @@ paths:
           $ref: '#/components/responses/PayloadTooLarge'
         '500':
           $ref: '#/components/responses/InternalServerError'
+
+  /api/catalog-submissions/track-updates:
+    post:
+      tags: [Catalog submissions]
+      summary: Propose changes to any editable field of a published track
+      description: Requires tracks.submit. Keeps the published version live until human approval. Replacement audio uses an owned unused MCP upload token.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTrackUpdateSubmissionRequest'
+      responses:
+        '201':
+          description: Pending review proposal with before and after snapshots
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '400':
+          description: Invalid or no-op patch
+        '403':
+          description: Permission denied
+        '409':
+          description: Active proposal, claimed audio or track-number conflict
+  /api/catalog-submissions/track-updates/{id}:
+    put:
+      tags: [Catalog submissions]
+      summary: Correct an owned track update after reviewer feedback
+      description: Requires catalog_submissions.update_own and changes_requested. Baseline refresh is explicit.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: {type: integer, format: int64, minimum: 1}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTrackUpdateSubmissionRequest'
+      responses:
+        '200':
+          description: Updated comparison proposal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogSubmission'
+        '400':
+          description: Invalid patch
+        '403':
+          description: Not owned or permission denied
+        '409':
+          description: Stale revision or baseline, wrong state or number conflict
+  /api/catalog-submissions/track-updates/{id}/audio:
+    get:
+      tags: [Catalog submissions]
+      summary: Preview a proposed replacement recording
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: {type: integer, format: int64, minimum: 1}
+        - in: header
+          name: X-Review-Lease
+          schema: {type: string}
+          description: Required for reviewers; requesters may preview their own active proposals.
+        - in: header
+          name: Range
+          schema: {type: string}
+      responses:
+        '200':
+          description: Private audio bytes
+          content:
+            audio/mpeg:
+              schema: {type: string, format: binary}
+        '206':
+          description: Requested audio byte range
+        '401':
+          description: Authentication required
+        '404':
+          description: Proposal or audio not found
+        '409':
+          description: Invalid review lease or terminal proposal
 
   /api/catalog-submissions/track-lyrics:
     post:
@@ -2529,7 +2619,7 @@ paths:
 
   /api/catalog-submissions/album-track-orders:
     post:
-      tags: [Catalog Submissions]
+      tags: [Catalog submissions]
       summary: Propose an approved album's track order for review
       description: |
         Requires `albums.submit_track_order` (granted to listeners and admins by default),
@@ -2571,7 +2661,7 @@ paths:
 
   /api/catalog-submissions/album-track-orders/{id}:
     put:
-      tags: [Catalog Submissions]
+      tags: [Catalog submissions]
       summary: Patch an owned order proposal after changes were requested
       description: |
         Requires catalog_submissions.update_own. The path id is a submission ID.
@@ -2612,7 +2702,7 @@ paths:
 
   /api/catalog-submissions/albums:
     post:
-      tags: [Catalog Submissions]
+      tags: [Catalog submissions]
       summary: Submit a new album
       description: Requires `albums.submit`. `authorIds` may reference published authors or the requester's pending authors. Images are optional and must be uploaded as multipart files (`photos` for authors, `cover` for albums), with a `metadata` JSON form field. Image URLs and paths are rejected. JPEG, PNG, and GIF files are supported, with a 10 MiB limit per file, 32 MiB per request, and maximum dimensions of 4096 by 4096 pixels. Uploaded images are re-encoded; GIFs become static PNGs. JSON requests support metadata only.
       security:
@@ -2661,7 +2751,7 @@ paths:
 
   /api/catalog-submissions/albums/{id}:
     put:
-      tags: [Catalog Submissions]
+      tags: [Catalog submissions]
       summary: Edit an album after changes were requested
       description: Requires `catalog_submissions.update_own`. Existing track membership is preserved and the album is not resubmitted automatically. Images are optional and must be uploaded as multipart files (`photos` for authors, `cover` for albums), with a `metadata` JSON form field. Image URLs and paths are rejected. JPEG, PNG, and GIF files are supported, with a 10 MiB limit per file, 32 MiB per request, and maximum dimensions of 4096 by 4096 pixels. Uploaded images are re-encoded; GIFs become static PNGs. JSON requests support metadata only. Omitting image files preserves existing images; supplied files replace them.
       security:
@@ -2714,7 +2804,7 @@ paths:
 
   /api/catalog-submissions/tracks:
     post:
-      tags: [Catalog Submissions]
+      tags: [Catalog submissions]
       summary: Submit a new track
       description: Requires `tracks.submit`. Referenced authors and album must be published or pending content owned by the requester.
       security:
@@ -2745,7 +2835,7 @@ paths:
 
   /api/catalog-submissions/tracks/{id}:
     put:
-      tags: [Catalog Submissions]
+      tags: [Catalog submissions]
       summary: Edit a track after changes were requested
       description: Requires `catalog_submissions.update_own`. Supplying `audioUploadToken` replaces staged audio; this does not resubmit automatically.
       security:
@@ -2778,7 +2868,7 @@ paths:
 
   /api/catalog-submissions/tracks/{id}/lyrics:
     put:
-      tags: [Catalog Submissions]
+      tags: [Catalog submissions]
       summary: Create or replace lyrics for an owned track submission
       description: Requires `catalog_submissions.update_own`. Lyrics present when the track is approved award a five-point bonus.
       security:
@@ -2817,7 +2907,7 @@ paths:
 
   /api/catalog-submissions/tracks/{id}/audio:
     get:
-      tags: [Catalog Submissions]
+      tags: [Catalog submissions]
       summary: Stream staged audio
       description: Available to the requester, or to the reviewer holding the requester's current lease. Reviewers must send `X-Review-Lease`.
       security:
@@ -2844,7 +2934,7 @@ paths:
 
   /api/catalog-submissions/{id}/resubmit:
     post:
-      tags: [Catalog Submissions]
+      tags: [Catalog submissions]
       summary: Resubmit corrected content
       description: Requires `catalog_submissions.update_own`. Only content in `changes_requested` can be resubmitted.
       security:
@@ -2869,7 +2959,7 @@ paths:
 
   /api/catalog-submissions/{id}:
     delete:
-      tags: [Catalog Submissions]
+      tags: [Catalog submissions]
       summary: Cancel an owned submission
       description: Requires `catalog_submissions.cancel_own`. The catalog entity, staged audio, lyrics, and playlist references are removed; the submission tombstone remains.
       security:
@@ -3712,7 +3802,7 @@ components:
 
     CatalogSubmissionEntityType:
       type: string
-      enum: [author, album, track, album_track_order, track_lyrics]
+      enum: [author, album, track, album_track_order, track_lyrics, track_update]
 
     CreateAlbumTrackOrderSubmissionRequest:
       type: object
@@ -3756,6 +3846,85 @@ components:
           type: integer
           format: int64
           minimum: 1
+        reason:
+          type: string
+          maxLength: 1000
+
+    CreateTrackUpdateSubmissionRequest:
+      type: object
+      additionalProperties: false
+      required: [trackId]
+      description: Omitted fields are preserved, [] clears metadata and null removes lyrics. At least one editable field must change.
+      properties:
+        trackId:
+          type: integer
+          format: int64
+          minimum: 1
+        name:
+          type: string
+        authorIds:
+          type: array
+          items: {type: integer, format: int64, minimum: 1}
+        albumId:
+          type: integer
+          format: int64
+          minimum: 1
+        trackNumber:
+          type: integer
+          minimum: 1
+        audioUploadToken:
+          type: string
+          description: Owned unused MCP audio token; empty string removes a proposed replacement.
+        additionalInfo:
+          type: array
+          items: {type: object, additionalProperties: true}
+        sourceMetadata:
+          type: array
+          items: {type: object, additionalProperties: true}
+        lyrics:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/UpsertTrackLyricsRequest'
+        reason:
+          type: string
+          maxLength: 1000
+    UpdateTrackUpdateSubmissionRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedRevision]
+      properties:
+        expectedRevision:
+          type: integer
+          format: int64
+          minimum: 1
+        refreshBaseline:
+          type: boolean
+          description: Explicitly rebase proposed changed fields onto current published data after inspecting concurrent corrections.
+        name:
+          type: string
+        authorIds:
+          type: array
+          items: {type: integer, format: int64, minimum: 1}
+        albumId:
+          type: integer
+          format: int64
+          minimum: 1
+        trackNumber:
+          type: integer
+          minimum: 1
+        audioUploadToken:
+          type: string
+          description: Owned unused MCP audio token; empty string removes a proposed replacement.
+        additionalInfo:
+          type: array
+          items: {type: object, additionalProperties: true}
+        sourceMetadata:
+          type: array
+          items: {type: object, additionalProperties: true}
+        lyrics:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/UpsertTrackLyricsRequest'
         reason:
           type: string
           maxLength: 1000
@@ -3839,6 +4008,9 @@ components:
           additionalProperties: true
           description: |
             Current author, album, or track; falls back to the snapshot after removal.
+            For track_update, returns trackId, before, after, changedFields, reason, current,
+            targetAvailable, isOutdated, and before/after artist names and album titles.
+            Before and after contain every editable track field and lyrics.
             For track_lyrics, returns trackId, name, audioFilePath, proposed lyrics,
             baseLyrics, targetAvailable, and isOutdated. Proposal lyrics use the
             UpsertTrackLyricsRequest format. entityId is the published track ID.
