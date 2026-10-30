@@ -166,6 +166,23 @@ ASK_USER = {
         "additionalProperties": False,
     },
 }
+FINISH_REQUEST = {
+    "type": "function",
+    "name": "finish_request",
+    "description": (
+        "Send the final answer when no question or tool action remains. "
+        "This ends the current agent turn or waits for submitted reviews. "
+        "Never put a question, choices, or an offer to continue in this message; "
+        "use ask_user for any question. Never finish while review corrections remain."
+    ),
+    "strict": True,
+    "parameters": {
+        "type": "object",
+        "properties": {"message": {"type": "string"}},
+        "required": ["message"],
+        "additionalProperties": False,
+    },
+}
 UPLOAD_MEDIA = {
     "type": "function",
     "name": "upload_media",

@@ -192,7 +192,18 @@ def test_missing_reference_is_reassessed_instead_of_pausing(tmp_path):
     def respond(**arguments):
         requests.append(arguments)
         return SimpleNamespace(
-            id="clarification", output=[], output_text="Which track did you mean?"
+            id="clarification",
+            output=[
+                SimpleNamespace(
+                    model_dump=lambda **options: {
+                        "type": "function_call",
+                        "call_id": "clarify",
+                        "name": "ask_user",
+                        "arguments": '{"question":"Which track did you mean?","options":[]}',
+                    }
+                )
+            ],
+            output_text="",
         )
 
     connection.call = missing
@@ -201,6 +212,42 @@ def test_missing_reference_is_reassessed_instead_of_pausing(tmp_path):
         Runtime(store, connection, settings, saver, model=model).step({"chat_id": chat["id"]})
     assert "no longer exists" in requests[0]["instructions"]
     assert store.get(chat["id"])["status"] != "paused"
+
+
+def test_completion_is_an_explicit_durable_idempotent_action(tmp_path):
+    store, settings, connection = prepare(tmp_path)
+    chat = create(store)
+    call = {"name": "finish_request", "call_id": "finish", "arguments": '{"message":"Done."}'}
+    with SqliteSaver.from_conn_string(str(tmp_path / "checkpoint.sqlite")) as saver:
+        runtime = Runtime(store, connection, settings, saver, model=object())
+        runtime.execute(chat["id"], call)
+        runtime.execute(chat["id"], call)
+    data = store.get(chat["id"])
+    assert data["status"] == "completed"
+    assert [message["text"] for message in data["messages"]].count("Done.") == 1
+    with store.transaction() as session:
+        assert session.query(Notice).count() == 1
+
+
+def test_completion_cannot_drop_steering_arriving_during_the_step(tmp_path):
+    store, settings, connection = prepare(tmp_path)
+    chat = create(store)
+    with SqliteSaver.from_conn_string(str(tmp_path / "checkpoint.sqlite")) as saver:
+        runtime = Runtime(store, connection, settings, saver, model=object())
+        original_update = runtime.update
+
+        def steer(identifier, callback):
+            store.message(2, identifier, str(uuid.uuid4()), "Use the live version instead")
+            original_update(identifier, callback)
+
+        runtime.update = steer
+        runtime.execute(
+            chat["id"],
+            {"name": "finish_request", "call_id": "finish", "arguments": '{"message":"Done."}'},
+        )
+    data = store.get(chat["id"])
+    assert data["status"] == "queued"
+    assert data["messages"][-1]["text"] == "Use the live version instead"
 
 
 def test_review_correction_requires_a_tool_action_instead_of_a_final_offer(tmp_path):

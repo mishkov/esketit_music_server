@@ -56,6 +56,8 @@ It does not put media bytes, base64 or local filesystem paths in MCP submissions
   Clear corrections resume the agent; ambiguous feedback uses durable questions.
 - Tool receipts and stable Esketit request identifiers prevent repeated writes
   after timeouts. Unknown outcomes of other write tools require reconciliation.
+- Questions and completion use explicit `ask_user` and `finish_request` actions.
+  Plain model text cannot silently finish a chat that still needs an answer.
 - A steering message supersedes unexecuted calls from an earlier instruction.
 - Notifications are retried from the durable outbox. Delivery can be repeated
   after a dispatcher crash; each notice carries a stable identifier.

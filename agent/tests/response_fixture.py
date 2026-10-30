@@ -38,17 +38,14 @@ class Handler(BaseHTTPRequestHandler):
             choice = json.loads(tool_output["output"]).get("answer", "Original")
             output = [
                 {
-                    "type": "message",
-                    "id": "msg_" + uuid.uuid4().hex,
-                    "role": "assistant",
+                    "type": "function_call",
+                    "id": "fc_" + uuid.uuid4().hex,
+                    "call_id": "finish-" + uuid.uuid4().hex,
+                    "name": "finish_request",
                     "status": "completed",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": "You selected " + choice + ". No catalog changes were made.",
-                            "annotations": [],
-                        }
-                    ],
+                    "arguments": json.dumps(
+                        {"message": "You selected " + choice + ". No catalog changes were made."}
+                    ),
                 }
             ]
         response = {
