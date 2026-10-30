@@ -1,0 +1,6 @@
+services:
+  agent:
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase.json
+    volumes:
+      - ${FIREBASE_CREDENTIALS_FILE:?Set the Firebase server credential path}:/run/secrets/firebase.json:ro

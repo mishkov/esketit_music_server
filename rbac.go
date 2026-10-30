@@ -138,6 +138,7 @@ func defaultRBACRoles() []defaultRoleDefinition {
 
 func definedPermissions() []permissionDefinition {
 	return []permissionDefinition{
+		{permissionAgentUse, "Use agent conversations"},
 		{permissionAccountReadSelf, "Read the authenticated account"},
 		{permissionPlaylistsRead, "Read personal playlists"},
 		{permissionPlaylistsCreate, "Create personal playlists"},

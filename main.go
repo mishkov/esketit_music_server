@@ -728,7 +728,14 @@ func run() (runErr error) {
 		}
 	}()
 
+	agent, err := newAgentGateway(store, strings.TrimSpace(os.Getenv("AGENT_SERVICE_URL")), os.Getenv("AGENT_SERVICE_TOKEN"))
+	if err != nil {
+		return err
+	}
 	mux := http.NewServeMux()
+	mux.Handle("GET /api/agent/capabilities", requireAuth(auth, store, http.HandlerFunc(agent.capabilities)))
+	mux.Handle("/api/agent/", requirePermission(auth, store, permissionAgentUse, http.HandlerFunc(agent.serve)))
+	mux.HandleFunc("GET /api/agent-internal/users/{userId}", agent.internalAccess)
 	mcpReview := &mcpService{store: store, authorPhotosDir: authorPhotosDir, albumCoversDir: albumCoversDir, accessToken: strings.TrimSpace(os.Getenv("MCP_ACCESS_TOKEN"))}
 	if err := mcpReview.configurePublicURL(os.Getenv("MCP_PUBLIC_URL")); err != nil {
 		return err

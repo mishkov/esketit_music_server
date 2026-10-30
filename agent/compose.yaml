@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: esketit_agent
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: ${AGENT_DATABASE_PASSWORD:?Set a database password}
+    volumes:
+      - agent_database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d esketit_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  agent:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8312:8312"
+    environment:
+      AGENT_DATABASE_URL: postgresql+psycopg://agent:${AGENT_DATABASE_PASSWORD}@postgres/esketit_agent
+      AGENT_SERVICE_TOKEN: ${AGENT_SERVICE_TOKEN:?Set the shared service credential}
+      ESKETIT_URL: ${ESKETIT_URL:?Set the catalog server origin}
+      ESKETIT_MCP_TOKEN: ${ESKETIT_MCP_TOKEN:?Set the existing MCP credential}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set an OpenAI API credential}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4-mini}
+      AGENT_MCP_SERVERS: ${AGENT_MCP_SERVERS:-}
+    volumes:
+      - ${AGENT_MEDIA_DIRECTORY:?Set a media directory}:/media
+volumes:
+  agent_database:
