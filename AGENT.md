@@ -4,13 +4,17 @@ The Go API authenticates `/api/agent/*` with the existing app session and checks
 the dedicated `agent.use` permission on every request. The Python service owns
 conversation state, PostgreSQL checkpoints, tool receipts, questions, item queues,
 review monitoring and the notification outbox. Model/API and MCP credentials never
-reach Flutter. The current MCP has one configured acting user; Agent access is
-limited to that same user even if another account receives `agent.use`.
+reach Flutter. Chat ownership and notifications belong to the signed-in user with `agent.use`.
+Catalog tools and submissions use the separately configured MCP acting account.
+That account is bound when a request first executes; changing it pauses existing
+requests before further catalog operations. A different chat user can review its
+submissions through the existing review permissions.
 
 ## Deployment
 
-1. Choose the existing MCP acting user in the console and assign `agent.use` using
-   Access Control. The feature migration does not grant it to existing roles.
+1. Choose the MCP service account in the console. Separately assign `agent.use`
+   to the intended chat users using Access Control. A reviewer should use a
+   different account from the MCP actor. The migration grants nobody access.
 2. Generate an independent shared secret with at least 32 characters. Set
    `AGENT_SERVICE_TOKEN` identically on Go and Python, and set
    `AGENT_SERVICE_URL=http://127.0.0.1:8312` on Go.
@@ -44,8 +48,9 @@ It does not put media bytes, base64 or local filesystem paths in MCP submissions
 ## Behavior and recovery
 
 - Drafts enter the durable queue only when a message is sent.
-- Requests touching the same item wait in arrival order, including paused work
-  and questions. Unrelated items remain eligible for execution.
+- Requests across chat owners touching the same item wait in arrival order, including paused work
+  and questions. Blocking chat identifiers are only visible to their own owner.
+  Unrelated items remain eligible for execution.
 - A queued request refreshes the item and prior review outcome before acting.
   Existing pending submissions created outside chats are also checked.
 - Stop preserves work. In-flight operations settle before the state becomes

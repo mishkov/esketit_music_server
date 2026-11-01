@@ -65,6 +65,21 @@ class Runtime:
         graph.add_edge("step", END)
         self.graph = graph.compile(checkpointer=checkpointer)
 
+    def authorize(self, identifier):
+        chat = self.store.get(identifier)
+        context = self.connections.authorize(chat["owner"])
+        acting_user = context["actingUserId"]
+
+        def bind(session, data):
+            previous = data.get("actingUserId", data["owner"])
+            if previous is not None and previous != acting_user:
+                raise PermissionError("The MCP acting account changed during this request")
+            data["actingUserId"] = acting_user
+
+        if chat.get("actingUserId") != acting_user:
+            self.update(identifier, bind)
+        return context
+
     def snapshot(self, chat_id):
         return self.graph.get_state({"configurable": {"thread_id": chat_id}})
 
@@ -115,7 +130,7 @@ class Runtime:
         chat = self.store.get(identifier)
         if chat["status"] in ("stopping", "paused", "cancelled"):
             return {}
-        context = self.connections.authorize(chat["owner"])
+        context = self.authorize(identifier)
         pending = list(state.get("pending", []))
         history = list(state.get("history", []))
         seen = list(state.get("seen_messages", []))
@@ -259,6 +274,7 @@ class Runtime:
             return json.dumps({"status": self.store.get(identifier)["status"]})
         if chat.get("waitingCall") == call["call_id"]:
             return self.wait_for_dependency(identifier)
+        self.authorize(identifier)
         definition = self.connections.definitions.get(name)
         if definition is None and name != "upload_media":
             self.connections.discover()
@@ -323,7 +339,6 @@ class Runtime:
                 return json.dumps(
                     {"status": "User verified prior operation; inspect current state"}
                 )
-        self.connections.authorize(chat["owner"])
         try:
             if name == "upload_media":
                 result = self.connections.upload(arguments, operation_id, chat["owner"])
@@ -395,7 +410,7 @@ class Runtime:
         data = self.store.get(identifier)
         if not unresolved(data) or data["nextReview"] > time.time():
             return
-        self.connections.authorize(data["owner"])
+        self.authorize(identifier)
         refreshed = [
             self.connections.call(
                 "esketit", "get_submission", {"submissionId": item["submissionId"]}
@@ -462,7 +477,7 @@ class Runtime:
                 renewal = threading.Thread(target=heartbeat, daemon=True)
                 renewal.start()
                 try:
-                    self.connections.authorize(self.store.get(identifier)["owner"])
+                    self.authorize(identifier)
                     if not self.gate(identifier):
                         continue
                     configuration = {"configurable": {"thread_id": identifier}}

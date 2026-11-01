@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -41,7 +42,7 @@ func TestAgentGatewayDoesNotTrustForwardedIdentity(t *testing.T) {
 	}
 }
 
-func TestAgentAccessRequiresPermissionAndMatchingMCPUser(t *testing.T) {
+func TestAgentAccessRequiresPermissionAndEnabledMCPUser(t *testing.T) {
 	store := newTestTrackStore(t)
 	defer store.db.Close()
 	owner, err := store.createUser("owner@example.test", "hash")
@@ -59,8 +60,8 @@ func TestAgentAccessRequiresPermissionAndMatchingMCPUser(t *testing.T) {
 	if _, err := store.db.Exec(`UPDATE mcp_settings SET acting_user_id=?`, listener.ID); err != nil {
 		t.Fatal(err)
 	}
-	if allowed, err := gateway.allowed(owner.ID); err != nil || allowed {
-		t.Fatalf("different MCP identity was accepted: %v", err)
+	if allowed, err := gateway.allowed(owner.ID); err != nil || !allowed {
+		t.Fatalf("separate authorized chat owner was rejected: %v", err)
 	}
 	if allowed, err := gateway.allowed(listener.ID); err != nil || allowed {
 		t.Fatalf("listener without permission was accepted: %v", err)
@@ -71,6 +72,15 @@ func TestAgentAccessRequiresPermissionAndMatchingMCPUser(t *testing.T) {
 	if allowed, err := gateway.allowed(owner.ID); err != nil || !allowed {
 		t.Fatalf("authorized identity rejected: %v", err)
 	}
+	if _, err := store.db.Exec(`UPDATE mcp_settings SET acting_user_id=NULL`); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := gateway.allowed(owner.ID); err != nil || allowed {
+		t.Fatalf("disabled MCP was accepted: %v", err)
+	}
+	if _, err := store.db.Exec(`UPDATE mcp_settings SET acting_user_id=?`, listener.ID); err != nil {
+		t.Fatal(err)
+	}
 	request := httptest.NewRequest(http.MethodGet, "/api/agent/capabilities", nil)
 	request = request.WithContext(context.WithValue(request.Context(), userContextKey, owner.ID))
 	response := httptest.NewRecorder()
@@ -78,6 +88,12 @@ func TestAgentAccessRequiresPermissionAndMatchingMCPUser(t *testing.T) {
 	var result map[string]bool
 	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || !result["canUseAgent"] {
 		t.Fatal("missing capability")
+	}
+	if _, err := store.db.Exec(`DELETE FROM role_permissions WHERE permission_id=(SELECT id FROM permissions WHERE code=?)`, permissionAgentUse); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := gateway.allowed(owner.ID); err != nil || allowed {
+		t.Fatalf("revoked chat access was accepted: %v", err)
 	}
 }
 
@@ -94,5 +110,33 @@ func TestAgentInternalAccessRejectsAppCredentials(t *testing.T) {
 	gateway.internalAccess(response, request)
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d", response.Code)
+	}
+}
+
+func TestAgentChatOwnerCanReviewMCPAccountSubmission(t *testing.T) {
+	service, actor := newMCPTestService(t)
+	gateway, err := newAgentGateway(service.store, "http://127.0.0.1:8312", strings.Repeat("s", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ownerID int64 = 1
+	if allowed, err := gateway.allowed(ownerID); err != nil || !allowed {
+		t.Fatalf("chat owner access: %v", err)
+	}
+	submission := callMCP(t, service, "submit_author", map[string]any{"requestId": "separate-chat-owner", "currentName": "Agent Review Identity Test"})
+	identifier := mcpID(submission, "submissionId")
+	if _, err := service.store.acquireCatalogReviewLease(actor.ID, actor.ID); !errors.Is(err, errCatalogSelfReview) {
+		t.Fatalf("self review error: %v", err)
+	}
+	lease, err := service.store.acquireCatalogReviewLease(ownerID, actor.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.store.approveCatalogSubmission(ownerID, identifier, lease.LeaseToken); err != nil {
+		t.Fatalf("chat owner could not approve agent submission: %v", err)
+	}
+	result := callMCP(t, service, "get_submission", map[string]any{"submissionId": identifier})
+	if result["status"] != "approved" {
+		t.Fatalf("unexpected review outcome: %v", result["status"])
 	}
 }

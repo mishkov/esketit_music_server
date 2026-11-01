@@ -108,10 +108,10 @@ class Connections:
     def call(self, server, name, arguments):
         return asyncio.run(self._call(server, name, arguments))
 
-    def context(self, owner):
+    def context(self):
         value = self.call("esketit", "get_context", {}).get("data", {})
-        if value.get("actingUserId") != owner:
-            raise PermissionError("MCP acting user differs from conversation owner")
+        if type(value.get("actingUserId")) is not int or value["actingUserId"] <= 0:
+            raise PermissionError("MCP acting account is not configured")
         return value
 
     def authorize(self, owner):
@@ -122,10 +122,10 @@ class Connections:
         )
         if response.status_code != 200:
             raise PermissionError("Agent permission is no longer available")
-        return self.context(owner)
+        return self.context()
 
     def upload(self, arguments, operation_id, owner):
-        context = self.context(owner)
+        context = self.authorize(owner)
         root = Path(self.settings.media_root).resolve()
         path = Path(arguments["path"]).resolve(strict=True)
         if not path.is_relative_to(root) or not path.is_file():

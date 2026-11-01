@@ -152,6 +152,7 @@ class Store:
                 "createdAt": now,
                 "locale": locale,
                 "owner": owner,
+                "actingUserId": None,
                 "queueOrder": session.get(Mutex, 1).value,
                 "instructionVersion": 1,
                 "blockedBy": [],
@@ -258,12 +259,15 @@ class Store:
         keys = {resource_key(item) for item in resources}
         return [
             other.id
-            for other in self.rows(session, row.owner)
+            for other in self.rows(session)
             if other.data.get("queueOrder", other.sequence)
             < row.data.get("queueOrder", row.sequence)
             and holds_place(other.data)
             and keys.intersection(resource_key(item) for item in other.data["resources"])
         ]
+
+    def visible_blockers(self, session, row, identifiers):
+        return [other.id for other in self.rows(session, row.owner) if other.id in identifiers]
 
     def reserve(self, identifier, resources):
         with self.transaction() as session:
@@ -274,7 +278,7 @@ class Store:
             blockers = self.blockers(session, row, data["resources"])
             # An earlier request discovering a new item must also wait for a later
             # request already changing it. Never overwrite in-flight/reviewed work.
-            for other in self.rows(session, row.owner):
+            for other in self.rows(session):
                 if other.id == row.id or not holds_place(other.data):
                     continue
                 if (
@@ -288,7 +292,7 @@ class Store:
                     and other.id not in blockers
                 ):
                     blockers.append(other.id)
-            data["blockedBy"] = blockers
+            data["blockedBy"] = self.visible_blockers(session, row, blockers)
             if blockers and data["status"] not in ("stopping", "paused", "cancelled"):
                 data["status"] = "waiting_dependency"
             self.save(row, data)
@@ -311,7 +315,7 @@ class Store:
                 return None
             blockers = self.blockers(session, row, data["resources"])
             if blockers:
-                data["blockedBy"] = blockers
+                data["blockedBy"] = self.visible_blockers(session, row, blockers)
                 data["status"] = "waiting_dependency"
                 self.save(row, data)
                 return None

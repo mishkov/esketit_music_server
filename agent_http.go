@@ -18,7 +18,7 @@ const permissionAgentUse = "agent.use"
 func migrateAgentPermission(ctx context.Context, transaction *sql.Tx) error {
 	_, err := transaction.ExecContext(ctx, `INSERT OR IGNORE INTO permissions (code, description, created_at) VALUES (?, ?, ?)`, permissionAgentUse, "Use agent conversations", formatSQLiteTime(time.Now().UTC()))
 	// Deliberately grant nobody access automatically. Assign agent.use through
-	// existing access-control management to the configured MCP acting user.
+	// existing access-control management to the intended chat users.
 	return err
 }
 
@@ -71,7 +71,7 @@ func (gateway *agentGateway) allowed(userID int64) (bool, error) {
 		actingUserID = settings.ActingUserID
 		return err
 	})
-	return err == nil && actingUserID != nil && *actingUserID == userID, err
+	return err == nil && actingUserID != nil, err
 }
 
 func (gateway *agentGateway) capabilities(writer http.ResponseWriter, request *http.Request) {
