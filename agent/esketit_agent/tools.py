@@ -198,3 +198,22 @@ UPLOAD_MEDIA = {
         "additionalProperties": False,
     },
 }
+
+
+SEARCH_WEB = {
+    "type": "function",
+    "name": "search_web",
+    "description": (
+        "Search the live public internet and read relevant sources for music facts, "
+        "release details, artists, versions or other public information. "
+        "Returns a cited answer and source URLs. This does not download audio. "
+        "Use only a public-information query, without secrets or private catalog notes."
+    ),
+    "strict": True,
+    "parameters": {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}

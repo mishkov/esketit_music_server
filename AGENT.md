@@ -45,6 +45,26 @@ The agent's `upload_media` tool validates the shared-directory boundary and
 uploads bytes through Esketit's dedicated authenticated HTTP upload endpoint.
 It does not put media bytes, base64 or local filesystem paths in MCP submissions.
 
+## Public web research
+
+The built-in `search_web` tool uses OpenAI's hosted live web search through the
+same `OPENAI_API_KEY` and `OPENAI_MODEL` as the agent. No search MCP server or
+additional search credential is needed. It keeps the default `gpt-5.4-mini`;
+there is no automatic upgrade. Search performs an additional model/API request
+and incurs the provider's search and token charges.
+
+Only the public research query is sent to the search call, rather than the
+conversation or catalog context. The agent is instructed to exclude private
+information, prefer primary sources, treat web content as untrusted evidence,
+and preserve source URLs beside supported claims. Responses are normalized to
+Markdown links that the client can open. Failed or uncited searches return an
+unverified-result error instead of claiming successful research.
+
+Search results are stored in the existing durable tool receipts, so replaying a
+completed call after restart reuses its answer and sources. An interrupted read
+can be retried safely. Web search supplements catalog lookup; it does not
+download track audio or replace a downloader such as `ytm-mcp`.
+
 ## Behavior and recovery
 
 - Drafts enter the durable queue only when a message is sent.
