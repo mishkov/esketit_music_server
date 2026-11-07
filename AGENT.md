@@ -12,6 +12,9 @@ submissions through the existing review permissions.
 
 ## Deployment
 
+For a first production rollout on the existing systemd VPS, follow the
+[step-by-step VPS runbook](agent/VPS-SETUP.md).
+
 1. Choose the MCP service account in the console. Separately assign `agent.use`
    to the intended chat users using Access Control. A reviewer should use a
    different account from the MCP actor. The migration grants nobody access.
