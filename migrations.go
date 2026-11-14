@@ -32,6 +32,7 @@ func defaultSchemaMigrations() []schemaMigration {
 		{version: 12, name: "persistent album track numbers", apply: migratePersistentTrackNumbers},
 		{version: 13, name: "reviewed track lyrics proposals", apply: migrateTrackLyricsSubmissions},
 		{version: 14, name: "reviewed published track updates", apply: migrateTrackUpdateSubmissions},
+		{version: 15, name: "agent conversation access", apply: migrateAgentPermission},
 	}
 }
 
